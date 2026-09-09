@@ -68,27 +68,22 @@ execute 'restart-user-docker' do
   only_if { ::File.exist?('/home/ubuntu/.config/systemd/user/docker.service') }
 end
 
-%w(/home/ubuntu/.config/traefik
-   /home/ubuntu/.config/traefik/dynamic
-   /home/ubuntu/.config/systemd/user).each do |dir|
-  directory dir do
-    owner 'ubuntu'
-    group 'ubuntu'
-    mode '0755'
-    recursive true
-  end
-end
-
 # ACME storage. Traefik requires acme.json at 0600 and must be able to write it.
 # If this directory were root-owned the certificate could not be persisted, so
 # every restart would re-issue instead of reuse — and Idlefy stops and starts
 # these VMs daily, which would silently turn "one certificate per VM" into a
 # race with Let's Encrypt's 50-per-week limit while appearing to work.
-directory '/home/ubuntu/.local/share/traefik' do
-  owner 'ubuntu'
+#
+# All four directories are created as ubuntu: root never writes under
+# /home/ubuntu (docs/design/first-external-review.md §1). ACME storage is 0700
+# for the reason in the comment above; the rest are 0755.
+execute 'ubuntu-traefik-dirs' do
+  command 'install -d -m 0755 /home/ubuntu/.config/traefik /home/ubuntu/.config/traefik/dynamic /home/ubuntu/.config/systemd/user && ' \
+          'install -d -m 0700 /home/ubuntu/.local/share/traefik'
+  user 'ubuntu'
   group 'ubuntu'
-  mode '0700'
-  recursive true
+  environment('HOME' => '/home/ubuntu')
+  not_if 'test -d /home/ubuntu/.config/traefik/dynamic && test -d /home/ubuntu/.config/systemd/user && test -d /home/ubuntu/.local/share/traefik', user: 'ubuntu'
 end
 
 # One resource, one guard, both files.
@@ -120,6 +115,9 @@ end
 # one the next converge repairs: no `users` means regenerate both.
 #
 # -C 12 is deliberate: htpasswd's default bcrypt cost for -B is 5.
+#
+# Runs as ubuntu: root never writes under /home/ubuntu, and neither openssl
+# nor htpasswd needs it.
 execute 'generate-traefik-password' do
   command <<~SH
     set -e
@@ -129,12 +127,14 @@ execute 'generate-traefik-password' do
     pw="$(openssl rand -base64 24)"
     printf '%s\\n' "$pw" > "$d/.password.tmp"
     htpasswd -nbB -C 12 dev "$pw" > "$d/.users.tmp"
-    chown ubuntu:ubuntu "$d/.password.tmp" "$d/.users.tmp"
     chmod 0600 "$d/.password.tmp" "$d/.users.tmp"
     mv "$d/.password.tmp" "$d/password"
     mv "$d/.users.tmp" "$d/users"
   SH
-  not_if { ::File.exist?('/home/ubuntu/.config/traefik/users') }
+  user 'ubuntu'
+  group 'ubuntu'
+  environment('HOME' => '/home/ubuntu')
+  not_if 'test -e /home/ubuntu/.config/traefik/users', user: 'ubuntu'
   notifies :run, 'execute[restart-traefik]', :delayed
 end
 
@@ -145,30 +145,68 @@ execute 'create-traefik-network' do
   not_if  "su -l ubuntu -c '#{docker_env} docker network inspect web >/dev/null 2>&1'"
 end
 
-template '/home/ubuntu/.config/traefik/traefik.yml' do
+# Rendered by root into the staging tree, copied by ubuntu. The staged copies
+# carry no secret: traefik.yml has the ACME e-mail, auth.yml names the users
+# file, the unit names the image, the readme names the password's PATH.
+staged = '/usr/share/dev-vm/home'
+
+%W(#{staged}/.config/traefik/dynamic #{staged}/.config/systemd/user).each do |dir|
+  directory dir do
+    owner 'root'
+    group 'root'
+    mode '0755'
+    recursive true
+  end
+end
+
+template "#{staged}/.config/traefik/traefik.yml" do
   source 'traefik.yml.erb'
-  owner 'ubuntu'
-  group 'ubuntu'
+  owner 'root'
+  group 'root'
   mode '0644'
   variables(acme_email: node['base']['traefik']['acme_email'])
+end
+
+execute 'ubuntu-traefik-yml' do
+  command "install -m 0644 #{staged}/.config/traefik/traefik.yml /home/ubuntu/.config/traefik/traefik.yml"
+  user 'ubuntu'
+  group 'ubuntu'
+  environment('HOME' => '/home/ubuntu')
+  not_if "cmp -s #{staged}/.config/traefik/traefik.yml /home/ubuntu/.config/traefik/traefik.yml", user: 'ubuntu'
   notifies :run, 'execute[restart-traefik]', :delayed
 end
 
 # No notifies: providers.file names this file with watch: true, so Traefik picks
 # dynamic configuration up by itself.
-template '/home/ubuntu/.config/traefik/dynamic/auth.yml' do
+template "#{staged}/.config/traefik/dynamic/auth.yml" do
   source 'traefik-auth.yml.erb'
-  owner 'ubuntu'
-  group 'ubuntu'
+  owner 'root'
+  group 'root'
   mode '0644'
 end
 
-template '/home/ubuntu/.config/systemd/user/traefik.service' do
-  source 'traefik.service.erb'
-  owner 'ubuntu'
+execute 'ubuntu-traefik-auth' do
+  command "install -m 0644 #{staged}/.config/traefik/dynamic/auth.yml /home/ubuntu/.config/traefik/dynamic/auth.yml"
+  user 'ubuntu'
   group 'ubuntu'
+  environment('HOME' => '/home/ubuntu')
+  not_if "cmp -s #{staged}/.config/traefik/dynamic/auth.yml /home/ubuntu/.config/traefik/dynamic/auth.yml", user: 'ubuntu'
+end
+
+template "#{staged}/.config/systemd/user/traefik.service" do
+  source 'traefik.service.erb'
+  owner 'root'
+  group 'root'
   mode '0644'
   variables(image: traefik_image)
+end
+
+execute 'ubuntu-traefik-unit' do
+  command "install -m 0644 #{staged}/.config/systemd/user/traefik.service /home/ubuntu/.config/systemd/user/traefik.service"
+  user 'ubuntu'
+  group 'ubuntu'
+  environment('HOME' => '/home/ubuntu')
+  not_if "cmp -s #{staged}/.config/systemd/user/traefik.service /home/ubuntu/.config/systemd/user/traefik.service", user: 'ubuntu'
   notifies :run, 'execute[systemd-user-reload]', :immediately
   notifies :run, 'execute[restart-traefik]', :delayed
 end
@@ -220,10 +258,18 @@ fqdn        = if region
 # people forward without reading. Nothing in it may be non-deterministic either,
 # or every converge would report it as updated and the team would learn to
 # ignore a permanently non-zero run.
-template '/home/ubuntu/traefik-readme.md' do
+template "#{staged}/traefik-readme.md" do
   source 'traefik-readme.md.erb'
-  owner 'ubuntu'
-  group 'ubuntu'
+  owner 'root'
+  group 'root'
   mode '0644'
   variables(fqdn: fqdn)
+end
+
+execute 'ubuntu-traefik-readme' do
+  command "install -m 0644 #{staged}/traefik-readme.md /home/ubuntu/traefik-readme.md"
+  user 'ubuntu'
+  group 'ubuntu'
+  environment('HOME' => '/home/ubuntu')
+  not_if "cmp -s #{staged}/traefik-readme.md /home/ubuntu/traefik-readme.md", user: 'ubuntu'
 end
