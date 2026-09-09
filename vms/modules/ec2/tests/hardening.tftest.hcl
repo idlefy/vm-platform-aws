@@ -171,6 +171,12 @@ run "boundary_denies_asset_routes_found_in_review" {
         # another VM's fail-closed bootstrap log
         "ec2:GetConsoleOutput",
         "ec2:GetConsoleScreenshot",
+        # IGW/route one-call blackholes, denied ahead of the topology that
+        # would make them live
+        "ec2:DetachInternetGateway",
+        "ec2:DeleteInternetGateway",
+        "ec2:AssociateRouteTable",
+        "ec2:DeleteNatGateway",
       ] : contains(
         [
           for statement in jsondecode(aws_iam_policy.identity_boundary["vm"].policy).Statement :

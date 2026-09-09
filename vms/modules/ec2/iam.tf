@@ -359,6 +359,15 @@ resource "aws_iam_policy" "identity_boundary" {
           "ec2:RebootInstances",
           "ec2:GetConsoleOutput",
           "ec2:GetConsoleScreenshot",
+          # The IGW/route one-call blackholes. Dead today — DetachInternetGateway
+          # fails while any instance holds a public IP, and every subnet already
+          # carries an explicit route-table association — but the cover is a
+          # property of the public-subnet topology, so deny them now rather than
+          # remember to on the day the fleet moves behind a NAT gateway.
+          "ec2:DetachInternetGateway",
+          "ec2:DeleteInternetGateway",
+          "ec2:AssociateRouteTable",
+          "ec2:DeleteNatGateway",
         ]
         Resource = "*"
       },
