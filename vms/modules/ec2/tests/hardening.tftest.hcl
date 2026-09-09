@@ -87,8 +87,21 @@ run "user_data_fails_closed_on_imds" {
   }
 
   assert {
-    condition     = strcontains(base64decode(aws_instance.this["vm"].user_data_base64), "> /dev/console")
+    condition = (
+      strcontains(base64decode(aws_instance.this["vm"].user_data_base64), "> /dev/console") &&
+      strcontains(base64decode(aws_instance.this["vm"].user_data_base64), "/var/log/user-data.log")
+    )
     error_message = "A failed bootstrap must write its log to the serial console — with sudo gone, get-console-output is the only diagnosis path."
+  }
+
+  assert {
+    condition     = !strcontains(base64decode(aws_instance.this["vm"].user_data_base64), "install -m 0440")
+    error_message = "The bootstrap must never re-create the sudoers grant — a 0440 install of 90-cloud-init-users is exactly the restore this script must not do."
+  }
+
+  assert {
+    condition     = length(regexall("/etc/sudoers.d", base64decode(aws_instance.this["vm"].user_data_base64))) == 1
+    error_message = "The script may name /etc/sudoers.d only once, in the rm that drops cloud-init's grant — a second mention would be a re-creation path."
   }
 
 }

@@ -261,13 +261,24 @@ converge.
 
 A VM that has not registered with the CINC server five minutes after `apply`
 failed its bootstrap. It fails **closed**: the cloud image's `NOPASSWD` grant
-for `ubuntu` is removed first and is never restored, so nobody can log in and
-read `/var/log/user-data.log`. The bootstrap writes that log to the serial
-console instead:
+for `ubuntu` is removed first and is never restored, so the developer can
+still SSH in as `ubuntu`, but without sudo nobody can read
+`/var/log/user-data.log` — it is root-owned and `0600`. The bootstrap writes
+that log to the serial console instead. Pass `--latest`: on Nitro instance
+types, the call without it returns the early-boot snapshot, not the log —
+and `tail` alone would show the post-boot SSH banner and login prompt rather
+than the bootstrap failure, so grab everything from the `BOOTSTRAP FAILED`
+marker on:
 
 ```bash
-aws ec2 get-console-output --instance-id <id> --region <region> --profile <profile> --output text | tail -60
+aws ec2 get-console-output --latest --instance-id <id> --region <region> --profile <profile> --output text | sed -n '/BOOTSTRAP FAILED/,$p'
 ```
+
+If the console output ends with "first converge failed" and no error
+underneath, the failure is in `cinc-client`'s own converge log
+(`/var/log/cinc-first-run.log` on the instance), which is deliberately not
+mirrored to the console — reading it needs sudo, which is gone, so treat
+the instance as unrecoverable and replace it.
 
 Fix the cause (a validator key missing in that region, a policy group that does
 not exist, a network that cannot reach the CINC server) and replace the

@@ -25,7 +25,7 @@ bootstrap_failed() {
   rm -f /etc/cinc/validation.pem
   {
     echo "BOOTSTRAP FAILED: validation key removed; developer sudo stays revoked. Log follows."
-    cat /var/log/user-data.log
+    tail -c 60000 /var/log/user-data.log
   } > /dev/console 2>/dev/null || true
 }
 trap bootstrap_failed ERR
@@ -163,7 +163,7 @@ CINC_CONFIG
 
 # Run initial converge
 install -m 0600 /dev/null /var/log/cinc-first-run.log
-cinc-client --once > /var/log/cinc-first-run.log 2>&1
+cinc-client --once > /var/log/cinc-first-run.log 2>&1 || { echo "FATAL: first converge failed; the converge log is /var/log/cinc-first-run.log on the instance and is not mirrored to the console"; bootstrap_failed; exit 1; }
 
 # Remove validation key — no longer needed after registration
 rm -f /etc/cinc/validation.pem
