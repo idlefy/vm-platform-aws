@@ -70,6 +70,7 @@ challenge one is to reproduce it.
 5. The credential broker's modes and uid gate are boundaries, not formatting.
 6. Never echo a secret's value — SSM is not encrypted at rest from where you sit.
 7. The Falco sudo exclusion and the Tailscale sudoers grant are one change.
+8. Root never writes under `/home/ubuntu` — stage under `/usr/share/dev-vm/home`, copy as `ubuntu`.
 
 **A deny entry in the permissions boundary must cover every route to the asset,
 not the API that happens to name it.** The list blocks the snapshot path to a VM's
@@ -167,6 +168,18 @@ because `/dev/shm` is world-writable and the developer must not be able to
 substitute what root published. The broker re-verifies the directory's owner and
 mode on every run instead of trusting `systemd-tmpfiles` to have won the boot
 race. These are security boundaries with tests attached, not formatting.
+
+**Root never writes under `/home/ubuntu` — stage under `/usr/share/dev-vm/home`
+and copy as `ubuntu`.** Chef's `directory` provider does no symlink handling at
+all, and `file`/`template`/`cookbook_file` inspect only the last path component,
+so `directory '/home/ubuntu/.claude'` against a developer-planted
+`~/.claude → /etc/dev-vm` chowned `/etc/dev-vm` to the developer (reproduced
+with `cinc-apply` 2026-09-09: the *target* of a symlink went 0700 → 0755). A
+resource-level guard cannot close it — a symlinked parent is followed silently,
+and the check-then-chown is a race the developer can win in a loop. The
+boundary that holds is privilege: the `execute … user 'ubuntu'` copies in
+`claude_code.rb`, `docker.rb` and `traefik.rb` are the pattern, and
+`spec/recipes/default_spec.rb` fails any recipe that adds a root writer there.
 
 **Never echo a secret's value.** The CINC validator key is reachable via
 `aws ssm get-parameter --with-decryption` from a workstation holding these
