@@ -1,0 +1,1594 @@
+{
+  "folderUid": "dev-vm-security",
+  "overwrite": true,
+  "message": "Provisioned from grafana/dashboards/dev-vm-audit.json",
+  "dashboard": {
+    "uid": "dev-vm-audit",
+    "title": "Developer VMs — audit trail",
+    "tags": [
+      "dev-vm",
+      "security",
+      "audit"
+    ],
+    "timezone": "utc",
+    "editable": true,
+    "time": {
+      "from": "now-24h",
+      "to": "now"
+    },
+    "refresh": "5m",
+    "annotations": {
+      "list": [
+        {
+          "name": "Alerts",
+          "enable": true,
+          "iconColor": "red",
+          "datasource": {
+            "type": "grafana",
+            "uid": "-- Grafana --"
+          },
+          "target": {
+            "type": "dashboard",
+            "limit": 100,
+            "matchAny": false,
+            "tags": []
+          }
+        }
+      ]
+    },
+    "templating": {
+      "list": [
+        {
+          "name": "instance",
+          "label": "VM",
+          "type": "query",
+          "datasource": {
+            "type": "loki",
+            "uid": "grafanacloud-logs"
+          },
+          "definition": "label_values(instance)",
+          "query": {
+            "label": "instance",
+            "stream": "{job=\"dev-vm\"}",
+            "type": 1
+          },
+          "refresh": 2,
+          "includeAll": true,
+          "multi": true,
+          "current": {
+            "text": [
+              "All"
+            ],
+            "value": [
+              "$__all"
+            ]
+          }
+        },
+        {
+          "name": "actor",
+          "label": "Actor",
+          "type": "textbox",
+          "query": ".+",
+          "current": {
+            "text": ".+",
+            "value": ".+"
+          },
+          "description": "Regex on the user who invoked sudo. Scopes the two root-command panels only."
+        }
+      ]
+    },
+    "panels": [
+      {
+        "id": 100,
+        "type": "row",
+        "title": "Fleet",
+        "gridPos": {
+          "h": 1,
+          "w": 24,
+          "x": 0,
+          "y": 0
+        },
+        "collapsed": false,
+        "panels": []
+      },
+      {
+        "id": 1,
+        "type": "stat",
+        "title": "VMs reporting",
+        "description": "Zero is normal. Idlefy stops these VMs outside working hours, which is why absence is deliberately not alerted on — a dead-man's switch would have fired across the fleet every evening.",
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 0,
+          "y": 1
+        },
+        "datasource": {
+          "type": "loki",
+          "uid": "grafanacloud-logs"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "loki",
+              "uid": "grafanacloud-logs"
+            },
+            "expr": "count(count by (instance) (count_over_time({job=\"dev-vm\", instance=~\"$instance\"} [5m])))",
+            "queryType": "instant"
+          }
+        ],
+        "options": {
+          "reduceOptions": {
+            "calcs": [
+              "lastNotNull"
+            ]
+          },
+          "colorMode": "none",
+          "graphMode": "none",
+          "textMode": "value"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "noValue": "0"
+          },
+          "overrides": []
+        }
+      },
+      {
+        "id": 2,
+        "type": "stat",
+        "title": "Escalations refused",
+        "description": "Developers have no sudo by design, so anything above zero is a deliberate act. Matches the two verdicts sudoers.so writes to the journal — not the friendlier wording sudo prints on the terminal, which never reaches it.",
+        "gridPos": {
+          "h": 4,
+          "w": 5,
+          "x": 4,
+          "y": 1
+        },
+        "datasource": {
+          "type": "loki",
+          "uid": "grafanacloud-logs"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "loki",
+              "uid": "grafanacloud-logs"
+            },
+            "expr": "sum(count_over_time({job=\"dev-vm\", instance=~\"$instance\"} | syslog_identifier=\"sudo\" |~ \"NOT in sudoers|command not allowed\" [$__range]))",
+            "queryType": "instant"
+          }
+        ],
+        "options": {
+          "reduceOptions": {
+            "calcs": [
+              "lastNotNull"
+            ]
+          },
+          "colorMode": "value",
+          "graphMode": "none",
+          "textMode": "value"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "noValue": "0",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 1
+                }
+              ]
+            }
+          },
+          "overrides": []
+        }
+      },
+      {
+        "id": 3,
+        "type": "stat",
+        "title": "Converge failures",
+        "description": "A failed converge is invisible on an OSS CINC server, so the VM stops tracking its own security settings while continuing to look healthy.",
+        "gridPos": {
+          "h": 4,
+          "w": 4,
+          "x": 9,
+          "y": 1
+        },
+        "datasource": {
+          "type": "loki",
+          "uid": "grafanacloud-logs"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "loki",
+              "uid": "grafanacloud-logs"
+            },
+            "expr": "sum(count_over_time({job=\"dev-vm\", instance=~\"$instance\"} |= \"cinc-client.service: Failed with result\" [$__range]))",
+            "queryType": "instant"
+          }
+        ],
+        "options": {
+          "reduceOptions": {
+            "calcs": [
+              "lastNotNull"
+            ]
+          },
+          "colorMode": "value",
+          "graphMode": "none",
+          "textMode": "value"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "noValue": "0",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "orange",
+                  "value": 1
+                }
+              ]
+            }
+          },
+          "overrides": []
+        }
+      },
+      {
+        "id": 4,
+        "type": "stat",
+        "title": "Failed password / max attempts",
+        "description": "Structurally impossible on a key-only fleet, so this must be zero. Measured baseline: 0 over six hours against 52 successful logins. 'Invalid user' is deliberately counted separately — one of those per VM is expected and is not an attack.",
+        "gridPos": {
+          "h": 4,
+          "w": 6,
+          "x": 13,
+          "y": 1
+        },
+        "datasource": {
+          "type": "loki",
+          "uid": "grafanacloud-logs"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "loki",
+              "uid": "grafanacloud-logs"
+            },
+            "expr": "sum(count_over_time({job=\"dev-vm\", instance=~\"$instance\"} |~ \"Failed password|maximum authentication attempts\" [$__range]))",
+            "queryType": "instant"
+          }
+        ],
+        "options": {
+          "reduceOptions": {
+            "calcs": [
+              "lastNotNull"
+            ]
+          },
+          "colorMode": "value",
+          "graphMode": "none",
+          "textMode": "value"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "noValue": "0",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 1
+                }
+              ]
+            }
+          },
+          "overrides": []
+        }
+      },
+      {
+        "id": 5,
+        "type": "stat",
+        "title": "Invalid user — worst VM",
+        "description": "Counted per VM and showing the highest, because exactly one is expected per VM lifetime: EC2 Instance Connect as admin, before the first converge has created that user, produces one. Two or more on the same VM is worth reading. Split out from the panel to its left so a brand-new VM does not paint a red tile and teach everyone to ignore red.",
+        "gridPos": {
+          "h": 4,
+          "w": 5,
+          "x": 19,
+          "y": 1
+        },
+        "datasource": {
+          "type": "loki",
+          "uid": "grafanacloud-logs"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "loki",
+              "uid": "grafanacloud-logs"
+            },
+            "expr": "max(sum by (instance) (count_over_time({job=\"dev-vm\", instance=~\"$instance\"} |~ \"Invalid user\" [$__range])))",
+            "queryType": "instant"
+          }
+        ],
+        "options": {
+          "reduceOptions": {
+            "calcs": [
+              "lastNotNull"
+            ]
+          },
+          "colorMode": "value",
+          "graphMode": "none",
+          "textMode": "value"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "noValue": "0",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "yellow",
+                  "value": 2
+                }
+              ]
+            }
+          },
+          "overrides": []
+        }
+      },
+      {
+        "id": 6,
+        "type": "table",
+        "title": "Fleet — one row per VM",
+        "description": "The view that was missing: every VM at once rather than one at a time behind a filter. Counts are magnitude, so their cells use a single-hue ramp; the two columns that mean something is wrong use status colour instead. Click a VM name to scope the whole dashboard to it. Refusals are excluded: a denied attempt also carries COMMAND=, so counting every COMMAND= line credits a developer with root commands they never ran — ubuntu showed 3 each here while holding no sudo at all. The two excluded verdicts are the same strings alert 1 matches; change one and change both.",
+        "gridPos": {
+          "h": 8,
+          "w": 24,
+          "x": 0,
+          "y": 5
+        },
+        "datasource": {
+          "type": "loki",
+          "uid": "grafanacloud-logs"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "loki",
+              "uid": "grafanacloud-logs"
+            },
+            "queryType": "instant",
+            "expr": "sum by (instance, region, public_ip) (count_over_time({job=\"dev-vm\", instance=~\"$instance\"} [$__range]))"
+          },
+          {
+            "refId": "B",
+            "datasource": {
+              "type": "loki",
+              "uid": "grafanacloud-logs"
+            },
+            "queryType": "instant",
+            "expr": "sum by (instance) (count_over_time({job=\"dev-vm\", instance=~\"$instance\"} |= \"Accepted publickey\" [$__range]))"
+          },
+          {
+            "refId": "C",
+            "datasource": {
+              "type": "loki",
+              "uid": "grafanacloud-logs"
+            },
+            "queryType": "instant",
+            "expr": "sum by (instance) (count_over_time({job=\"dev-vm\", instance=~\"$instance\"} | syslog_identifier=\"sudo\" |= \"COMMAND=\" !~ \"NOT in sudoers|command not allowed\" [$__range]))"
+          },
+          {
+            "refId": "D",
+            "datasource": {
+              "type": "loki",
+              "uid": "grafanacloud-logs"
+            },
+            "queryType": "instant",
+            "expr": "sum by (instance) (count_over_time({job=\"dev-vm\", instance=~\"$instance\"} | syslog_identifier=\"sudo\" |~ \"NOT in sudoers|command not allowed\" [$__range]))"
+          },
+          {
+            "refId": "E",
+            "datasource": {
+              "type": "loki",
+              "uid": "grafanacloud-logs"
+            },
+            "queryType": "instant",
+            "expr": "sum by (instance) (count_over_time({job=\"dev-vm\", instance=~\"$instance\"} |= \"cinc-client.service: Failed with result\" [$__range]))"
+          }
+        ],
+        "transformations": [
+          {
+            "id": "labelsToFields",
+            "options": {
+              "mode": "columns"
+            }
+          },
+          {
+            "id": "joinByField",
+            "options": {
+              "byField": "instance",
+              "mode": "outer"
+            }
+          },
+          {
+            "id": "organize",
+            "options": {
+              "excludeByName": {
+                "Time": true,
+                "Time 1": true,
+                "Time 2": true,
+                "Time 3": true,
+                "Time 4": true,
+                "Time 5": true
+              },
+              "renameByName": {
+                "instance": "VM",
+                "public_ip": "Public IP",
+                "region": "Region",
+                "Value #A": "Lines",
+                "Value #B": "Logins",
+                "Value #C": "Root cmds",
+                "Value #D": "Refused",
+                "Value #E": "Converge fails"
+              },
+              "indexByName": {
+                "instance": 0,
+                "public_ip": 1,
+                "region": 2,
+                "Value #A": 3,
+                "Value #B": 4,
+                "Value #C": 5,
+                "Value #D": 6,
+                "Value #E": 7
+              }
+            }
+          }
+        ],
+        "options": {
+          "showHeader": true,
+          "cellHeight": "sm",
+          "footer": {
+            "show": false
+          }
+        },
+        "fieldConfig": {
+          "defaults": {
+            "custom": {
+              "align": "auto",
+              "cellOptions": {
+                "type": "auto"
+              },
+              "filterable": true
+            },
+            "unit": "short"
+          },
+          "overrides": [
+            {
+              "matcher": {
+                "id": "byRegexp",
+                "options": "Lines|Logins|Root cmds"
+              },
+              "properties": [
+                {
+                  "id": "custom.cellOptions",
+                  "value": {
+                    "type": "color-background",
+                    "mode": "gradient"
+                  }
+                },
+                {
+                  "id": "color",
+                  "value": {
+                    "mode": "continuous-blues"
+                  }
+                },
+                {
+                  "id": "noValue",
+                  "value": "0"
+                },
+                {
+                  "id": "custom.width",
+                  "value": 100
+                }
+              ]
+            },
+            {
+              "matcher": {
+                "id": "byRegexp",
+                "options": "Refused|Converge fails"
+              },
+              "properties": [
+                {
+                  "id": "custom.cellOptions",
+                  "value": {
+                    "type": "color-background",
+                    "mode": "basic"
+                  }
+                },
+                {
+                  "id": "thresholds",
+                  "value": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      },
+                      {
+                        "color": "red",
+                        "value": 1
+                      }
+                    ]
+                  }
+                },
+                {
+                  "id": "color",
+                  "value": {
+                    "mode": "thresholds"
+                  }
+                },
+                {
+                  "id": "noValue",
+                  "value": "0"
+                },
+                {
+                  "id": "custom.width",
+                  "value": 120
+                }
+              ]
+            },
+            {
+              "matcher": {
+                "id": "byName",
+                "options": "Public IP"
+              },
+              "properties": [
+                {
+                  "id": "noValue",
+                  "value": "— none"
+                },
+                {
+                  "id": "custom.width",
+                  "value": 140
+                }
+              ]
+            },
+            {
+              "matcher": {
+                "id": "byName",
+                "options": "Region"
+              },
+              "properties": [
+                {
+                  "id": "custom.width",
+                  "value": 120
+                }
+              ]
+            },
+            {
+              "matcher": {
+                "id": "byName",
+                "options": "VM"
+              },
+              "properties": [
+                {
+                  "id": "links",
+                  "value": [
+                    {
+                      "title": "Show only this VM",
+                      "url": "/d/dev-vm-audit/developer-vms-e28094-audit-trail?var-instance=${__value.text}&from=${__from}&to=${__to}",
+                      "targetBlank": false
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "id": 7,
+        "type": "status-history",
+        "title": "Log activity by VM — when was each one alive",
+        "description": "Categorical rows against time with magnitude as colour, so it stays readable for any fleet size and never needs one hue per VM. Gaps are Idlefy stopping a VM, not a fault. maxDataPoints is capped because this panel type refuses to render past about a thousand points, and $__interval on a 12-hour range produces 1441.",
+        "gridPos": {
+          "h": 7,
+          "w": 24,
+          "x": 0,
+          "y": 13
+        },
+        "maxDataPoints": 120,
+        "datasource": {
+          "type": "loki",
+          "uid": "grafanacloud-logs"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "loki",
+              "uid": "grafanacloud-logs"
+            },
+            "expr": "sum by (instance) (count_over_time({job=\"dev-vm\", instance=~\"$instance\"} [$__interval]))",
+            "legendFormat": "{{instance}}"
+          }
+        ],
+        "options": {
+          "showValue": "never",
+          "colWidth": 0.9,
+          "rowHeight": 0.9,
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom",
+            "showLegend": false
+          },
+          "tooltip": {
+            "mode": "single"
+          }
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "color": {
+              "mode": "continuous-blues"
+            },
+            "custom": {
+              "fillOpacity": 90,
+              "lineWidth": 0
+            }
+          },
+          "overrides": []
+        }
+      },
+      {
+        "id": 200,
+        "type": "row",
+        "title": "Who did what",
+        "gridPos": {
+          "h": 1,
+          "w": 24,
+          "x": 0,
+          "y": 20
+        },
+        "collapsed": false,
+        "panels": []
+      },
+      {
+        "id": 8,
+        "type": "table",
+        "title": "Root commands by actor",
+        "description": "The actor comes out of the message body; audit_loginuid in the panel to the right is a cross-check, not proof — it is a journald field, supplied by the sending process, and it was matched by the documented forgery (see the “Root commands — the attributable trail” panel's description for what journald fields are and are not worth). It is still worth showing: on a genuine line it attributes the escalation to a human, and a mismatch between it and the actor name is informative. Refusals are excluded: a denied attempt also carries COMMAND=, so counting every COMMAND= line credits a developer with root commands they never ran — ubuntu showed 3 each here while holding no sudo at all. The two excluded verdicts are the same strings alert 1 matches; change one and change both.",
+        "gridPos": {
+          "h": 8,
+          "w": 9,
+          "x": 0,
+          "y": 21
+        },
+        "datasource": {
+          "type": "loki",
+          "uid": "grafanacloud-logs"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "loki",
+              "uid": "grafanacloud-logs"
+            },
+            "queryType": "instant",
+            "expr": "topk(50, sum by (actor, instance) (count_over_time({job=\"dev-vm\", instance=~\"$instance\"} | syslog_identifier=\"sudo\" |= \"COMMAND=\" !~ \"NOT in sudoers|command not allowed\" | regexp `^ *(?P<actor>[a-zA-Z0-9_.-]+) : ` | actor =~ \"$actor\" [$__range])))"
+          }
+        ],
+        "transformations": [
+          {
+            "id": "labelsToFields",
+            "options": {
+              "mode": "columns"
+            }
+          },
+          {
+            "id": "organize",
+            "options": {
+              "excludeByName": {
+                "Time": true
+              },
+              "renameByName": {
+                "actor": "Actor",
+                "instance": "VM",
+                "Value #A": "Commands"
+              }
+            }
+          },
+          {
+            "id": "sortBy",
+            "options": {
+              "sort": [
+                {
+                  "field": "Commands",
+                  "desc": true
+                }
+              ]
+            }
+          }
+        ],
+        "options": {
+          "showHeader": true,
+          "cellHeight": "sm"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "custom": {
+              "align": "auto",
+              "filterable": true
+            },
+            "unit": "short"
+          },
+          "overrides": [
+            {
+              "matcher": {
+                "id": "byName",
+                "options": "Commands"
+              },
+              "properties": [
+                {
+                  "id": "custom.cellOptions",
+                  "value": {
+                    "type": "color-background",
+                    "mode": "gradient"
+                  }
+                },
+                {
+                  "id": "color",
+                  "value": {
+                    "mode": "continuous-blues"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "id": 9,
+        "type": "logs",
+        "title": "Root commands — the attributable trail",
+        "description": "Everyone becomes root on these VMs, so the attributable field is audit_loginuid, shown inline as 'login N' rather than buried in the expandable detail. Filtering stays on syslog_identifier, never the line body — mechanically because stage.output reduces each line to MESSAGE, so a body match for 'sudo' finds nothing, and that is a display and cost choice, not a security boundary: logger -t sudo sets syslog_identifier from an unprivileged shell, so filtering on it establishes no trust.\n\nexe is shown so a forged line is visible: a line claiming to be sudo whose exe points somewhere else is a strong forgery signal. It is never filtered on because Loki holds no exe for lines shipped before base 0.9.0, so filtering on it would silently show zero for any incident older than that, and a pre-change line cannot be made trustworthy after the fact anyway. An absent exe proves nothing either way: journald fills _EXE best-effort from /proc/PID/exe at receive time, and sudo writes its verdict immediately before exiting, so the read can lose that race even on a genuine line — measured 2026-08-11 over 30 days of the live fleet at 148 of 151 real sudo lines carrying it. Trust lives in the Falco rule 'Developer user invoked sudo', in the Runtime detection (Falco) row below.\n\nRefusals are excluded: a denied attempt also carries COMMAND=, so counting every COMMAND= line credits a developer with root commands they never ran — ubuntu showed 3 each here while holding no sudo at all. The two excluded verdicts are the same strings alert 1 matches; change one and change both.",
+        "gridPos": {
+          "h": 8,
+          "w": 15,
+          "x": 9,
+          "y": 21
+        },
+        "datasource": {
+          "type": "loki",
+          "uid": "grafanacloud-logs"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "loki",
+              "uid": "grafanacloud-logs"
+            },
+            "expr": "{job=\"dev-vm\", instance=~\"$instance\"} | syslog_identifier=\"sudo\" |= \"COMMAND=\" !~ \"NOT in sudoers|command not allowed\" | regexp `^ *(?P<actor>[a-zA-Z0-9_.-]+) : ` | regexp `COMMAND=(?P<command>.+)$` | actor =~ \"$actor\" | line_format `{{.instance}}  comm={{.comm}} exe={{.exe}} {{.actor}} (login {{.audit_loginuid}}) → {{.command}}`"
+          }
+        ],
+        "options": {
+          "showTime": true,
+          "showLabels": false,
+          "showCommonLabels": false,
+          "wrapLogMessage": true,
+          "prettifyLogMessage": false,
+          "enableLogDetails": true,
+          "dedupStrategy": "none",
+          "sortOrder": "Descending"
+        }
+      },
+      {
+        "id": 10,
+        "type": "table",
+        "title": "SSH logins — who, from where, which key type",
+        "description": "Aggregated on the stable dimensions only. Key fingerprint is deliberately not a column: EC2 Instance Connect mints an ephemeral key per session, so grouping admin by fingerprint would produce one row per login.",
+        "gridPos": {
+          "h": 8,
+          "w": 9,
+          "x": 0,
+          "y": 29
+        },
+        "datasource": {
+          "type": "loki",
+          "uid": "grafanacloud-logs"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "loki",
+              "uid": "grafanacloud-logs"
+            },
+            "queryType": "instant",
+            "expr": "topk(50, sum by (instance, ssh_user, src_ip, key_type) (count_over_time({job=\"dev-vm\", instance=~\"$instance\"} |= \"Accepted publickey\" | pattern `Accepted publickey for <ssh_user> from <src_ip> port <port> ssh2: <key_type> <fingerprint>` [$__range])))"
+          }
+        ],
+        "transformations": [
+          {
+            "id": "labelsToFields",
+            "options": {
+              "mode": "columns"
+            }
+          },
+          {
+            "id": "organize",
+            "options": {
+              "excludeByName": {
+                "Time": true
+              },
+              "renameByName": {
+                "instance": "VM",
+                "ssh_user": "User",
+                "src_ip": "From",
+                "key_type": "Key type",
+                "Value #A": "Logins"
+              },
+              "indexByName": {
+                "instance": 0,
+                "ssh_user": 1,
+                "src_ip": 2,
+                "key_type": 3,
+                "Value #A": 4
+              }
+            }
+          },
+          {
+            "id": "sortBy",
+            "options": {
+              "sort": [
+                {
+                  "field": "Logins",
+                  "desc": true
+                }
+              ]
+            }
+          }
+        ],
+        "options": {
+          "showHeader": true,
+          "cellHeight": "sm"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "custom": {
+              "align": "auto",
+              "filterable": true
+            },
+            "unit": "short"
+          },
+          "overrides": [
+            {
+              "matcher": {
+                "id": "byName",
+                "options": "Logins"
+              },
+              "properties": [
+                {
+                  "id": "custom.cellOptions",
+                  "value": {
+                    "type": "color-background",
+                    "mode": "gradient"
+                  }
+                },
+                {
+                  "id": "color",
+                  "value": {
+                    "mode": "continuous-blues"
+                  }
+                },
+                {
+                  "id": "custom.width",
+                  "value": 100
+                }
+              ]
+            },
+            {
+              "matcher": {
+                "id": "byName",
+                "options": "Key type"
+              },
+              "properties": [
+                {
+                  "id": "custom.width",
+                  "value": 110
+                }
+              ]
+            },
+            {
+              "matcher": {
+                "id": "byName",
+                "options": "From"
+              },
+              "properties": [
+                {
+                  "id": "custom.width",
+                  "value": 150
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "id": 11,
+        "type": "logs",
+        "title": "SSH logins — detail, with key fingerprint",
+        "description": "The fingerprint is the part worth reading, and it means opposite things per user: admin's changes every login because EC2 Instance Connect issues a throwaway key, while a developer's is the one key they registered — so a NEW fingerprint for a developer is a key nobody authorised.",
+        "gridPos": {
+          "h": 8,
+          "w": 15,
+          "x": 9,
+          "y": 29
+        },
+        "datasource": {
+          "type": "loki",
+          "uid": "grafanacloud-logs"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "loki",
+              "uid": "grafanacloud-logs"
+            },
+            "expr": "{job=\"dev-vm\", instance=~\"$instance\"} |= \"Accepted publickey\" | pattern `Accepted publickey for <ssh_user> from <src_ip> port <port> ssh2: <key_type> <fingerprint>` | line_format `{{.instance}}  {{.ssh_user}} from {{.src_ip}}  {{.key_type}} {{.fingerprint}}`"
+          }
+        ],
+        "options": {
+          "showTime": true,
+          "showLabels": false,
+          "showCommonLabels": false,
+          "wrapLogMessage": true,
+          "enableLogDetails": true,
+          "dedupStrategy": "none",
+          "sortOrder": "Descending"
+        }
+      },
+      {
+        "id": 300,
+        "type": "row",
+        "title": "Anomalies — these three should be empty",
+        "gridPos": {
+          "h": 1,
+          "w": 24,
+          "x": 0,
+          "y": 37
+        },
+        "collapsed": false,
+        "panels": []
+      },
+      {
+        "id": 12,
+        "type": "logs",
+        "title": "Escalation refused",
+        "description": "The single most interesting event this fleet can produce. Requires classic sudo — sudo-rs, the default on Ubuntu 26.04, writes nothing when it refuses, which is why the AMI is pinned to 24.04.\n\nexe is shown but never filtered on: Loki holds no exe for lines shipped before base 0.9.0, so filtering on it would silently show zero for any incident older than that, and a pre-change line cannot be made trustworthy after the fact anyway. Real sudo on this AMI writes exe=/usr/bin/sudo (measured from structured metadata on real 'NOT in sudoers' lines) — a line claiming to be sudo whose exe points somewhere else is a strong forgery signal. An absent exe proves nothing either way: journald fills _EXE best-effort from /proc/PID/exe at receive time, and sudo writes its verdict immediately before exiting, so the read can lose that race even on a genuine refusal.\n\nThis panel is blind to sudo -n: measured 2026-08-12 on a live VM, four real 'sudo -n' attempts produced zero journald verdicts here while Falco detected all four, and in the same window three forgeries did land here as 'command not allowed'. For the cheapest probing form, this panel shows only fabrications — the authoritative detector is the Falco rule 'Developer user invoked sudo', in the Runtime detection (Falco) row below.",
+        "gridPos": {
+          "h": 7,
+          "w": 12,
+          "x": 0,
+          "y": 38
+        },
+        "datasource": {
+          "type": "loki",
+          "uid": "grafanacloud-logs"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "loki",
+              "uid": "grafanacloud-logs"
+            },
+            "expr": "{job=\"dev-vm\", instance=~\"$instance\"} | syslog_identifier=\"sudo\" |~ \"NOT in sudoers|command not allowed\" | line_format `{{.instance}}  comm={{.comm}} exe={{.exe}} (login {{.audit_loginuid}}) {{ __line__ }}`"
+          }
+        ],
+        "options": {
+          "showTime": true,
+          "wrapLogMessage": true,
+          "enableLogDetails": true,
+          "dedupStrategy": "none",
+          "sortOrder": "Descending"
+        }
+      },
+      {
+        "id": 13,
+        "type": "logs",
+        "title": "SSH authentication anomalies",
+        "description": "Expect exactly one 'Invalid user admin' per VM lifetime and nothing else. Do not add AuthorizedKeysCommand failures here: EC2 Instance Connect consults its helper per candidate key and it exits 255 on the ones that do not match, measured at 15 occurrences against 52 entirely normal logins.",
+        "gridPos": {
+          "h": 7,
+          "w": 12,
+          "x": 12,
+          "y": 38
+        },
+        "datasource": {
+          "type": "loki",
+          "uid": "grafanacloud-logs"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "loki",
+              "uid": "grafanacloud-logs"
+            },
+            "expr": "{job=\"dev-vm\", instance=~\"$instance\"} |~ \"Failed password|Invalid user|maximum authentication attempts\" | line_format `{{.instance}}  {{ __line__ }}`"
+          }
+        ],
+        "options": {
+          "showTime": true,
+          "wrapLogMessage": true,
+          "enableLogDetails": true,
+          "dedupStrategy": "none",
+          "sortOrder": "Descending"
+        }
+      },
+      {
+        "id": 14,
+        "type": "logs",
+        "title": "Account and group changes",
+        "description": "How access gets quietly widened, and what a converge is supposed to be the only source of. A burst on a VM's first converge is expected — the alloy user plus its adm and systemd-journal memberships — and anything outside that window is a real change.",
+        "gridPos": {
+          "h": 7,
+          "w": 24,
+          "x": 0,
+          "y": 45
+        },
+        "datasource": {
+          "type": "loki",
+          "uid": "grafanacloud-logs"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "loki",
+              "uid": "grafanacloud-logs"
+            },
+            "expr": "{job=\"dev-vm\", instance=~\"$instance\"} | syslog_identifier=~\"useradd|usermod|userdel|groupadd|gpasswd|chpasswd\" | line_format `{{.instance}}  [{{.syslog_identifier}}] {{ __line__ }}`"
+          }
+        ],
+        "options": {
+          "showTime": true,
+          "wrapLogMessage": true,
+          "enableLogDetails": true,
+          "dedupStrategy": "none",
+          "sortOrder": "Descending"
+        }
+      },
+      {
+        "id": 400,
+        "type": "row",
+        "title": "Pipeline health — can the panels above be trusted",
+        "gridPos": {
+          "h": 1,
+          "w": 24,
+          "x": 0,
+          "y": 52
+        },
+        "collapsed": false,
+        "panels": []
+      },
+      {
+        "id": 15,
+        "type": "bargauge",
+        "title": "Busiest unit, now",
+        "description": "A ratio against a limit, so a meter rather than an arc — an empty track against the full width reads as 'far from the ceiling', which a gauge showing 0 of 1200 does not. The ceiling is 1200 lines/min per unit (20/s) and the limiter discards the excess with no log line of any kind: measured at 3001 lines emitted, 439 arrived, Alloy's journal silent about the rest. Saturation here is the only visible sign audit lines are going missing.",
+        "gridPos": {
+          "h": 6,
+          "w": 5,
+          "x": 0,
+          "y": 53
+        },
+        "datasource": {
+          "type": "loki",
+          "uid": "grafanacloud-logs"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "loki",
+              "uid": "grafanacloud-logs"
+            },
+            "queryType": "instant",
+            "expr": "max(max by (instance, unit) (count_over_time({job=\"dev-vm\", instance=~\"$instance\"} [1m])))"
+          }
+        ],
+        "options": {
+          "displayMode": "basic",
+          "orientation": "horizontal",
+          "reduceOptions": {
+            "calcs": [
+              "lastNotNull"
+            ]
+          },
+          "showUnfilled": true,
+          "valueMode": "color",
+          "minVizWidth": 8,
+          "minVizHeight": 16,
+          "namePlacement": "auto",
+          "sizing": "auto"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "min": 0,
+            "max": 1200,
+            "noValue": "0",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "yellow",
+                  "value": 1000
+                },
+                {
+                  "color": "red",
+                  "value": 1200
+                }
+              ]
+            }
+          },
+          "overrides": []
+        }
+      },
+      {
+        "id": 16,
+        "type": "timeseries",
+        "title": "Busiest unit over time, against the 1200/min ceiling",
+        "description": "One series on purpose: the worst unit anywhere at each moment. The previous version drew a line per unit under topk(10), which does not cap series over a range — it produced twenty-odd cycled colours and pushed the ceiling off the top of the axis, so the panel could not answer the question in its own title. The axis is fixed rather than auto-scaled, so headroom against the ceiling is always visible, and its max sits above the ceiling rather than on it: a unit measured at 1205/min against a 1200 axis had its peak clipped by the frame.",
+        "gridPos": {
+          "h": 6,
+          "w": 12,
+          "x": 5,
+          "y": 53
+        },
+        "datasource": {
+          "type": "loki",
+          "uid": "grafanacloud-logs"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "loki",
+              "uid": "grafanacloud-logs"
+            },
+            "expr": "max(max by (instance, unit) (count_over_time({job=\"dev-vm\", instance=~\"$instance\"} [1m])))",
+            "legendFormat": "busiest unit"
+          }
+        ],
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom",
+            "showLegend": false
+          },
+          "tooltip": {
+            "mode": "single"
+          }
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "min": 0,
+            "max": 1400,
+            "custom": {
+              "drawStyle": "line",
+              "lineWidth": 2,
+              "fillOpacity": 10,
+              "showPoints": "never",
+              "thresholdsStyle": {
+                "mode": "line"
+              }
+            },
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "transparent",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 1000
+                }
+              ]
+            }
+          },
+          "overrides": []
+        }
+      },
+      {
+        "id": 17,
+        "type": "table",
+        "title": "Noisiest units over the range (top 10 — the rest are not shown)",
+        "description": "Total lines per unit, not peak rate: Loki has no subquery, so peak-per-unit over a range is not expressible in one query. Named as a top-10 rather than silently truncating.",
+        "gridPos": {
+          "h": 6,
+          "w": 7,
+          "x": 17,
+          "y": 53
+        },
+        "datasource": {
+          "type": "loki",
+          "uid": "grafanacloud-logs"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "loki",
+              "uid": "grafanacloud-logs"
+            },
+            "queryType": "instant",
+            "expr": "topk(10, sum by (instance, unit) (count_over_time({job=\"dev-vm\", instance=~\"$instance\"} [$__range])))"
+          }
+        ],
+        "transformations": [
+          {
+            "id": "labelsToFields",
+            "options": {
+              "mode": "columns"
+            }
+          },
+          {
+            "id": "organize",
+            "options": {
+              "excludeByName": {
+                "Time": true
+              },
+              "renameByName": {
+                "instance": "VM",
+                "unit": "Unit",
+                "Value #A": "Lines"
+              }
+            }
+          },
+          {
+            "id": "sortBy",
+            "options": {
+              "sort": [
+                {
+                  "field": "Lines",
+                  "desc": true
+                }
+              ]
+            }
+          }
+        ],
+        "options": {
+          "showHeader": true,
+          "cellHeight": "sm"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "custom": {
+              "align": "auto",
+              "filterable": true
+            },
+            "unit": "short"
+          },
+          "overrides": [
+            {
+              "matcher": {
+                "id": "byName",
+                "options": "Lines"
+              },
+              "properties": [
+                {
+                  "id": "custom.cellOptions",
+                  "value": {
+                    "type": "color-background",
+                    "mode": "gradient"
+                  }
+                },
+                {
+                  "id": "color",
+                  "value": {
+                    "mode": "continuous-blues"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "id": 18,
+        "type": "bargauge",
+        "title": "Log volume, trailing 30 days, against the free tier",
+        "description": "Fixed 30-day window regardless of the dashboard's time range, because the quota is monthly, and deliberately not scoped by the VM filter, because the quota is fleet-wide. The rate limiter exists as the guard on this number, and a developer can push it up on purpose.",
+        "gridPos": {
+          "h": 6,
+          "w": 5,
+          "x": 0,
+          "y": 59
+        },
+        "datasource": {
+          "type": "loki",
+          "uid": "grafanacloud-logs"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "loki",
+              "uid": "grafanacloud-logs"
+            },
+            "queryType": "instant",
+            "expr": "sum(bytes_over_time({job=\"dev-vm\"} [30d]))"
+          }
+        ],
+        "options": {
+          "displayMode": "basic",
+          "orientation": "horizontal",
+          "reduceOptions": {
+            "calcs": [
+              "lastNotNull"
+            ]
+          },
+          "showUnfilled": true,
+          "valueMode": "color",
+          "minVizWidth": 8,
+          "minVizHeight": 16,
+          "namePlacement": "auto",
+          "sizing": "auto"
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "bytes",
+            "min": 0,
+            "max": 53687091200,
+            "noValue": "0",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "yellow",
+                  "value": 42949672960
+                },
+                {
+                  "color": "red",
+                  "value": 50990364057
+                }
+              ]
+            }
+          },
+          "overrides": []
+        }
+      },
+      {
+        "id": 19,
+        "type": "logs",
+        "title": "Pipeline complaints — Alloy and CINC",
+        "description": "Where the pipeline reports on itself. A failed push logs 'no retries left, dropping data' — real data loss, and the only kind this pipeline reports at all; rate-limiter drops are reported nowhere.\n\nTwo things the filter cannot do. It cannot key on the word 'error': case-insensitively that scored 90 hits against these same logs, 88 of them Alloy's entirely normal 'node exited without error'. And it cannot key on the journal's level label either — Alloy writes to stdout, so journald stamps every line it produces, errors included, with priority info. The two genuine 'dropping data' lines in these logs both carry level=\"info\". Severity exists only in Alloy's own level= field inside the message text, which is what this matches.",
+        "gridPos": {
+          "h": 6,
+          "w": 19,
+          "x": 5,
+          "y": 59
+        },
+        "datasource": {
+          "type": "loki",
+          "uid": "grafanacloud-logs"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "loki",
+              "uid": "grafanacloud-logs"
+            },
+            "expr": "{job=\"dev-vm\", instance=~\"$instance\"} | syslog_identifier=~\"alloy|cinc-client\" |~ `level=(error|warn)|ERROR|FATAL|dropping data|no retries left` | line_format `{{.instance}}  [{{.syslog_identifier}}] {{ __line__ }}`"
+          }
+        ],
+        "options": {
+          "showTime": true,
+          "wrapLogMessage": true,
+          "enableLogDetails": true,
+          "dedupStrategy": "none",
+          "sortOrder": "Descending"
+        }
+      },
+      {
+        "collapsed": false,
+        "gridPos": {
+          "h": 1,
+          "w": 24,
+          "x": 0,
+          "y": 65
+        },
+        "id": 500,
+        "title": "Runtime detection (Falco) — a hit has no legitimate cause",
+        "type": "row"
+      },
+      {
+        "datasource": {
+          "type": "loki",
+          "uid": "grafanacloud-logs"
+        },
+        "description": "Zero is the expected state, and that is measured, not hoped: the ruleset produced nothing at idle and nothing under npm installs, container builds and parallel compiles. Platform rules fire only on things the fleet makes structurally impossible — writing ~/.aws/credentials, a non-root process reaching IMDS, a denied access in the credential store — so any nonzero count here is worth reading, not triaging.",
+        "fieldConfig": {
+          "defaults": {
+            "noValue": "0",
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "red",
+                  "value": 1
+                }
+              ]
+            },
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "gridPos": {
+          "h": 7,
+          "w": 4,
+          "x": 0,
+          "y": 66
+        },
+        "id": 20,
+        "options": {
+          "colorMode": "value",
+          "graphMode": "none",
+          "reduceOptions": {
+            "calcs": [
+              "lastNotNull"
+            ]
+          },
+          "textMode": "value"
+        },
+        "targets": [
+          {
+            "datasource": {
+              "type": "loki",
+              "uid": "grafanacloud-logs"
+            },
+            "expr": "sum(count_over_time({job=\"dev-vm\", unit=\"falco-modern-bpf.service\", instance=~\"$instance\"} | json | __error__=\"\" [$__range]))",
+            "queryType": "instant",
+            "refId": "A"
+          }
+        ],
+        "title": "Falco detections",
+        "type": "stat"
+      },
+      {
+        "datasource": {
+          "type": "loki",
+          "uid": "grafanacloud-logs"
+        },
+        "description": "Keyed on the rule name from Falco's own JSON. The | json guard is load-bearing: Falco's startup banner goes through the same journal unit and is not JSON — without __error__=\"\" it poisons every query on this stream.",
+        "fieldConfig": {
+          "defaults": {
+            "custom": {
+              "drawStyle": "bars",
+              "fillOpacity": 100,
+              "stacking": {
+                "mode": "normal"
+              }
+            },
+            "unit": "short"
+          },
+          "overrides": []
+        },
+        "gridPos": {
+          "h": 7,
+          "w": 9,
+          "x": 4,
+          "y": 66
+        },
+        "id": 21,
+        "maxDataPoints": 300,
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom",
+            "showLegend": true
+          },
+          "tooltip": {
+            "mode": "multi"
+          }
+        },
+        "targets": [
+          {
+            "datasource": {
+              "type": "loki",
+              "uid": "grafanacloud-logs"
+            },
+            "expr": "sum by (rule) (count_over_time({job=\"dev-vm\", unit=\"falco-modern-bpf.service\", instance=~\"$instance\"} | json | __error__=\"\" [$__interval]))",
+            "legendFormat": "{{rule}}",
+            "refId": "A"
+          }
+        ],
+        "title": "Detections by rule",
+        "type": "timeseries"
+      },
+      {
+        "datasource": {
+          "type": "loki",
+          "uid": "grafanacloud-logs"
+        },
+        "description": "One line per detection: which VM, which rule, the binary, and as whom. cmdline is shown when the rule exports it — the credentials rule deliberately does not, because its command line can carry the key being reported, so the template omits the field rather than rendering an empty gap. The full Falco event is in the expandable details. loginuid here comes from the kernel via Falco — unlike the journald audit_loginuid in the root-commands panel above, which is supplied by the sending process — and that is the difference that matters: this loginuid cannot be forged by the process it reports on.",
+        "gridPos": {
+          "h": 7,
+          "w": 11,
+          "x": 13,
+          "y": 66
+        },
+        "id": 22,
+        "options": {
+          "dedupStrategy": "none",
+          "enableLogDetails": true,
+          "showTime": true,
+          "sortOrder": "Descending",
+          "wrapLogMessage": true
+        },
+        "targets": [
+          {
+            "datasource": {
+              "type": "loki",
+              "uid": "grafanacloud-logs"
+            },
+            "expr": "{job=\"dev-vm\", unit=\"falco-modern-bpf.service\", instance=~\"$instance\"} | json | __error__=\"\" | line_format `{{.instance}}  [{{.priority}}] {{.rule}} — {{.output_fields_proc_exepath}}{{ if .output_fields_proc_cmdline }} :: {{.output_fields_proc_cmdline}}{{ end }} (loginuid {{.output_fields_user_loginuid}}, euser {{.output_fields_user_name}})`",
+            "refId": "A"
+          }
+        ],
+        "title": "Recent detections",
+        "type": "logs"
+      }
+    ]
+  }
+}

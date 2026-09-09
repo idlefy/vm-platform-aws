@@ -1,0 +1,19 @@
+---
+# Generic CINC server defaults. Tenant-specific values live in
+# group_vars/all/tenant.yml (see tenant.yml.example).
+#
+# Required from group_vars/all/tenant.yml:
+#   cinc_server_fqdn, cinc_org_name, cinc_org_full_name, cinc_admin_email
+
+# Exact version, not the major "15" this used to be — with a major-only value the
+# installer resolves to "whatever is newest today", so two runs months apart give
+# two different servers. Newest in the 15 line; there is no 16.
+cinc_server_version: "15.10.114"
+cinc_admin_username: "admin"
+
+# Override via --extra-vars or ansible-vault
+cinc_admin_password: "{{ vault_cinc_admin_password }}"
+
+cinc_admin_key_path: "/etc/cinc-project/admin.pem"
+cinc_org_validator_key_path: "/etc/cinc-project/{{ cinc_org_name }}-validator.pem"
+cinc_certbot_email: "{{ cinc_admin_email }}"

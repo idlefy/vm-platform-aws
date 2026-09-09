@@ -1,0 +1,30 @@
+---
+# Per-tenant Ansible-vault encrypted secrets for the infra control plane.
+#
+# Copy this file to `vault.yml` and encrypt its values with `ansible-vault`.
+# `vault.yml` is gitignored, and the entry stays that way: it is what stops an
+# in-place `ansible-vault decrypt` from making the cleartext committable. If you
+# want the *encrypted* blob in your tenant's private repository — so the secrets
+# are not only on one operator's workstation — commit it once, explicitly:
+#
+#   git add -f infra/ansible/group_vars/all/vault.yml
+#
+# Deliberate, per commit, and the ignore rule still guards every other path.
+#
+# Use a vault password file of your own (e.g. ~/.vault_pass_<org>) so a leak of
+# one tenant's password does not expose another's. `vault_password_file` in
+# infra/ansible/ansible.cfg names it; it points at ~/.vault_pass by default, and
+# that file must exist before any playbook here will run.
+#
+# To populate, replace the placeholder below and encrypt the value:
+#
+#   echo -n 'your-strong-cinc-admin-pw' | ansible-vault encrypt_string \
+#     --stdin-name 'vault_cinc_admin_password' >> vault.yml
+#
+# Nothing in this file goes to SSM. The two per-region SSM SecureStrings the
+# platform needs — the CINC validator key and the Grafana Cloud Loki push
+# token — are created by hand, region by region, and the runbook covers both:
+# https://idlefy.github.io/vm-platform-aws/runbook/
+
+# CINC web UI admin user password (login: "admin")
+vault_cinc_admin_password: REPLACE_ME_BEFORE_ENCRYPTING

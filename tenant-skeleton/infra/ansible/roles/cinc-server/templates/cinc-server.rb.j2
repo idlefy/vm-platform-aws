@@ -1,0 +1,7 @@
+# CINC Server configuration — managed by Ansible
+api_fqdn "{{ cinc_server_fqdn }}"
+{% if cinc_ssl_enabled | default(false) %}
+
+nginx['ssl_certificate']     = "/etc/letsencrypt/live/{{ cinc_server_fqdn }}/fullchain.pem"
+nginx['ssl_certificate_key'] = "/etc/letsencrypt/live/{{ cinc_server_fqdn }}/privkey.pem"
+{% endif %}

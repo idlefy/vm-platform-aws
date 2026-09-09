@@ -1,0 +1,305 @@
+# Falco rules specific to this platform.  Managed by CINC — base::falco.
+# Loaded from /etc/falco/rules.d, i.e. after falco_rules.yaml, so `rule_matching:
+# first` means an upstream rule matching the same event would win. Checked on a
+# live VM: none of the four below overlaps a stable rule.
+#
+# The fourth rule ("Developer user invoked sudo") was checked on 2026-08-12 with
+# `falco -L` on a converged VM: 29 rules load, and the only stable rules whose
+# condition mentions sudo at all key on *file access* to /etc/sudoers and
+# /etc/sudoers.d — open/openat/openat2, symlink/symlinkat, link/linkat. None
+# matches an execve, so nothing upstream can take this event first. Re-run that
+# check after a falco package upgrade rather than trusting this note: the failure
+# mode is silent, because a losing rule reports nothing at all.
+#
+# Every rule here exists because the platform makes something structurally
+# impossible, so a hit has no legitimate cause. That is the only kind of rule
+# worth adding to a developer VM: anything that needs a judgement call about
+# whether the developer "meant it" will be tuned into silence within a week.
+#
+# Each condition starts with a positive evt.type filter. Falco evaluates the
+# ruleset per syscall, and the upstream style guide is explicit that negated
+# evt.type expressions carry a large penalty.
+#
+# --- Deliberately NOT here, so nobody re-derives them -----------------------
+#
+# * "Broker credential file read by a suspicious process." There is no syscall-level
+#   discriminator. Malware inside `npm install` is the same process tree, with the
+#   same uid, the same authority AND the same tty as the developer who started it —
+#   tty is inherited, so "no tty" does not separate them. The tractable version is
+#   to record every reader's exepath and alert in LogQL on a reader outside a known
+#   set; that is a query plus a maintained list, not a Falco condition, and it needs
+#   a volume measurement first because the file is read on every `aws` invocation.
+#
+# * "Outbound connection from a binary under node_modules / a package cache."
+#   Misses the dominant case (malicious JS is run by /usr/bin/node, whose exepath is
+#   perfectly normal) and fires on the legitimate one — esbuild and sharp both
+#   download prebuilt binaries during install. Wrong on both sides.
+#
+# * "Write to shell dotfiles as persistence." Developers edit their own ~/.bashrc
+#   and ~/.zshrc; rootless Docker writes ~/.config/systemd/user/docker.service.
+#   Noise with a security-sounding name.
+#
+# ---------------------------------------------------------------------------
+
+# Note the absence of `evt.dir` anywhere below. Falco 0.44 dropped enter events, so
+# `evt.dir = <` is always true and `evt.dir = >` always false; the loader emits
+# LOAD_DEPRECATED_ITEM for it. Do not add it back from an older example.
+#
+- rule: AWS credentials file written under a home directory
+  desc: >
+    On this fleet nothing reads ~/.aws/credentials. base::aws_access exports
+    AWS_SHARED_CREDENTIALS_FILE=/dev/shm/dev-vm-aws/credentials from
+    /etc/profile.d/dev-vm.sh and /etc/zsh/zshenv, so the CLI looks only at the
+    broker's file; `aws configure` fails with EACCES against it because it is
+    root-owned 0640; and a hand-written ~/.aws/credentials is simply ignored. All
+    three measured on a live VM on 2026-08-06. `aws sso login` writes
+    ~/.aws/sso/cache and ~/.aws/config, never `credentials`.
+    So a write to this path means long-lived credentials have been brought onto a
+    developer VM. That matters more than it looks: such credentials belong to a
+    different principal, so the VM's permissions boundary — the control this whole
+    platform rests on — does not apply to them at all. Blocking the path is not an
+    option (the developer owns $HOME, and AWS_ACCESS_KEY_ID in the environment
+    outranks every file), which is exactly why this is a detection.
+    Three branches, and the third is not padding. Verified on a live VM: an
+    `mv /tmp/x /home/ubuntu/.aws/credentials` reports evt.arg.newpath as an absolute
+    path, but only because the argument was absolute — `cd ~/.aws && mv x credentials`
+    would report newpath="credentials" and evade an endswith match, and it would not
+    hit the open branch either because mv never opens the destination. proc.cwd closes
+    that; observed values carry a trailing slash ("/home/ubuntu/.aws/").
+  condition: >
+    (evt.type in (open, openat, openat2)
+     and evt.is_open_write = true
+     and fd.name endswith "/.aws/credentials")
+    or
+    (evt.type in (rename, renameat, renameat2)
+     and evt.arg.newpath endswith "/.aws/credentials")
+    or
+    (evt.type in (rename, renameat, renameat2)
+     and evt.arg.newpath = "credentials"
+     and proc.cwd endswith "/.aws/")
+  # No %proc.cmdline here, and that is deliberate — it is the one rule of the
+  # three where the command line can carry the very secret the rule is reporting.
+  # `AWS_SHARED_CREDENTIALS_FILE= aws configure set aws_secret_access_key <KEY>`
+  # writes this path and puts the key in argv, so exporting cmdline would copy a
+  # live long-lived credential into journald and on into Loki, where it would sit
+  # in the audit store for the retention period. The other two rules keep cmdline
+  # because no comparable path exists for them (see each).
+  #
+  # What is lost is the arguments, not the attribution: file, newpath, cwd, the
+  # acting user, the tamper-resistant loginuid, the binary's full path and three
+  # generations of ancestry all remain, which is what a triage actually starts
+  # from. If you need the arguments for a specific investigation they are on the
+  # VM in the process tree while it still exists.
+  output: >
+    Long-lived AWS credentials written under a home directory
+    (file=%fd.name newpath=%evt.arg.newpath cwd=%proc.cwd evt_type=%evt.type
+    user=%user.name uid=%user.uid loginuid=%user.loginuid
+    process=%proc.name exepath=%proc.exepath
+    parent=%proc.pname gparent=%proc.aname[2] ggparent=%proc.aname[3] tty=%proc.tty)
+  priority: WARNING
+  tags: [dev-vm, host, aws, mitre_credential_access, T1552.001]
+
+- rule: Instance metadata service contacted by a non-root process
+  desc: >
+    base::imds allows 169.254.169.254 in the OUTPUT chain for uid 0 and for the
+    ec2-instance-connect user, and DROPs it for everyone else — so a developer
+    process cannot reach IMDS at all. Harvesting instance credentials from IMDS is
+    the standard opening move of cloud malware, and here the attempt is both futile
+    and unambiguous: no legitimate non-root workload on this VM has any reason to
+    touch that address. This is the detection the journal cannot provide — an
+    iptables DROP is silent, so today the attempt leaves no trace anywhere.
+    Note the rule keys on the attempt, not its outcome. The packet is dropped rather
+    than rejected, so a blocking connect() sits until TCP gives up; the exit event
+    can therefore arrive well after the attempt.
+  condition: >
+    evt.type = connect
+    and fd.sip = "169.254.169.254"
+    and user.uid != 0
+    and not user.name = "ec2-instance-connect"
+  # cmdline IS exported here, unlike the credentials rule above. It is the field
+  # that separates reconnaissance from credential theft — /latest/meta-data/ vs
+  # .../iam/security-credentials/ is the whole difference — and an IMDSv2 token
+  # cannot leak through it, because no process on this VM can obtain one: the
+  # token request is itself a connect to the same DROPped address.
+  output: >
+    Non-root process reached for instance metadata
+    (dest=%fd.sip:%fd.sport res=%evt.res
+    user=%user.name uid=%user.uid loginuid=%user.loginuid
+    process=%proc.name exepath=%proc.exepath cmdline=%proc.cmdline
+    parent=%proc.pname gparent=%proc.aname[2] ggparent=%proc.aname[3])
+  priority: CRITICAL
+  tags: [dev-vm, host, aws, mitre_credential_access, T1552.005]
+
+- rule: Denied access to the VM credential store
+  desc: >
+    /dev/shm/dev-vm-aws is root:ubuntu 0750 and its credentials file root:ubuntu
+    0640. The developer can read the file and can write nothing in the directory;
+    root's broker is the only writer and it always succeeds, publishing via mktemp
+    plus mv. So a *denied* access there has no legitimate cause — it is either
+    something trying to substitute the credentials root published, which is the
+    attack /dev/shm's 1777 mode makes possible and which the broker's mode checks
+    exist to stop, or something probing for the credentials from an account that
+    should not have them.
+    Keyed on the denial rather than on the identity of the writer on purpose: the
+    broker is a shell script, so the process actually opening the file is mv or jq
+    and the only thing tying it to the broker is proc.pname — a name any process can
+    claim. A rule that trusted that field would hand over the exemption with it.
+  condition: >
+    evt.type in (open, openat, openat2)
+    and evt.res = EACCES
+    and fd.name startswith "/dev/shm/dev-vm-aws"
+  # cmdline is exported here too. The event is a *failed* open, so nothing was
+  # read, and the arguments are the only record of what was being reached for —
+  # the directory, the credentials file, or a path being written over it.
+  output: >
+    Access denied in the VM credential store
+    (file=%fd.name res=%evt.res evt_type=%evt.type
+    user=%user.name uid=%user.uid loginuid=%user.loginuid
+    process=%proc.name exepath=%proc.exepath cmdline=%proc.cmdline
+    parent=%proc.pname gparent=%proc.aname[2])
+  priority: WARNING
+  tags: [dev-vm, host, aws, mitre_credential_access, T1552.001]
+
+# The one detector here that exists because journald cannot be trusted. Every
+# _-prefixed journald field is derived from the sending process, so a developer
+# can mint a line claiming any sudo verdict — verified 2026-08-11 against _COMM,
+# _EXE, _UID, _AUDIT_LOGINUID, _AUDIT_SESSION, _CAP_EFFECTIVE and _SYSTEMD_UNIT
+# simultaneously. Falco does not read a line somebody asked to have logged; it
+# observes the execve in the kernel, so there is no sender to lie.
+#
+# user.loginuid, NOT user.uid, and this is the whole rule. sudo is setuid root,
+# so on the execve *exit* event the process is already running as root: measured
+# 2026-08-12 on a live VM, a real `sudo -n id` by ubuntu reports
+# `uid=0 loginuid=1000 exepath=/usr/bin/sudo`. A condition on `user.uid = 1000`
+# therefore matches nothing, ever, and says nothing when it doesn't — the first
+# draft of this rule had exactly that and produced zero detections on a real
+# escalation attempt.
+#
+# loginuid is the right anchor rather than a workaround. The kernel sets it from
+# PAM at session start and refuses to let an unprivileged process rewrite it —
+# verified: `echo 0 > /proc/self/loginuid` as ubuntu returns EPERM. It also
+# survives the setuid transition, which is precisely why the audit subsystem
+# uses it to answer "which human".
+#
+# loginuid = 1000, not `!= 0`: admin is 1001 and runs sudo constantly, so a
+# non-root match would fire on every devops session. ubuntu is the only human on
+# these VMs and holds no sudo today — confirmed 2026-08-12, `sudo -l -U ubuntu`
+# returns "User ubuntu is not allowed to run sudo" — which is what makes any hit
+# here reportable on its own. A root shell obtained by ubuntu keeps loginuid
+# 1000, so it stays in scope; a system daemon has loginuid -1 and does not.
+#
+# Both execve AND execveat — belt and braces, NOT a fix for a live gap, and the
+# distinction is worth keeping straight because a review asserted the gap and the
+# measurement refuted it.
+#
+# Measured 2026-08-12 on a live VM. A static C binary calling
+# `syscall(SYS_execveat, AT_FDCWD, "/usr/bin/sudo", ...)` — a raw syscall, so no
+# glibc fallback to execve — was run as `ubuntu` against a rules file carrying the
+# original `evt.type = execve` condition, and it **still produced a detection**.
+# Falco's driver reports the execveat exit event under the same event type, so an
+# execve-only condition was never blind to it. The enumeration is kept anyway
+# because it costs nothing, it matches how the rules above enumerate
+# open/openat/openat2 and rename/renameat/renameat2, and it survives a future
+# driver that stops normalising. `execveat` is a valid evt.type on the pinned
+# Falco and the file passes `falco --validate` with it.
+#
+# If you are tempted to widen this condition for some other syscall, run the same
+# negative control first: install the narrow condition, exercise the path you
+# think it misses, and check whether it fires. Widening on a reasoned-about gap
+# rather than a measured one is how this file would accumulate noise.
+#
+# proc.exepath = /usr/bin/sudo is the literal this AMI reports, taken from a real
+# event rather than assumed, and it is the field carrying the trust. Falco's
+# proc.name is forgeable in exactly the way journald's _COMM is: measured here,
+# a symlink named `sudo` pointing at /usr/bin/logger produced an event with
+# `name=sudo` and `exepath=/usr/bin/logger`. Keying on the name would have
+# accepted that forgery; keying on exepath rejected it. Under sudo-rs (26.04,
+# which CLAUDE.md forbids) the path becomes /usr/lib/cargo/bin/sudo, so an AMI
+# bump has to revisit this line or the rule silently stops matching.
+#
+# The verdict (granted vs refused) is NOT in the syscall stream, and since
+# base::sudoers grants `/usr/bin/tailscale login` it can no longer be inferred
+# from the platform's shape either — some invocations now succeed. Triage takes
+# two sources: this rule attributes an escalation-shaped exec to a named human
+# and is trustworthy; the journald verdict line (dashboard panel 12) says whether
+# sudo granted it and is forgeable. A hit here is actionable on its own.
+#
+# The exclusion below is what stops that grant paging someone on every legitimate
+# login — alert 6 is critical, for: 0s, with no threshold. It is full-cmdline
+# EQUALITY, never `contains`/`startswith`/`endswith`, because proc.cmdline is argv
+# and argv is attacker-chosen (see the rule's own desc). Each loose shape has its
+# own hole, and they are not the same hole:
+#
+#   * `contains` and `endswith` — `sudo sh -c id "tailscale login"` carries the
+#     permitted string while asking for something else entirely.
+#   * `startswith` — any trailing argument, e.g. `sudo tailscale login --qr`.
+#     sudoers refuses all of those, so nothing executes, but a refused attempt is
+#     still an execve and the exclusion would make probing invisible. An earlier
+#     version of this comment offered the `sudo sh -c` example as defeating
+#     `startswith` too; it does not — that argv does not start with the permitted
+#     string. Different holes, both real.
+#
+# THE TWO STRINGS BELOW WERE MEASURED, NOT DERIVED. Four legitimate spellings
+# collapse to two, because Falco renders proc.cmdline as proc.name (the exec'd
+# file's basename, from the kernel) plus the arguments — the path used to invoke
+# sudo never appears. Measured on a live VM 2026-08-12, as `ubuntu` with
+# loginuid 1000:
+#
+#   sudo tailscale login              -> cmdline "sudo tailscale login"
+#   /usr/bin/sudo tailscale login     -> cmdline "sudo tailscale login"
+#   sudo /usr/bin/tailscale login     -> cmdline "sudo /usr/bin/tailscale login"
+#   /usr/bin/sudo /usr/bin/tailscale login
+#                                     -> cmdline "sudo /usr/bin/tailscale login"
+#
+# Re-measure rather than reason if this ever needs changing: an exclusion that
+# does not match is indistinguishable from no exclusion until someone is paged,
+# and one that matches too much is indistinguishable from a working detector.
+#
+# Accepted residual: a legitimate-but-unusual spelling still fires. `sudo --
+# tailscale login` is permitted by sudoers and is not in this list. That is the
+# deliberate choice — there is no finite equality list for the spellings sudoers
+# refuses, and any family-shaped match reopens the holes above. README gives
+# developers exactly one spelling, which is what keeps this rare.
+#
+# Note this is deliberately ASYMMETRIC with alert 1 in
+# grafana/alerts/dev-vm-security.yaml, which excludes the whole
+# `/usr/bin/tailscale` family. Different jobs: alert 1 is a forgeable tripwire
+# whose value dies if it is noisy, this is the detector. Do not harmonise them.
+- rule: Developer user invoked sudo
+  desc: >
+    ubuntu holds sudo on exactly one command — `/usr/bin/tailscale login`, which
+    the condition excludes by full-cmdline equality — so any execve of sudo
+    attributed to loginuid 1000 that reaches this rule is an escalation attempt
+    and is worth reporting on its own. Note the exclusion is on the argv, not on
+    the outcome: a refused `sudo tailscale up` still fires, deliberately, because
+    the syscall carries no verdict and a developer probing the boundary is worth
+    seeing. This is the
+    kernel-sourced replacement for trusting sudo's own journal line: alert 1 in
+    grafana/alerts/dev-vm-security.yaml matches text that `logger -t sudo` can
+    fabricate, and remains only as a tripwire.
+    Note what this rule does NOT claim: proc.cmdline is argv and therefore
+    attacker-chosen, so treat the arguments as a report of what was asked for,
+    not as trusted content. The attribution fields — loginuid, the resolved
+    exepath, and three generations of ancestry — are what a triage starts from.
+    Coverage is also bounded: this rule watches sudo only. su, pkexec and
+    newgrp are also setuid/setgid escalation paths on this platform and are not
+    covered here — the same gap the journald alerts already have. Do not read
+    "authoritative escalation detector" as "covers every escalation path".
+  condition: >
+    evt.type in (execve, execveat)
+    and evt.arg.res = 0
+    and proc.exepath = /usr/bin/sudo
+    and user.loginuid = 1000
+    and not proc.cmdline in ("sudo tailscale login", "sudo /usr/bin/tailscale login")
+  # euser/euid, not user/uid: sudo is setuid, so by the exit event these read
+  # root/0 on every hit and a responder reading "user=root" would look for the
+  # wrong human. loginuid is the human. The names are relabelled here rather than
+  # dropped, because seeing euid=0 confirms the setuid transition took effect.
+  output: >
+    Developer user invoked sudo
+    (cmdline=%proc.cmdline exepath=%proc.exepath
+    loginuid=%user.loginuid euser=%user.name euid=%user.uid
+    process=%proc.name parent=%proc.pname gparent=%proc.aname[2]
+    ggparent=%proc.aname[3] tty=%proc.tty cwd=%proc.cwd)
+  priority: WARNING
+  tags: [dev-vm, host, mitre_privilege_escalation, T1548.003]

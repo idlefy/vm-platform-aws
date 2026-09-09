@@ -1,0 +1,8 @@
+# S3 backend partial config — fill in and save as backend.hcl (gitignored).
+# Used by: terraform init -backend-config=backend.hcl
+
+bucket  = "your-terraform-state-bucket"
+key     = "developer-vms/terraform.tfstate"
+region  = "us-east-1"
+profile = "your-aws-cli-profile"
+encrypt = true

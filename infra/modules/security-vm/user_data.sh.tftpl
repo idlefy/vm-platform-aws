@@ -1,0 +1,43 @@
+#!/bin/bash
+set -euo pipefail
+
+apt-get update && apt-get upgrade -y
+
+# Unattended upgrades
+apt-get install -y unattended-upgrades
+echo 'APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";' > /etc/apt/apt.conf.d/20auto-upgrades
+
+cat > /etc/cron.d/system-update << 'CRON'
+0 3 * * * root apt-get update && apt-get upgrade -y
+CRON
+chmod 644 /etc/cron.d/system-update
+
+# UFW
+apt-get install -y ufw
+ufw default deny incoming
+ufw default allow outgoing
+%{ for port in ufw_ports ~}
+ufw allow ${port}
+%{ endfor ~}
+ufw --force enable
+
+# Master SSH keys
+%{ if master_ssh_keys != "" ~}
+mkdir -p /root/.ssh
+chmod 700 /root/.ssh
+cat >> /root/.ssh/authorized_keys << 'SSHKEYS'
+${master_ssh_keys}
+SSHKEYS
+chmod 600 /root/.ssh/authorized_keys
+%{ endif ~}
+
+# CloudWatch agent
+wget -q https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+dpkg -i ./amazon-cloudwatch-agent.deb
+rm ./amazon-cloudwatch-agent.deb
+systemctl enable amazon-cloudwatch-agent
+systemctl start amazon-cloudwatch-agent
+
+echo "Bootstrap complete."

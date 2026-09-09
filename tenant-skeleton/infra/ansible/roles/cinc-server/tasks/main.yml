@@ -1,0 +1,205 @@
+---
+- name: Validate required secrets are defined
+  ansible.builtin.assert:
+    that:
+      - vault_cinc_admin_password is defined
+      - vault_cinc_admin_password | length > 0
+    fail_msg: "vault_cinc_admin_password must be set via ansible-vault"
+
+- name: Download CINC omnibus installer
+  ansible.builtin.get_url:
+    url: https://omnitruck.cinc.sh/install.sh
+    dest: /tmp/cinc-install.sh
+    mode: "0755"
+  changed_when: false
+
+# `creates: /usr/bin/cinc-server-ctl` used to guard this task, which meant it ran
+# exactly once in the life of the server: raising cinc_server_version had no effect
+# whatsoever, and the server stayed on whatever was current the day it was built.
+# Compare against what is actually installed instead, so the version in defaults is
+# the version that runs.
+- name: Read installed CINC Server version
+  ansible.builtin.command: dpkg-query -W -f='${Version}' cinc-server-core
+  register: cinc_server_installed
+  changed_when: false
+  # rc 1 is "no such package" — a first-time install, and the expected answer on a
+  # fresh server. rc 2 and above are dpkg-query's own errors (bad usage, unreadable
+  # database). Accepting those would silently take the not-installed branch, which
+  # skips the backup and reinstalls over a live server.
+  failed_when: cinc_server_installed.rc > 1
+  # Read-only, so let it run under --check too: every task below keys off its
+  # result, and skipping it makes a check run report nothing useful.
+  check_mode: false
+
+- name: Detect an existing CINC Server installation
+  ansible.builtin.stat:
+    path: /usr/bin/cinc-server-ctl
+  register: cinc_server_ctl
+  check_mode: false
+
+# dpkg-query answers rc 1 both when the package is genuinely absent and when it
+# cannot read its own database — the two are indistinguishable by exit code. Cross-
+# check against the binary: a server that is on disk but missing from the package
+# database must not be treated as a fresh install, because that branch is the one
+# that skips the backup.
+- name: Refuse to reinstall over a server dpkg does not know about
+  ansible.builtin.fail:
+    msg: >-
+      /usr/bin/cinc-server-ctl exists but dpkg-query does not report
+      cinc-server-core as installed. Refusing to continue: the version-change path
+      would skip the pre-upgrade backup. Repair the package database first.
+  when:
+    - cinc_server_installed.rc != 0
+    - cinc_server_ctl.stat.exists
+
+- name: Back up CINC Server before changing its version
+  ansible.builtin.command: cinc-server-ctl backup --yes
+  when:
+    - cinc_server_installed.rc == 0
+    - cinc_server_installed.stdout | regex_replace('-[0-9]+$', '') != cinc_server_version
+  changed_when: true
+  # Deliberately not rescued: if the backup fails, stop before touching the
+  # package. An upgrade of this server is not trivially reversible — every VM
+  # converges against it, and `make push` and `make promote` go through it.
+
+- name: Install or upgrade CINC Server via omnibus
+  ansible.builtin.command:
+    cmd: /tmp/cinc-install.sh -P cinc-server -v {{ cinc_server_version }}
+  when: cinc_server_installed.stdout | regex_replace('-[0-9]+$', '') != cinc_server_version
+  register: cinc_server_package
+  changed_when: true
+
+- name: Apply schema migrations after a version change  # noqa: no-handler
+  ansible.builtin.command: cinc-server-ctl upgrade --yes
+  when: cinc_server_package is changed
+  changed_when: true
+  # Deliberately an inline task rather than a handler: handlers flush after the
+  # remaining tasks, and the migration has to land before the API-wait below.
+  # `upgrade`, not the `reconfigure` handler below: reconfigure applies
+  # configuration, while a package change may also need data migrations. It stops
+  # and restarts the services, so the API is briefly unavailable — VMs converging
+  # in that window simply retry on their next 30-minute run.
+
+- name: Ensure CINC Server is running after the upgrade  # noqa: no-handler
+  ansible.builtin.command: cinc-server-ctl start
+  when: cinc_server_package is changed
+  changed_when: false
+
+- name: Create CINC configuration directory
+  ansible.builtin.file:
+    path: /etc/cinc-project
+    state: directory
+    mode: "0750"
+
+- name: Deploy CINC Server configuration
+  ansible.builtin.template:
+    src: cinc-server.rb.j2
+    dest: /etc/cinc-project/cinc-server.rb
+    mode: "0640"
+  notify: reconfigure cinc server
+
+- name: Flush handlers to run reconfigure now
+  ansible.builtin.meta: flush_handlers
+
+- name: Wait for CINC Server API
+  ansible.builtin.uri:
+    url: "https://localhost:443"
+    method: GET
+    validate_certs: false
+    status_code: [200, 401]
+  register: cinc_health
+  retries: 15
+  delay: 10
+  until: cinc_health.status in [200, 401]
+  changed_when: false
+
+- name: Install certbot
+  ansible.builtin.apt:
+    name:
+      - certbot
+    state: present
+    update_cache: true
+
+- name: Obtain Let's Encrypt certificate (standalone)
+  ansible.builtin.command:
+    cmd: >
+      certbot certonly --standalone
+      --pre-hook "cinc-server-ctl stop nginx"
+      --post-hook "cinc-server-ctl start nginx"
+      -d {{ cinc_server_fqdn }}
+      --email {{ cinc_certbot_email }}
+      --agree-tos
+      --non-interactive
+    creates: /etc/letsencrypt/live/{{ cinc_server_fqdn }}/fullchain.pem
+
+- name: Check if Let's Encrypt certificate exists
+  ansible.builtin.stat:
+    path: /etc/letsencrypt/live/{{ cinc_server_fqdn }}/fullchain.pem
+  register: le_cert
+
+- name: Configure CINC Server to use Let's Encrypt certificate
+  ansible.builtin.template:
+    src: cinc-server.rb.j2
+    dest: /etc/cinc-project/cinc-server.rb
+    mode: "0640"
+  vars:
+    cinc_ssl_enabled: true
+  notify: reconfigure cinc server
+  when: le_cert.stat.exists
+
+- name: Flush handlers to apply SSL config
+  ansible.builtin.meta: flush_handlers
+
+- name: Set up certbot renewal hooks
+  ansible.builtin.copy:
+    dest: /etc/letsencrypt/renewal-hooks/{{ item.dir }}/cinc-server.sh
+    mode: "0755"
+    content: |
+      #!/bin/bash
+      cinc-server-ctl {{ item.action }} nginx
+  loop:
+    - { dir: "pre", action: "stop" }
+    - { dir: "post", action: "start" }
+
+- name: Create CINC admin user
+  ansible.builtin.command:
+    cmd: >
+      cinc-server-ctl user-create
+      {{ cinc_admin_username }}
+      Admin User
+      {{ cinc_admin_email }}
+      "{{ cinc_admin_password }}"
+      --filename {{ cinc_admin_key_path }}
+    creates: "{{ cinc_admin_key_path }}"
+  no_log: true
+
+- name: Secure admin key permissions
+  ansible.builtin.file:
+    path: "{{ cinc_admin_key_path }}"
+    mode: "0600"
+    owner: root
+    group: root
+
+- name: Create CINC organization
+  ansible.builtin.command:
+    cmd: >
+      cinc-server-ctl org-create
+      {{ cinc_org_name }}
+      "{{ cinc_org_full_name }}"
+      --association_user {{ cinc_admin_username }}
+      --filename {{ cinc_org_validator_key_path }}
+    creates: "{{ cinc_org_validator_key_path }}"
+
+- name: Secure org validator key permissions
+  ansible.builtin.file:
+    path: "{{ cinc_org_validator_key_path }}"
+    mode: "0600"
+    owner: root
+    group: root
+
+- name: Print CINC Server access info
+  ansible.builtin.debug:
+    msg: |
+      CINC Server API: https://{{ cinc_server_fqdn }}
+      Admin key: {{ cinc_admin_key_path }}
+      Org validator key: {{ cinc_org_validator_key_path }}

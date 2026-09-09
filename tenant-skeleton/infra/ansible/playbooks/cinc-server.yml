@@ -1,0 +1,6 @@
+---
+- name: Deploy CINC Server
+  hosts: cinc
+  become: true
+  roles:
+    - cinc-server

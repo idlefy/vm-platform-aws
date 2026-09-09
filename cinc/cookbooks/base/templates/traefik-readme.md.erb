@@ -1,0 +1,79 @@
+# Publishing a service from this VM
+
+Managed by CINC. This file is rewritten on every converge; edits are lost.
+
+**You do not need to publish anything, and by default you should not.** Anything
+you publish is reachable from the entire internet, and its hostname becomes
+public knowledge within minutes — every certificate issued is written to public
+Certificate Transparency logs, which are monitored continuously. A temporary
+test host is not obscure.
+
+## Your hostname
+
+    https://<%= @fqdn %>
+
+One hostname per VM. Several services can share it by path.
+
+## Publishing
+
+Attach your container to the `web` network and give it these labels:
+
+```yaml
+services:
+  myapp:
+    image: your/image
+    restart: unless-stopped
+    networks: [web]
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.myapp.rule=Host(`<%= @fqdn %>`)
+      - traefik.http.routers.myapp.entrypoints=websecure
+      - traefik.http.routers.myapp.tls.certresolver=le
+      - traefik.http.services.myapp.loadbalancer.server.port=8080
+      - traefik.http.routers.myapp.middlewares=auth@file
+
+networks:
+  web:
+    external: true
+```
+
+Set `loadbalancer.server.port` to the port your app listens on *inside* the
+container. There is no reload step — Traefik picks the container up by itself.
+
+**`restart: unless-stopped` is not optional here.** This VM is stopped when you
+stop working and started again when you come back, and Docker only brings back
+containers that asked to be brought back. Without it your service is up until
+the end of the day and down every morning, with nothing to tell you why. On
+`docker run`, the same thing is `--restart unless-stopped`.
+
+## Password protection
+
+`auth@file` is the last label above and it is **strongly recommended**. A
+password has already been generated for you:
+
+```bash
+cat ~/.config/traefik/password        # username: dev
+```
+
+To add more users:
+
+```bash
+htpasswd -nbB -C 12 alice 'their-password' >> ~/.config/traefik/users
+systemctl --user restart traefik
+```
+
+The restart is required: Traefik reads the password file when its middleware
+configuration loads, and appending a line to `users` does not touch that
+configuration, so nothing changes until it reloads.
+
+Without the `auth@file` label your service is open to anyone who finds the
+hostname, and what you expose is your responsibility.
+
+## When something does not work
+
+Almost every failure looks the same from outside — the browser reports an
+invalid certificate. The real reason is always here:
+
+```bash
+journalctl --user -u traefik -n 50
+```

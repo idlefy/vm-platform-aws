@@ -1,0 +1,465 @@
+# Grafana alert rules for the developer VM fleet.
+#
+# Applied by hand, with a short-lived token — there is deliberately no make
+# target and no Terraform resource for this, because either one would need a
+# Grafana admin credential kept somewhere. See grafana/README.md for the two
+# commands and for that reasoning.
+#
+#   curl -sf     "$GRAFANA_URL/api/v1/provisioning/alert-rules/export"           # GET
+#   curl -sf -X PUT "$GRAFANA_URL/api/v1/provisioning/folder/<f>/rule-groups/<g>"
+#
+# The methods matter: the provisioning API answers GET on export and PUT on a
+# rule group, and returns 404 — not 405 — for anything else, so a POST fails in
+# a way that reads like a wrong URL or a bad token.
+#
+# ---------------------------------------------------------------------------
+# WHY THE QUERIES LOOK LIKE THIS
+#
+# Every match string here was derived from the program that writes it and then
+# confirmed as a line in Loki — not in `journalctl` on the VM, which proves only
+# that the event happened, not that the alert can see it. Two of the original
+# seven queries matched nothing and were found this way. Read
+# docs/design/log-shipping.md, sections
+# "Two wordings, and only one reaches the journal" and "There is no drop to
+# alert on", before editing any `expr` below.
+#
+# Filter processes on `syslog_identifier`, never on the line body: stage.output
+# reduces each line to MESSAGE, so `|~ "sudo"` matches nothing while
+# `| syslog_identifier="sudo"` works. But an identifier filter only raises the
+# bar — it establishes no trust. `logger -t sudo` sets that field from an
+# unprivileged shell, and so does every other journald field that describes the
+# sending process, because the sending process belongs to whoever sent the line.
+# Two fields are the exception: `uid`, which the kernel fills in from
+# SCM_CREDENTIALS, and `unit`, which journald derives from the sender's cgroup —
+# a forged line lands in the developer's own session-N.scope. Anchor a query on
+# those wherever the data allows it, and verify the anchored query returns the
+# same count as the unanchored one before believing it. Anything that needs real
+# trust does not belong here at all: it belongs in the Falco rule, which reads
+# the kernel's view of the syscall rather than a line a process asked to have
+# logged. `unit` is absent on kernel-transport streams, so a {unit="..."}
+# matcher silently excludes them.
+#
+# TWO SETTINGS ARE LOAD-BEARING ON EVERY RULE:
+#
+#   noDataState: OK        These are presence alerts and the fleet is routinely
+#                          empty — Idlefy stops VMs outside working hours.
+#                          NoData -> Alerting would page every evening, which is
+#                          the failure that killed the dead-man's switch.
+#
+#   execErrState: Alerting A detector that cannot run is a security control that
+#                          is off, and there is no second path to notice that.
+#                          The `for` values stop one transient Loki error from
+#                          paging: a real event stays true across several
+#                          evaluations, a one-off error does not.
+# ---------------------------------------------------------------------------
+
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: dev-vm-security
+    # Must name a folder that exists. Grafana's own export writes `folder: ""`
+    # here, which fails to import — do not copy an export over this file
+    # without putting the name back.
+    folder: Developer VMs
+    interval: 1m
+
+    rules:
+      # --- The one that goes to a human ------------------------------------
+      - uid: ffuahumsc3z0gc
+        title: 'dev-vm: escalation refused'
+        condition: B
+        for: 0s
+        noDataState: OK
+        execErrState: Alerting
+        labels:
+          service: dev-vm
+          severity: critical
+        annotations:
+          summary: Someone tried to escalate privileges on {{ $labels.instance }}
+          description: >-
+            Developers hold sudo on exactly one command — `/usr/bin/tailscale
+            login`, granted by base::sudoers — and nothing else. So a refusal for
+            anything outside that is a deliberate act and the most interesting
+            security event this fleet produces. The offending line carries
+            audit_loginuid, which attributes it to a named human even though the
+            effective user is root.
+
+            The whole `/usr/bin/tailscale` command family is excluded, not just
+            the one permitted argv. `sudo tailscale up`, `sudo tailscale logout`,
+            `sudo tailscale login --qr` and a bare `sudo tailscale` all log
+            `command not allowed`, and at `severity: critical` with `for: 0s` an
+            exclusion matching only the exact permitted string would page on every
+            developer typo. This is deliberately NOT what the Falco rule does —
+            that one excludes the permitted spellings only and lets the rest fire.
+            The two have different jobs: this is a forgeable tripwire whose value
+            dies if it is noisy, Falco is the detector. Do not harmonise them.
+
+            The exclusion regex has NO `^`/`$` and that is deliberate. LogQL
+            label-filter regexes are fully anchored, like Prometheus label
+            matchers, so `^/usr/bin/tailscale( |$)` must match the WHOLE value
+            and therefore never matches `/usr/bin/tailscale up` — it silently
+            excluded nothing. Measured 2026-08-12 on a live VM: the anchored form
+            returned 6 where the correct answer was 3. `/usr/bin/tailscale( .*)?`
+            matches the whole value and returns 3.
+
+            Note this failure survived a same-count check against 30 days of
+            fleet history, because a filter that excludes nothing and a filter
+            that excludes only what it should both leave that count unchanged.
+            The same-count check proves you did not lose real detections; it says
+            nothing about whether the exclusion works. Prove that separately, with
+            a line the filter is supposed to drop.
+
+            One property this relies on: sudo logs COMMAND= as the path resolved
+            through secure_path, so a denied `sudo tailscale up` records
+            `/usr/bin/tailscale up`. That resolution happens because ubuntu now
+            matches a UserSpec — before the grant existed the same command logged
+            the bare `tailscale up`, which this regex would not exclude. Measured
+            both forms on the same VM either side of the grant. Steady state is
+            the resolved form; the unresolved one can only appear on a VM that has
+            not yet converged the grant, where it errs toward firing.
+
+            This is a tripwire, not a control. Its selector
+            `syslog_identifier="sudo"` is forgeable with `logger -t sudo`, and so
+            is every other journald field (see the design doc). It still catches
+            the careless case, and its `NOT in sudoers` branch is the only signal
+            for accounts other than ubuntu, since that string is printed only
+            when the user has no sudoers entry at all. The authoritative
+            escalation detector is the Falco rule.
+
+            This alert is blind to `sudo -n`. Measured 2026-08-12 on a live VM,
+            four real `sudo -n` attempts produced zero journald verdicts while
+            the Falco rule "Developer user invoked sudo" detected all four; in
+            the same window three deliberate forgeries did land here as
+            `command not allowed`. So for the cheapest probing form this alert
+            reports only fabrications.
+
+            The two match strings are the verdicts sudoers.so actually writes to
+            the journal, read out of the binary and confirmed on a live 24.04 VM.
+            Do NOT "fix" them to the friendlier wording sudo prints on the
+            terminal ("is not allowed to execute", "a password is required") —
+            those never reach the journal, and the alert would silently stop
+            matching. That is exactly how this alert shipped broken the first
+            time.
+
+            Requires classic sudo. sudo-rs, the default on Ubuntu 26.04, logs
+            nothing at all when it refuses; that is why the fleet AMI is pinned
+            to 24.04.
+
+            This rule depends on a pipeline property, not only on its own query.
+            An interactive sudo is journaled under the developer's own login
+            session scope, so until base 0.6.0 the rate limiter bucketed a
+            developer's `logger` flood together with their escalation verdict and
+            dropped both — measured 2026-08-05, 3 attempts emitted and 0 reaching
+            Loki, this rule reading zero throughout. base 0.6.0 routes the audit
+            identifiers around stage.limit. If that bypass is ever removed, this
+            rule goes quiet again without erroring.
+        data:
+          - refId: A
+            queryType: instant
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: grafanacloud-logs
+            model:
+              refId: A
+              queryType: instant
+              datasource: {type: loki, uid: grafanacloud-logs}
+              expr: >-
+                sum by (instance) (count_over_time({job="dev-vm"} |
+                syslog_identifier="sudo" |~ "NOT in sudoers|command not allowed"
+                | regexp "COMMAND=(?P<cmd>.+)$" | cmd !~
+                "/usr/bin/tailscale( .*)?" [5m]))
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              expression: A
+              datasource: {type: __expr__, uid: __expr__}
+              conditions:
+                - evaluator: {type: gt, params: [0]}
+
+      # --- Worth a channel --------------------------------------------------
+      - uid: ffuahvap8m58gc
+        title: 'dev-vm: converge failed'
+        condition: B
+        for: 0s
+        noDataState: OK
+        execErrState: Alerting
+        labels:
+          service: dev-vm
+          severity: warning
+        annotations:
+          summary: CINC converge failed on {{ $labels.instance }}
+          description: >-
+            A failed converge is invisible on an OSS CINC server, so the VM
+            silently stops tracking the cookbook — including its security
+            settings — while looking healthy.
+
+            The 30m window matches the converge timer. A shorter window would
+            resolve the alert between runs while the VM is still broken.
+
+            Keys on systemd's own wording rather than Chef's output, so it
+            survives a change of Chef log format, and matches result 'signal'
+            (an OOM-killed converge) as well as 'exit-code'.
+
+            `uid="0"` is safe here: uid comes from SCM_CREDENTIALS and the
+            kernel fills it in, so a sender cannot forge it, and this line is
+            written by a root-owned systemd process — which is why `uid="0"`
+            is right here and wrong on alert 1 (escalation refused) and alert 4
+            (Loki push failed), where the interesting lines come from
+            developer-reachable or non-root senders. Verified against 30 days
+            of live data: the filtered query matches the same 3 of 3 lines as
+            before hardening.
+        data:
+          - refId: A
+            queryType: instant
+            relativeTimeRange: {from: 1800, to: 0}
+            datasourceUid: grafanacloud-logs
+            model:
+              refId: A
+              queryType: instant
+              datasource: {type: loki, uid: grafanacloud-logs}
+              expr: >-
+                sum by (instance) (count_over_time({job="dev-vm"} |=
+                "cinc-client.service: Failed with result" | uid="0" [30m]))
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              expression: A
+              datasource: {type: __expr__, uid: __expr__}
+              conditions:
+                - evaluator: {type: gt, params: [0]}
+
+      - uid: cfuah6amothxcb
+        title: 'dev-vm: SSH authentication anomaly'
+        condition: B
+        for: 1m
+        noDataState: OK
+        execErrState: Alerting
+        labels:
+          service: dev-vm
+          severity: warning
+        annotations:
+          summary: SSH auth anomaly on {{ $labels.instance }}
+          description: >-
+            These VMs are key-only with a public IP, so "Failed password" should
+            be structurally impossible. Measured baseline: 0 over six hours
+            against 52 successful logins — a clean zero is what makes this
+            alertable.
+
+            Exactly one "Invalid user admin" per VM lifetime is expected and is
+            NOT an attack: EC2 Instance Connect as admin, before the first
+            converge has created that user, produces one.
+
+            Do not add AuthorizedKeysCommand.*failed here. It looks like an
+            authentication failure and is not — EC2 Instance Connect's
+            eic_run_authorized_keys is consulted per candidate key and exits 255
+            on the ones that do not match, measured at 15 occurrences against 52
+            normal logins with no attack.
+
+            `uid="0"` is safe here for the same reason: uid comes from
+            SCM_CREDENTIALS and the kernel fills it in, so a sender cannot
+            forge it, and these lines are written by a root-owned process
+            (sshd) — which is why `uid="0"` is right here and wrong on alert 1
+            (escalation refused) and alert 4 (Loki push failed). Verified
+            against 30 days of live data: the filtered query matches the same
+            73 of 73 lines as before hardening.
+        data:
+          - refId: A
+            queryType: instant
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: grafanacloud-logs
+            model:
+              refId: A
+              queryType: instant
+              datasource: {type: loki, uid: grafanacloud-logs}
+              expr: >-
+                sum by (instance) (count_over_time({job="dev-vm"} |~ "Failed
+                password|Invalid user|maximum authentication attempts" | uid="0"
+                [5m]))
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              expression: A
+              datasource: {type: __expr__, uid: __expr__}
+              conditions:
+                - evaluator: {type: gt, params: [0]}
+
+      - uid: dfuan1d6q7jeof
+        title: 'dev-vm: Loki push failed, audit lines dropped'
+        condition: B
+        for: 0s
+        noDataState: OK
+        execErrState: Alerting
+        labels:
+          service: dev-vm
+          severity: critical
+        annotations:
+          summary: >-
+            Alloy on {{ $labels.instance }} gave up on a batch and discarded it —
+            audit lines are gone
+          description: >-
+            Unlike a rate-limiter drop, this one Alloy does report: "final error
+            sending batch, no retries left, dropping data". Observed on
+            2026-08-05 during a token test, with status=401 and "authentication
+            error: invalid token".
+
+            It is the loudest data-loss signal this pipeline has, and it still
+            only reaches Loki once the push path recovers — a permanently wrong
+            token in one region ships nothing at all and nothing announces it,
+            which is what `make preflight` covers at deploy time instead.
+
+            Do NOT rewrite this to filter on the journal's level label. Alloy
+            writes to stdout, so journald stamps every line it produces — errors
+            included — with priority info: both real occurrences of this message
+            carry level="info" as a stream label. Severity exists only in Alloy's
+            own level= field inside the message text.
+
+            `unit="alloy.service"`, NOT `uid="0"`: Alloy logs through stdout as
+            uid 999, so a uid filter returns zero and this alert would go
+            permanently silent. Measured 2026-08-12. `unit` is derived by
+            journald from the sender's cgroup, so a forged line — which lands in
+            the developer's own session-N.scope — cannot match it.
+        data:
+          - refId: A
+            queryType: instant
+            relativeTimeRange: {from: 900, to: 0}
+            datasourceUid: grafanacloud-logs
+            model:
+              refId: A
+              queryType: instant
+              datasource: {type: loki, uid: grafanacloud-logs}
+              expr: >-
+                sum by (instance) (count_over_time({job="dev-vm",
+                unit="alloy.service"} | syslog_identifier="alloy" |~ `no retries
+                left, dropping data` [15m]))
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              expression: A
+              datasource: {type: __expr__, uid: __expr__}
+              conditions:
+                - evaluator: {type: gt, params: [0]}
+
+      - uid: afuahw3yfaxogb
+        title: 'dev-vm: log rate at limiter ceiling (audit lines being dropped)'
+        condition: B
+        for: 1m
+        noDataState: OK
+        execErrState: Alerting
+        labels:
+          service: dev-vm
+          severity: warning
+        annotations:
+          summary: >-
+            {{ $labels.unit }} on {{ $labels.instance }} is at the rate-limit
+            ceiling — audit lines are probably being discarded
+          description: >-
+            A SATURATION PROXY, not a measurement of drops, and deliberately so.
+
+            stage.limit discards lines with no log line of any kind. Measured on
+            a live VM: 3001 lines emitted from one unit, 439 arrived, Alloy's own
+            journal completely silent about the 2562 it threw away. The drop is
+            visible only as the Prometheus counter
+            loki_process_dropped_lines_total, and this platform ships logs and no
+            metrics, so nothing scrapes it.
+
+            What IS visible is the arrived rate saturating at the limiter's
+            ceiling of 20 lines/s = 1200/min per unit. Above 1000/min a unit is
+            within 85% of that ceiling and is almost certainly losing lines. Per
+            the design's "rate limit as the budget guard" note, a developer can
+            trigger this deliberately, which is why it has to be visible.
+
+            Kernel-transport lines carry no unit label and are never throttled,
+            so they cannot trigger this.
+        data:
+          - refId: A
+            queryType: instant
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: grafanacloud-logs
+            model:
+              refId: A
+              queryType: instant
+              datasource: {type: loki, uid: grafanacloud-logs}
+              expr: max by (instance, unit) (count_over_time({job="dev-vm"} [1m]))
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              expression: A
+              datasource: {type: __expr__, uid: __expr__}
+              conditions:
+                - evaluator: {type: gt, params: [1000]}
+
+      # --- Runtime detection -------------------------------------------------
+      - uid: ffuafalcodet1
+        title: 'dev-vm: Falco runtime detection'
+        condition: B
+        for: 0s
+        noDataState: OK
+        execErrState: Alerting
+        labels:
+          service: dev-vm
+          severity: critical
+        annotations:
+          summary: 'Falco fired on {{ $labels.instance }}: {{ $labels.rule }}'
+          description: >-
+            No threshold on purpose: the ruleset is measured silent on this fleet
+            (zero events at idle and under npm installs, container builds and
+            parallel compiles), and the four platform rules key on things the
+            platform makes structurally impossible — a write to
+            ~/.aws/credentials, a non-root process reaching IMDS, a denied access
+            in /dev/shm/dev-vm-aws, and a sudo by the developer's loginuid.
+
+            That last one holds ONLY because the sudo rule carries a
+            full-cmdline-equality exclusion for the permitted `tailscale login`
+            spellings. Without it every legitimate login lands here, and since
+            this rule is critical with `for: 0s` and no threshold, the feature
+            would page someone on normal use. The exclusion and the sudoers grant
+            are one change; if you are looking at this because the alert became
+            noisy, check that the exclusion still matches the argv developers
+            actually type before touching the threshold. Every hit is therefore
+            worth a human. The
+            full event — exepath, the acting user and the tamper-resistant
+            loginuid — is in the "Runtime detection" row of the audit-trail
+            dashboard. The credentials rule deliberately omits proc.cmdline,
+            because for that one rule the command line can contain the very key
+            being reported; the other two include it.
+
+            The `| json | __error__=""` guard is load-bearing: Falco's startup
+            banner goes through the same journal unit and is not JSON. Without
+            the guard the banner poisons the parse and the rule errors on every
+            Falco restart; with it, banner lines are simply excluded.
+
+            Falco logs via syslog_output only — the packaged unit discards
+            stdout (StandardOutput=null), so if this rule reads zero forever
+            while Falco is "active", check syslog_output is still enabled
+            before trusting the silence.
+        data:
+          - refId: A
+            queryType: instant
+            relativeTimeRange: {from: 300, to: 0}
+            datasourceUid: grafanacloud-logs
+            model:
+              refId: A
+              queryType: instant
+              datasource: {type: loki, uid: grafanacloud-logs}
+              expr: >-
+                sum by (instance, rule) (count_over_time({job="dev-vm",
+                unit="falco-modern-bpf.service"} | json | __error__="" [5m]))
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: threshold
+              expression: A
+              datasource: {type: __expr__, uid: __expr__}
+              conditions:
+                - evaluator: {type: gt, params: [0]}

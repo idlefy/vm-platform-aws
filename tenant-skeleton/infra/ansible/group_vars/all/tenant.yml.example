@@ -1,0 +1,11 @@
+---
+# Per-tenant Ansible vars for the infra control plane (CINC server).
+# Copy this file to tenant.yml and fill in your own values.
+# tenant.yml is gitignored — never commit your real config.
+
+# --- CINC server ---
+cinc_server_fqdn:    "cinc.infra.example.com"
+cinc_org_name:       "your-org"
+cinc_org_full_name:  "Your Org Full Name"
+cinc_admin_email:    "ops@example.com"
+

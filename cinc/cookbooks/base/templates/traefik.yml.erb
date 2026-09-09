@@ -1,0 +1,57 @@
+# Managed by CINC (base::traefik). Local edits are reverted every 30 minutes.
+global:
+  checkNewVersion: false
+  sendAnonymousUsage: false
+
+log:
+  level: INFO
+
+# accessLog is deliberately absent: journalctl carries the ACME and routing
+# errors that matter, and request logging would duplicate whatever URLs and
+# headers a developer's traffic contains, unrotated and unread.
+
+api:
+  dashboard: false
+
+entryPoints:
+  web:
+    address: ":80"
+    http:
+      redirections:
+        entryPoint:
+          to: websecure
+          scheme: https
+          permanent: true
+  websecure:
+    address: ":443"
+
+providers:
+  docker:
+    endpoint: "unix:///var/run/docker.sock"
+    exposedByDefault: false
+    network: web
+  # One FILE, not the directory it sits in. Chef's template resource stages its
+  # render as `.chef-auth<pid>-<rand>.yml` beside the destination and renames it
+  # into place, and a directory watch sees that temp file, tries to read it, and
+  # logs two "permission denied" errors — on EVERY converge, including a no-op
+  # one, because Chef stages even when the content turns out to be identical.
+  # Every 30 minutes, on every VM, forever. Traefik keeps its previous
+  # configuration and nothing breaks, which is what makes it dangerous: the
+  # journal is where the ACME failures are, and this teaches people to skim past
+  # errors there.
+  #
+  # Naming the file is also a smaller blast radius: with a directory watch, one
+  # unparseable yaml dropped in by anyone takes routing down for the whole VM.
+  # There is exactly one dynamic file and the platform owns it; routes come from
+  # docker labels, not from here. Adding a second file means naming it here too.
+  file:
+    filename: /etc/traefik/dynamic/auth.yml
+    watch: true
+
+certificatesResolvers:
+  le:
+    acme:
+      email: <%= @acme_email %>
+      storage: /acme/acme.json
+      httpChallenge:
+        entryPoint: web

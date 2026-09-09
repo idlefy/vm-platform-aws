@@ -1,0 +1,6 @@
+---
+- name: reconfigure cinc server
+  ansible.builtin.command:
+    cmd: cinc-server-ctl reconfigure
+  changed_when: false
+

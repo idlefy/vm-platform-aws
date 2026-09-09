@@ -1,0 +1,10 @@
+# Managed by CINC (base::traefik). Local edits are reverted every 30 minutes.
+#
+# Referenced from a container label as `auth@file`. Applying it is the
+# developer's choice — it is deliberately NOT attached to an entrypoint, so
+# nothing is protected unless the label says so. See the spec's A1.
+http:
+  middlewares:
+    auth:
+      basicAuth:
+        usersFile: /etc/traefik/users
