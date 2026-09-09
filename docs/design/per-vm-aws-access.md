@@ -106,6 +106,21 @@ Statement = [
       "ec2-instance-connect:*",
       "ec2:GetPasswordData",
       "ec2:RunInstances",
+      "ec2:CreateFleet",
+      "ec2:RequestSpotInstances",
+      "ec2:RequestSpotFleet",
+      "ec2:RunScheduledInstances",
+      "ec2:CreateLaunchTemplateVersion",
+      "ec2:ModifyLaunchTemplate",
+      "ec2:ModifyFleet",
+      "ec2:ModifySpotFleetRequest",
+      "autoscaling:CreateAutoScalingGroup",
+      "autoscaling:CreateLaunchConfiguration",
+      "autoscaling:UpdateAutoScalingGroup",
+      "batch:CreateComputeEnvironment",
+      "batch:UpdateComputeEnvironment",
+      "imagebuilder:CreateInfrastructureConfiguration",
+      "imagebuilder:UpdateInfrastructureConfiguration",
       "ec2:ModifyInstanceAttribute",
       "ec2:AssociateIamInstanceProfile",
       "ec2:ReplaceIamInstanceProfileAssociation",
@@ -137,7 +152,9 @@ Statement = [
       "ec2:DisassociateRouteTable",
       "ec2:AuthorizeSecurityGroupEgress",
       "ec2:RevokeSecurityGroupEgress",
+      "ec2:RevokeSecurityGroupIngress",
       "ec2:ModifySecurityGroupRules",
+      "ec2:ModifyNetworkInterfaceAttribute",
       "ec2:TerminateInstances",
       "ec2:RebootInstances",
       "ec2:GetConsoleOutput",
@@ -172,7 +189,8 @@ Every deny entry is a path from "developer holds identity-role credentials" to e
 - **`ssm:PutParameter` and `ssm:DeleteParameter*`** are integrity, not confidentiality: overwriting the validator-key parameter does not reveal it but does break enrolment for every VM created afterwards.
 - **`ssm:CreateAssociation` and `ssm:UpdateAssociation`** are remote root execution on a managed instance via `AWS-RunShellScript`, in the same class as `SendCommand`. Not exploitable today — the bootstrap role carries no `AmazonSSMManagedInstanceCore`, so the agent is unregistered — but that is a property of a policy that could change, not of this boundary.
 - **`sts:AssumeRole`** is denied because phase A has no chaining at all; that also blocks pivoting into another VM's identity role. Phase B replaces it with a deny scoped to `role/dev-vm-*`.
-- **EBS direct APIs (`ebs:GetSnapshotBlock` and siblings), fleet network mutation, `TerminateInstances`, and `GetConsoleOutput`** — added after the first external review. The EBS direct API reads a snapshot's blocks without calling any of the denied `ec2:` snapshot actions; network ACL and route changes cut the fleet's Loki egress, which is the one failure the alerts cannot see; the console carries a failed bootstrap's log. Fourth, fifth and sixth omissions of the multi-call-path shape, found by an outside reviewer rather than a test.
+- **EBS direct APIs (`ebs:GetSnapshotBlock` and siblings), fleet network mutation, `TerminateInstances`, and `GetConsoleOutput`** — added after the first external review. The EBS direct API reads a snapshot's blocks without calling any of the denied `ec2:` snapshot actions; network ACL and route changes cut the fleet's Loki egress, which is the one failure the alerts cannot see; the console carries a failed bootstrap's log. Sixth, seventh and eighth omissions of the multi-call-path shape, found by an outside reviewer rather than a test.
+- **`ec2:RevokeSecurityGroupIngress` and `ec2:ModifyNetworkInterfaceAttribute`** deny two more routes to the fleet's one shared security group (`aws_security_group.ec2`, `main.tf`): revoke deletes its rules — including SSH — for every VM in the region in a single call, and `ModifyNetworkInterfaceAttribute` is the ENI-level twin of `ModifyInstanceAttribute` above, replacing an instance's SG set directly with no `--groups` flag on `ModifyInstanceAttribute` needed. `ec2:AuthorizeSecurityGroupIngress` is left allowed: the boundary is `Resource = "*"` and cannot scope a grant to the calling VM's own rules, so an added ingress rule lands on the whole fleet's shared group either way, and it is accepted as a reviewed exception — unlike revoke, which can lock the fleet out rather than merely widen it.
 
 A boundary constrains a role's permissions but not its trust policy — fine here, since the identity role's trust names only its own bootstrap role.
 

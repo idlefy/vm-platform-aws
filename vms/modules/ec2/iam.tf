@@ -329,8 +329,16 @@ resource "aws_iam_policy" "identity_boundary" {
           # The fleet's egress is its audit transport: an ACL or route change
           # black-holes Loki for every VM in the subnet, and the "no logs"
           # condition cannot be alerted on over the transport that was cut.
-          # Ingress stays open — a developer opening a port on their own VM is
-          # the documented self-service.
+          # Ingress authorize is left allowed: the boundary is Resource="*" and
+          # cannot scope it to the calling VM, an added ingress rule lands on
+          # aws_security_group.ec2 — the one security group the whole fleet
+          # shares (main.tf) — for every VM, and it is accepted here as a
+          # reviewed exception. Ingress *revoke* is denied because one call
+          # deletes that same shared rule set and locks the fleet out, and
+          # ModifyNetworkInterfaceAttribute is denied alongside
+          # ModifyInstanceAttribute above: it is the ENI-level twin that
+          # replaces an instance's SG set directly, one call, no --groups flag
+          # needed. Seventh instance of the multi-call-path omission.
           "ec2:CreateNetworkAclEntry",
           "ec2:ReplaceNetworkAclEntry",
           "ec2:DeleteNetworkAclEntry",
@@ -342,8 +350,11 @@ resource "aws_iam_policy" "identity_boundary" {
           "ec2:DisassociateRouteTable",
           "ec2:AuthorizeSecurityGroupEgress",
           "ec2:RevokeSecurityGroupEgress",
+          "ec2:RevokeSecurityGroupIngress",
           "ec2:ModifySecurityGroupRules",
+          "ec2:ModifyNetworkInterfaceAttribute",
           # Peers' availability, and the fail-closed bootstrap log (user_data.tf).
+          # Eighth instance of the multi-call-path omission.
           "ec2:TerminateInstances",
           "ec2:RebootInstances",
           "ec2:GetConsoleOutput",

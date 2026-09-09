@@ -137,6 +137,9 @@ run "boundary_denies_every_launch_path" {
 run "boundary_denies_asset_routes_found_in_review" {
   command = plan
 
+  # Anchored on the Deny statement's Action list, not the whole policy JSON
+  # string — a Sid, a description, or an unrelated Allow entry could otherwise
+  # make strcontains() pass without the action actually being denied.
   assert {
     condition = alltrue([
       for action in [
@@ -147,7 +150,7 @@ run "boundary_denies_asset_routes_found_in_review" {
         "ebs:StartSnapshot",
         "ebs:PutSnapshotBlock",
         "ebs:CompleteSnapshot",
-        # the fleet's shared egress path (Loki transport)
+        # the fleet's shared network path (Loki egress, and the one shared SG)
         "ec2:CreateNetworkAclEntry",
         "ec2:ReplaceNetworkAclEntry",
         "ec2:DeleteNetworkAclEntry",
@@ -159,21 +162,35 @@ run "boundary_denies_asset_routes_found_in_review" {
         "ec2:DisassociateRouteTable",
         "ec2:AuthorizeSecurityGroupEgress",
         "ec2:RevokeSecurityGroupEgress",
+        "ec2:RevokeSecurityGroupIngress",
         "ec2:ModifySecurityGroupRules",
+        "ec2:ModifyNetworkInterfaceAttribute",
         # other instances' availability
         "ec2:TerminateInstances",
         "ec2:RebootInstances",
         # another VM's fail-closed bootstrap log
         "ec2:GetConsoleOutput",
         "ec2:GetConsoleScreenshot",
-      ] : strcontains(aws_iam_policy.identity_boundary["vm"].policy, action)
+      ] : contains(
+        [
+          for statement in jsondecode(aws_iam_policy.identity_boundary["vm"].policy).Statement :
+          statement.Action if statement.Effect == "Deny"
+        ][0],
+        action
+      )
     ])
-    error_message = "The identity boundary must deny the EBS direct-read, fleet-network, termination and console-output routes (first external review, H1/H2)."
+    error_message = "The identity boundary's Deny statement must cover the EBS direct-read, fleet-network, termination and console-output routes (first external review, H1/H2)."
   }
 
   assert {
-    condition     = !strcontains(aws_iam_policy.identity_boundary["vm"].policy, "ec2:AuthorizeSecurityGroupIngress")
-    error_message = "Security-group ingress on a developer's own VM is documented self-service; do not deny it here."
+    condition = !contains(
+      [
+        for statement in jsondecode(aws_iam_policy.identity_boundary["vm"].policy).Statement :
+        statement.Action if statement.Effect == "Deny"
+      ][0],
+      "ec2:AuthorizeSecurityGroupIngress"
+    )
+    error_message = "Security-group ingress authorize is a reviewed exception (the boundary is Resource=\"*\" and cannot scope it per VM); do not deny it here."
   }
 }
 
