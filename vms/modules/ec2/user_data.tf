@@ -12,28 +12,27 @@ exec > /var/log/user-data.log 2>&1
 # ---- close the first-boot window --------------------------------------------
 # Until base::sudoers and base::imds first converge, the cloud image grants
 # ubuntu NOPASSWD sudo and leaves IMDS open — and the developer holds this
-# VM's key pair. Everything here runs before any secret exists on the box, so
-# an abort in this block fails closed AND safe.
+# VM's key pair. So the grant goes first, and it never comes back: a failed
+# bootstrap FAILS CLOSED. Restoring it "for diagnosis" (what this script did
+# before the first external review) handed the developer root, and root
+# reaches IMDS, and IMDS carries the bootstrap role, which reads the validator
+# key — the instance profile is a secret from the first second, so there is
+# no stage at which a restore is safe. Diagnosis goes through the serial
+# console instead: the handler below copies this log there, and the operator
+# reads it with `aws ec2 get-console-output` and replaces the instance.
 
 bootstrap_failed() {
   rm -f /etc/cinc/validation.pem
-  if [ -f /root/.90-cloud-init-users.bak ]; then
-    install -m 0440 /root/.90-cloud-init-users.bak /etc/sudoers.d/90-cloud-init-users
-  fi
-  echo "BOOTSTRAP FAILED: validation key removed; cloud-init sudo restored for diagnosis"
+  {
+    echo "BOOTSTRAP FAILED: validation key removed; developer sudo stays revoked. Log follows."
+    cat /var/log/user-data.log
+  } > /dev/console 2>/dev/null || true
 }
 trap bootstrap_failed ERR
 
-# 1. Drop cloud-init's sudo grant, keeping a copy: the ERR trap below restores
-#    it so a FAILED bootstrap stays diagnosable (no admin user exists until the
-#    first converge creates it), while a successful one ends with the grant
-#    gone and base::sudoers owning the file.
-#    The missing-source case is expected (a re-run after a successful bootstrap
-#    already removed the grant); any OTHER cp failure aborts here, BEFORE the
-#    rm below, so the grant is still in place for diagnosis.
-if [ -f /etc/sudoers.d/90-cloud-init-users ]; then
-  cp /etc/sudoers.d/90-cloud-init-users /root/.90-cloud-init-users.bak
-fi
+# 1. Drop cloud-init's sudo grant. The missing-file case is expected (a re-run
+#    after a successful bootstrap already removed it, or base::sudoers owns the
+#    path now).
 rm -f /etc/sudoers.d/90-cloud-init-users
 
 # 2. Block IMDS for everyone but root (and EIC when present): the same three
@@ -169,7 +168,6 @@ cinc-client --once > /var/log/cinc-first-run.log 2>&1
 # Remove validation key — no longer needed after registration
 rm -f /etc/cinc/validation.pem
 trap - ERR
-rm -f /root/.90-cloud-init-users.bak
 
 echo "CINC agent bootstrap complete for $INSTANCE_NAME"
 EOF
