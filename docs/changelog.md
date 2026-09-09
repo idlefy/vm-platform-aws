@@ -9,9 +9,11 @@ Live verification of the first external review (`docs/design/first-external-revi
 - The Falco sudo exclusion compares `proc.args`, not `proc.cmdline`: a symlink
   named `sudo tailscale` gave the excluded cmdline while asking sudo for `login`,
   and the tripwire stayed quiet on a command sudoers refused.
-- `falco` joins Alloy's audit bypass: a developer-driven flood of Falco
-  detections shares the sudo detection's rate-limit bucket (1098 of 1301 lines
-  dropped in the measurement), so Falco lines are no longer throttled.
+- `falco` joins Alloy's audit bypass. Before: every Falco detection on a VM
+  shared one `unit` rate-limit bucket with the sudo detection, and a
+  developer-driven flood dropped 1098 of 1301 lines from it. After: Falco
+  entries skip `stage.limit` entirely, the same flood reached `loki.write`
+  with zero drops.
 
 ## 1.1.0
 
