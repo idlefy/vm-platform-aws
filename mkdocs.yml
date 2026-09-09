@@ -55,5 +55,6 @@ nav:
       - Log shipping: design/log-shipping.md
       - Optional log shipping: design/optional-log-shipping.md
       - Per-VM AWS access: design/per-vm-aws-access.md
+      - First external review: design/first-external-review.md
   - Versioning: versioning.md
   - Changelog: changelog.md
