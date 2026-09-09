@@ -204,7 +204,7 @@ check "nothing published" "$([ -e "$OUT/credentials" ] && echo yes || echo no)" 
 check "no aws call was made" "$([ -e "$WORK/stub-args" ] && echo yes || echo no)" "no"
 teardown
 
-echo "== an env file owned by someone else is refused before it is sourced =="
+echo "== an env file that is not a regular file is refused before it is sourced =="
 setup
 # Unprivileged harness: the owner check compares against $(id -u), so the only
 # foreign owner reachable here is a file that does not exist as a regular file.
@@ -213,6 +213,27 @@ rm -f "$WORK/aws-access.env"; mkdir "$WORK/aws-access.env"
 run_broker >/dev/null 2>&1; rc=$?
 check "exit code is 1" "$rc" "1"
 check "nothing published" "$([ -e "$OUT/credentials" ] && echo yes || echo no)" "no"
+teardown
+
+echo "== an env file owned by someone else is refused before it is sourced =="
+setup
+# A real foreign owner, unlike the "not a regular file" case above: a
+# root-owned, world-readable, not-group-writable regular file the test user
+# can read but does not own. /etc/hostname fits on every dev box and CI
+# runner this suite has been run on; fall back to /proc/version (also
+# root-owned, mode 0444) if it does not.
+REAL_ENV_FILE=/etc/hostname
+if [ ! -e "$REAL_ENV_FILE" ] || [ "$(stat -c '%u' "$REAL_ENV_FILE")" != "0" ]; then
+  REAL_ENV_FILE=/proc/version
+fi
+PATH="$STUB:$PATH" \
+AWS_VM_ENV_FILE="$REAL_ENV_FILE" \
+AWS_VM_OUT_DIR="$OUT" \
+AWS_VM_STUB_ARGS="$WORK/stub-args" \
+bash "$SCRIPT" >/dev/null 2>"$WORK/stderr"; rc=$?
+check "exit code is 1" "$rc" "1"
+check "nothing published" "$([ -e "$OUT/credentials" ] && echo yes || echo no)" "no"
+check "stderr names the wrong-uid refusal" "$(grep -c 'owned by uid' "$WORK/stderr")" "1"
 teardown
 
 echo ""

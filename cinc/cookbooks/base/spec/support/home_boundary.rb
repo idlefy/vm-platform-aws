@@ -14,6 +14,13 @@ HOME_WRITERS = %w(directory file template cookbook_file link remote_file).freeze
 # to it), or a ~ubuntu tilde-expansion.
 HOME_UBUNTU_COMMAND = %r{/home/ubuntu|\$HOME|~ubuntu\b}.freeze
 
+# execute's whole family: bash/csh/perl/python/ruby are all script resources
+# (Chef::Resource::Script subclasses) that shell out exactly like execute does,
+# so a root-run `bash 'x' do code '...install into /home/ubuntu...' end` is the
+# same boundary violation as a root-run `execute` and must be caught the same
+# way.
+HOME_COMMAND_RESOURCES = %w(execute bash script csh perl python ruby).freeze
+
 RSpec.shared_examples 'root never writes under /home/ubuntu' do
   it 'has no root-run file resource under /home/ubuntu' do
     offenders = chef_run.resource_collection.all_resources.select do |r|
@@ -22,16 +29,34 @@ RSpec.shared_examples 'root never writes under /home/ubuntu' do
     expect(offenders.map(&:to_s)).to eq([])
   end
 
-  it 'runs every execute that names /home/ubuntu as ubuntu' do
+  it 'runs every execute (and script-family resource) that names /home/ubuntu as ubuntu' do
     # A literal substring match on "/home/ubuntu" misses a root-run execute
     # that reaches the same place via $HOME (with HOME set to it) or a
     # ~ubuntu tilde-expansion — both walk past a plain command.include? check.
+    #
+    # bash/script/csh/perl/python/ruby are execute's script-family siblings:
+    # each shells out to `code`, not `command` (script resources have no
+    # `command` property at all), so a root-run `bash` that installs into
+    # /home/ubuntu is the same violation wearing a different resource name.
     offenders = chef_run.resource_collection.all_resources.select do |r|
-      next false unless r.declared_type.to_s == 'execute' && r.user != 'ubuntu'
+      next false unless HOME_COMMAND_RESOURCES.include?(r.declared_type.to_s) && r.user != 'ubuntu'
 
-      command_hits_home = r.command.to_s.match?(HOME_UBUNTU_COMMAND)
+      command = r.respond_to?(:code) ? r.code : r.command
+      command_hits_home = command.to_s.match?(HOME_UBUNTU_COMMAND)
       env_sets_home = r.environment.is_a?(Hash) && r.environment.key?('HOME')
       command_hits_home || env_sets_home
+    end
+    expect(offenders.map(&:to_s)).to eq([])
+  end
+
+  it 'has no ruby_block named after a home-directory command' do
+    # ruby_block bodies are arbitrary Ruby, not a shelled-out command string,
+    # so there is no `command`/`code` property here to inspect — a root-run
+    # ruby_block that writes into /home/ubuntu from inside its block is a
+    # review item, not something this spec can catch. This only catches the
+    # (weaker) signal of a resource *name* that says what it does.
+    offenders = chef_run.resource_collection.all_resources.select do |r|
+      r.declared_type.to_s == 'ruby_block' && r.name.to_s.match?(HOME_UBUNTU_COMMAND)
     end
     expect(offenders.map(&:to_s)).to eq([])
   end
@@ -56,9 +81,9 @@ RSpec.shared_examples 'root never writes under /home/ubuntu' do
     expect(offenders).to eq([])
   end
 
-  it 'runs every ubuntu-user execute as the ubuntu group with HOME set to /home/ubuntu' do
+  it 'runs every ubuntu-user execute (and script-family resource) as the ubuntu group with HOME set to /home/ubuntu' do
     offenders = chef_run.resource_collection.all_resources.select do |r|
-      next false unless r.declared_type.to_s == 'execute' && r.user == 'ubuntu'
+      next false unless HOME_COMMAND_RESOURCES.include?(r.declared_type.to_s) && r.user == 'ubuntu'
 
       r.group != 'ubuntu' || !(r.environment.is_a?(Hash) && r.environment['HOME'] == '/home/ubuntu')
     end

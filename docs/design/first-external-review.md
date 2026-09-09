@@ -31,7 +31,7 @@ Open questions from the review that need a live VM are in §7. Two items were de
 1. Root stages the content under `/usr/share/dev-vm/home/` (root:root, directories `0755`, files `0644`), using the ordinary `cookbook_file`/`template`/`file` resources. Nothing staged is secret; the tree mirrors the layout under the home directory (`/usr/share/dev-vm/home/.claude/settings.json` and so on).
 2. An `execute` resource with `user 'ubuntu'`, `group 'ubuntu'`, `environment 'HOME' => '/home/ubuntu'` copies it into place with `install -D -m <mode> <staged> <target>`. Idempotence: `not_if "cmp -s <staged> <target>"` for files the cookbook keeps in sync, `not_if "test -e <target>"` for the ones that are `create_if_missing` today (`statusline-command.sh`, `settings.json`). Directories: `install -d -m <mode> <dir>` guarded by `not_if "test -d <dir>"`.
 
-Chef's `execute` with `user` drops to that uid with `setuid`/`setgid` and the user's supplementary groups; `install` then runs with the developer's privileges and its own `-D` creates parents as that user. A symlink anywhere in the path resolves with the developer's permissions, not root's.
+Chef's `execute` with `user`/`group` sets uid and gid only; it does not touch supplementary groups, which are inherited from the parent (root) unless `login true` is set, and this cookbook does not set it. The boundary therefore rests on uid/gid alone, not on group membership — which is sufficient here because the cookbook creates nothing group-writable, so root's inherited supplementary groups reach nothing regardless of which ones ride along. `install` then runs as that uid/gid, and its own `-D` creates parents as that user, so a symlink anywhere in the path resolves with the developer's permissions, not root's. A future `execute` that runs as ubuntu but needs a supplementary group — the `docker` group, say — would have to set `login true` to get it.
 
 **Resources that move** (every root resource naming `/home/ubuntu` today):
 
@@ -47,7 +47,7 @@ Notifications survive the move: the `execute` copies carry the `notifies` the te
 
 **Tests.**
 - ChefSpec, one per touched recipe, on the converged resource collection: no `directory`, `file`, `template`, `cookbook_file`, `link` or `remote_file` resource has a `path` under `/home/ubuntu/`; every `execute` whose `command` mentions `/home/ubuntu` has `user 'ubuntu'`. This is the regression guard for the principle, and it is what a future recipe fails.
-- `test-aws-vm-credentials.sh`: two new cases — `ENV_FILE` is a symlink → exit 1, nothing published; `ENV_FILE` is group-writable → exit 1. The existing 28 cases keep passing.
+- `test-aws-vm-credentials.sh`: four new cases — `ENV_FILE` is a symlink → exit 1, nothing published; `ENV_FILE` is group-writable → exit 1; `ENV_FILE` is not a regular file → exit 1; `ENV_FILE` is owned by a different uid → exit 1, stderr names the refusal. The existing 28 cases keep passing.
 - Live (§7): the review's exploit, before and after.
 
 **Not changed.** Root still reads under `/home/ubuntu` in guards (`not_if 'grep -q docker-env /home/ubuntu/.bashrc'`); a read follows a symlink to a root-readable file, which discloses nothing the developer cannot read. The `add-docker-env-to-bashrc` append already runs as ubuntu. `admin`'s home is not in scope: `admin` is the operator.

@@ -14,6 +14,7 @@
       "dotted_decimal_identifier": "25374281127321240.13786995366084570.222626792329969",
       "source": "../cookbooks/base",
       "cache_key": null,
+      "scm_info": null,
       "source_options": {
         "path": "../cookbooks/base"
       }

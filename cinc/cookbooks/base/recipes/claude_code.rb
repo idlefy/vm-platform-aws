@@ -22,6 +22,7 @@ end
 #
 # The staging root itself is the new trust anchor: declare it explicitly so
 # its owner/mode do not depend on mkdir_p's umask.
+# Also declared in base::docker; Chef runs both — keep the two byte-identical.
 directory '/usr/share/dev-vm/home' do
   owner 'root'
   group 'root'
