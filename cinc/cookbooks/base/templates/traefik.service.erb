@@ -26,7 +26,7 @@ ExecStartPre=-/usr/bin/docker rm -f platform-traefik
 # The configuration DIRECTORY is mounted, never the individual files. Docker
 # creates a missing -v source as a directory, so a per-file mount of `users`
 # would have Docker create it as an empty directory on a VM where the password
-# has not been generated yet — and the recipe's File.exist? guard is true for a
+# has not been generated yet — and the recipe's `test -e` guard is true for a
 # directory, so the password would then never be generated, on any converge,
 # silently. A single-file mount is also pinned to an inode, so editing `users`
 # with anything that replaces the file would detach it from what Traefik reads.

@@ -176,8 +176,6 @@ execute 'ubuntu-traefik-yml' do
   notifies :run, 'execute[restart-traefik]', :delayed
 end
 
-# No notifies: providers.file names this file with watch: true, so Traefik picks
-# dynamic configuration up by itself.
 template "#{staged}/.config/traefik/dynamic/auth.yml" do
   source 'traefik-auth.yml.erb'
   owner 'root'
@@ -185,8 +183,11 @@ template "#{staged}/.config/traefik/dynamic/auth.yml" do
   mode '0644'
 end
 
+# No notifies: providers.file names this file with watch: true, so Traefik picks
+# dynamic configuration up by itself. Copy through a temp file and rename so the
+# watcher never sees a truncated auth.yml mid-write.
 execute 'ubuntu-traefik-auth' do
-  command "install -m 0644 #{staged}/.config/traefik/dynamic/auth.yml /home/ubuntu/.config/traefik/dynamic/auth.yml"
+  command "install -m 0644 #{staged}/.config/traefik/dynamic/auth.yml /home/ubuntu/.config/traefik/.auth.yml.tmp && mv -f /home/ubuntu/.config/traefik/.auth.yml.tmp /home/ubuntu/.config/traefik/dynamic/auth.yml"
   user 'ubuntu'
   group 'ubuntu'
   environment('HOME' => '/home/ubuntu')
