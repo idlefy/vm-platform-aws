@@ -36,7 +36,7 @@ the Ansible half exists will look for it here.
 
 ```bash
 make boundary-check                                    # modules stay inside themselves
-( cd vms/modules/ec2          && terraform test )      # 26 runs
+( cd vms/modules/ec2          && terraform test )      # 27 runs
 ( cd vms/modules/fleet-guards && terraform test )      # 5 runs
 make smoke                                             # the skeleton against this tree
 for t in test/test-release-gate.sh test/test-resolve-pin.sh test/test-boundary-check.sh \

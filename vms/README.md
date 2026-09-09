@@ -266,7 +266,7 @@ gone.
 | `ExpiredToken` in a long-running process only | See the refresh note above. Restart it. |
 | Nothing in `/dev/shm/dev-vm-aws` and the journal says `cannot read /developer-vms/access/<vm>` | `terraform apply` has not run for this VM yet. Not an error on the VM's side. |
 | Journal says `refusing to publish` about the output directory | Something else owns `/dev/shm/dev-vm-aws` or made it group-writable. `/dev/shm` is world-writable, so the broker verifies the directory rather than trusting it. Remove the directory as root and let tmpfiles recreate it: `sudo rm -rf /dev/shm/dev-vm-aws && sudo systemd-tmpfiles --create /etc/tmpfiles.d/aws-vm.conf`. |
-| A new VM never registers with the CINC server, and `ssh` as `ubuntu` has no `sudo` | The bootstrap failed and failed closed. Read `aws ec2 get-console-output` for the log, fix the cause, and `terraform apply -replace=` the instance. |
+| A new VM never registers with the CINC server, and `ssh` as `ubuntu` has no `sudo` | The bootstrap failed and failed closed. Read `aws ec2 get-console-output --latest` for the log, fix the cause, and `terraform apply -replace=` the instance. |
 
 ### Tests
 
@@ -276,7 +276,7 @@ terraform init -backend=false   # no bucket, no profile, no tenant.auto.tfvars n
 terraform test
 ```
 
-26 runs over the plan-time guards, in three files. `validation.tftest.hcl`
+27 runs over the plan-time guards, in three files. `validation.tftest.hcl`
 (16, fixture with no instances): every `allowed_actions` rule, both VM-name
 limits, both SSM parameter-name shapes, the unknown-bundle-name and
 fleet-wide unique-name preconditions, and the shapes that must be *accepted* —

@@ -24,9 +24,9 @@ decision is made.
   Workstation package supplies `chef`, `knife` and `cinc-client`. The version
   this was built against is pinned in
   [`cinc/README.md` § Prerequisites](https://github.com/idlefy/vm-platform-aws/blob/main/cinc/README.md#prerequisites).
-- A GNU userland: the Makefiles and `scripts/` use `sed -i`, `grep -P` and
-  `install -D` in their GNU forms. On macOS install `coreutils` and `gnu-sed`
-  and put their `gnubin` directories first on `PATH`.
+- A GNU userland: the Makefiles and `scripts/` use `sed -i` without a suffix
+  argument, and §5 uses `shred`, which macOS lacks. On macOS install
+  `coreutils` and `gnu-sed` and put their `gnubin` directories first on `PATH`.
 
 ## 1. Create the Terraform state bucket
 
@@ -419,7 +419,7 @@ rotation.
      surfaces on the VM as `AccessDenied` → exit 10 → a green converge with no
      logs — the exact silent failure this whole section exists to prevent.
 
-   Set all three, then `cd cinc && make push && make promote`. The token
+   Set all three, re-lock with a bare `make bump-cookbook`, then `cd cinc && make push && make promote`. The token
    itself never goes in this file — only these three identifiers do.
 6. Create the security alerts and the audit dashboard. Shipping logs nobody is
    alerted on is only half the system: the **six Grafana alert rules**, the
@@ -489,7 +489,7 @@ disagree, so the two are edited together and *applied* apart:
 3. `cd cinc && make push`.
 4. In `vms/tenant.auto.tfvars` set `log_shipping = false` and
    `loki_ssm_parameter_name = null`, but **do not apply yet**.
-5. `make promote`. Preflight now sees both halves agree.
+5. `cd cinc && make promote`. Preflight now sees both halves agree.
 6. Wait until every VM has converged past the teardown (`knife status`, or the
    Alloy unit gone on each VM), then `cd vms && terraform apply`.
 

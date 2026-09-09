@@ -23,7 +23,9 @@ Fixes from the first external review (`docs/design/first-external-review.md`).
 - A failed bootstrap fails closed: cloud-init's `NOPASSWD` grant is never
   restored; the log goes to the serial console, recovered with
   `aws ec2 get-console-output --latest` and replaced with
-  `terraform apply -replace=`.
+  `terraform apply -replace=`. The bootstrap runs once, so re-pinning reaches
+  new instances only; a VM that already failed under 1.0.0 keeps its restored
+  grant until it is replaced.
 - The permissions boundary denies the EBS direct API, fleet network mutation
   (NACL entries, routes, security-group egress, `RevokeSecurityGroupIngress`,
   `ModifyNetworkInterfaceAttribute`), `TerminateInstances`/`RebootInstances`,
