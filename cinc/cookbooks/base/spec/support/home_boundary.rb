@@ -43,8 +43,8 @@ RSpec.shared_examples 'root never writes under /home/ubuntu' do
 
       command = r.respond_to?(:code) ? r.code : r.command
       command_hits_home = command.to_s.match?(HOME_UBUNTU_COMMAND)
-      env_sets_home = r.environment.is_a?(Hash) && r.environment.key?('HOME')
-      command_hits_home || env_sets_home
+      env_sets_ubuntu_home = r.environment.is_a?(Hash) && r.environment['HOME'] == '/home/ubuntu'
+      command_hits_home || env_sets_ubuntu_home
     end
     expect(offenders.map(&:to_s)).to eq([])
   end
