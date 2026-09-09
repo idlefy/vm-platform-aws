@@ -125,6 +125,24 @@ Requires IAM permission `ec2-instance-connect:SendSSHPublicKey`. All access is l
 - GPU access via CDI (`--device nvidia.com/gpu=all`), auto-detected by `/dev/nvidia0`
 - IMDSv2 hop limit = 1 blocks container IMDS access (defense in depth)
 
+### Developer home directory
+
+Root never writes under `/home/ubuntu`. Chef's `directory` resource follows a
+symlink the developer can plant there, and `file`/`template` check only the
+last path component, so a root-run resource in the developer's home is a
+`chown`/`chmod` of whatever the developer points it at — `/etc/dev-vm`, for
+instance, after which the credential broker's environment file is theirs to
+replace. Reproduced with `cinc-apply` during the first external review.
+
+The rule the cookbook follows instead: anything that must exist in the home
+directory is **staged by root under `/usr/share/dev-vm/home/`** (root-owned,
+world-readable, never secret) and **copied into place by `ubuntu`** with
+`install`, so a symlink resolves with the developer's privileges and confers
+nothing. The Traefik password is generated as `ubuntu` for the same reason.
+`spec/recipes/default_spec.rb` (via the shared example in
+`spec/support/home_boundary.rb`) converges the whole run list and fails any
+recipe that regresses; it runs in the `base-` release gate.
+
 ### Automatic updates
 
 Unattended-upgrades runs daily and installs security + non-security patches.

@@ -127,3 +127,5 @@ Both throwaway VMs and their CINC nodes are destroyed afterwards; the measuremen
 ## Measured
 
 _Filled in after §7._
+
+- ChefSpec: 59 examples, 0 failures.

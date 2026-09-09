@@ -1,5 +1,5 @@
 {
-  "revision_id": "c92cb6ef69fb74228ddb0417f3736d37b2778a56ea7882cf593554e3f82b5099",
+  "revision_id": "77c3027f0dc403a98edaef514926e3128d735634417b561903efddc418d61e58",
   "name": "dev-vm",
   "run_list": [
     "recipe[base::default]"
@@ -9,12 +9,11 @@
   ],
   "cookbook_locks": {
     "base": {
-      "version": "1.0.0",
-      "identifier": "6060ff1ba8efdaa32c754e4a14cc97a84ec9eeb8",
-      "dotted_decimal_identifier": "27128246561206234.45929303540110540.166749132156600",
+      "version": "1.1.0",
+      "identifier": "5a25c635065e9830fb330150bfdaca7a56dfd2f1",
+      "dotted_decimal_identifier": "25374281127321240.13786995366084570.222626792329969",
       "source": "../cookbooks/base",
       "cache_key": null,
-      "scm_info": null,
       "source_options": {
         "path": "../cookbooks/base"
       }
@@ -44,7 +43,7 @@
       ]
     ],
     "dependencies": {
-      "base (1.0.0)": [
+      "base (1.1.0)": [
 
       ]
     }
