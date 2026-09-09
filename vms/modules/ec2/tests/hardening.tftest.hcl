@@ -134,6 +134,49 @@ run "boundary_denies_every_launch_path" {
   }
 }
 
+run "boundary_denies_asset_routes_found_in_review" {
+  command = plan
+
+  assert {
+    condition = alltrue([
+      for action in [
+        # snapshot content without any ec2: call (EBS direct API)
+        "ebs:ListSnapshotBlocks",
+        "ebs:ListChangedBlocks",
+        "ebs:GetSnapshotBlock",
+        "ebs:StartSnapshot",
+        "ebs:PutSnapshotBlock",
+        "ebs:CompleteSnapshot",
+        # the fleet's shared egress path (Loki transport)
+        "ec2:CreateNetworkAclEntry",
+        "ec2:ReplaceNetworkAclEntry",
+        "ec2:DeleteNetworkAclEntry",
+        "ec2:ReplaceNetworkAclAssociation",
+        "ec2:CreateRoute",
+        "ec2:ReplaceRoute",
+        "ec2:DeleteRoute",
+        "ec2:ReplaceRouteTableAssociation",
+        "ec2:DisassociateRouteTable",
+        "ec2:AuthorizeSecurityGroupEgress",
+        "ec2:RevokeSecurityGroupEgress",
+        "ec2:ModifySecurityGroupRules",
+        # other instances' availability
+        "ec2:TerminateInstances",
+        "ec2:RebootInstances",
+        # another VM's fail-closed bootstrap log
+        "ec2:GetConsoleOutput",
+        "ec2:GetConsoleScreenshot",
+      ] : strcontains(aws_iam_policy.identity_boundary["vm"].policy, action)
+    ])
+    error_message = "The identity boundary must deny the EBS direct-read, fleet-network, termination and console-output routes (first external review, H1/H2)."
+  }
+
+  assert {
+    condition     = !strcontains(aws_iam_policy.identity_boundary["vm"].policy, "ec2:AuthorizeSecurityGroupIngress")
+    error_message = "Security-group ingress on a developer's own VM is documented self-service; do not deny it here."
+  }
+}
+
 # --- log shipping: the three runs that need a real instance ------------------
 # aws_iam_role_policy.bootstrap is for_each = var.instances, so only with the
 # "vm" fixture is its Resource list — and local.loki_parameter_arn — evaluated.

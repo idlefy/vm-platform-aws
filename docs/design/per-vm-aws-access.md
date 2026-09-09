@@ -120,6 +120,28 @@ Statement = [
       "ec2:StopInstances",
       "ec2:DetachVolume",
       "ec2:AttachVolume",
+      "ebs:ListSnapshotBlocks",
+      "ebs:ListChangedBlocks",
+      "ebs:GetSnapshotBlock",
+      "ebs:StartSnapshot",
+      "ebs:PutSnapshotBlock",
+      "ebs:CompleteSnapshot",
+      "ec2:CreateNetworkAclEntry",
+      "ec2:ReplaceNetworkAclEntry",
+      "ec2:DeleteNetworkAclEntry",
+      "ec2:ReplaceNetworkAclAssociation",
+      "ec2:CreateRoute",
+      "ec2:ReplaceRoute",
+      "ec2:DeleteRoute",
+      "ec2:ReplaceRouteTableAssociation",
+      "ec2:DisassociateRouteTable",
+      "ec2:AuthorizeSecurityGroupEgress",
+      "ec2:RevokeSecurityGroupEgress",
+      "ec2:ModifySecurityGroupRules",
+      "ec2:TerminateInstances",
+      "ec2:RebootInstances",
+      "ec2:GetConsoleOutput",
+      "ec2:GetConsoleScreenshot",
     ]
     Resource = "*"
   },
@@ -150,6 +172,7 @@ Every deny entry is a path from "developer holds identity-role credentials" to e
 - **`ssm:PutParameter` and `ssm:DeleteParameter*`** are integrity, not confidentiality: overwriting the validator-key parameter does not reveal it but does break enrolment for every VM created afterwards.
 - **`ssm:CreateAssociation` and `ssm:UpdateAssociation`** are remote root execution on a managed instance via `AWS-RunShellScript`, in the same class as `SendCommand`. Not exploitable today — the bootstrap role carries no `AmazonSSMManagedInstanceCore`, so the agent is unregistered — but that is a property of a policy that could change, not of this boundary.
 - **`sts:AssumeRole`** is denied because phase A has no chaining at all; that also blocks pivoting into another VM's identity role. Phase B replaces it with a deny scoped to `role/dev-vm-*`.
+- **EBS direct APIs (`ebs:GetSnapshotBlock` and siblings), fleet network mutation, `TerminateInstances`, and `GetConsoleOutput`** — added after the first external review. The EBS direct API reads a snapshot's blocks without calling any of the denied `ec2:` snapshot actions; network ACL and route changes cut the fleet's Loki egress, which is the one failure the alerts cannot see; the console carries a failed bootstrap's log. Fourth, fifth and sixth omissions of the multi-call-path shape, found by an outside reviewer rather than a test.
 
 A boundary constrains a role's permissions but not its trust policy — fine here, since the identity role's trust names only its own bootstrap role.
 
