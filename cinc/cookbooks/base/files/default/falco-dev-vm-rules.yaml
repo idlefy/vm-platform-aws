@@ -225,11 +225,16 @@
 # sudo granted it and is forgeable. A hit here is actionable on its own.
 #
 # The exclusion below is what stops that grant paging someone on every legitimate
-# login — alert 6 is critical, for: 0s, with no threshold. It is full-cmdline
-# EQUALITY, never `contains`/`startswith`/`endswith`, because proc.cmdline is argv
-# and argv is attacker-chosen (see the rule's own desc). Each loose shape has its
-# own hole, and they are not the same hole:
+# login — alert 6 is critical, for: 0s, with no threshold. It is EQUALITY on
+# proc.args — argv without argv[0] — never `contains`/`startswith`/`endswith`,
+# and never on proc.cmdline, because argv is attacker-chosen (see the rule's own
+# desc). Each loose shape has its own hole, and they are not the same hole:
 #
+#   * proc.cmdline equality — argv[0] is the name the binary was invoked by, so
+#     `ln -s /usr/bin/sudo ~/"sudo tailscale"; ~/"sudo tailscale" login` has
+#     cmdline `sudo tailscale login` while asking sudo to run `login`. Measured
+#     2026-09-09 on a staging VM: sudoers refused it and this rule stayed quiet.
+#     proc.args is `login` there and `tailscale login` on the real thing.
 #   * `contains` and `endswith` — `sudo sh -c id "tailscale login"` carries the
 #     permitted string while asking for something else entirely.
 #   * `startswith` — any trailing argument, e.g. `sudo tailscale login --qr`.
@@ -268,7 +273,7 @@
 - rule: Developer user invoked sudo
   desc: >
     ubuntu holds sudo on exactly one command — `/usr/bin/tailscale login`, which
-    the condition excludes by full-cmdline equality — so any execve of sudo
+    the condition excludes by proc.args equality — so any execve of sudo
     attributed to loginuid 1000 that reaches this rule is an escalation attempt
     and is worth reporting on its own. Note the exclusion is on the argv, not on
     the outcome: a refused `sudo tailscale up` still fires, deliberately, because
@@ -290,7 +295,7 @@
     and evt.arg.res = 0
     and proc.exepath = /usr/bin/sudo
     and user.loginuid = 1000
-    and not proc.cmdline in ("sudo tailscale login", "sudo /usr/bin/tailscale login")
+    and not proc.args in ("tailscale login", "/usr/bin/tailscale login")
   # euser/euid, not user/uid: sudo is setuid, so by the exit event these read
   # root/0 on every hit and a responder reading "user=root" would look for the
   # wrong human. loginuid is the human. The names are relabelled here rather than

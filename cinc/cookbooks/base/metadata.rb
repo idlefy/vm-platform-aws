@@ -8,6 +8,6 @@ description     'Base configuration for all VMs: firewall, SSH hardening, IMDS b
 # `make release` refuses to cut a tag whose suffix does not match it byte for
 # byte. A frozen version would make every tenant on every tag report the same
 # one out of its lock, so the bump is part of every cookbook change.
-version         '1.1.0'
+version         '1.1.1'
 
 supports 'ubuntu', '>= 24.04'

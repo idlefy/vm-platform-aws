@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.1.1
+
+Live verification of the first external review (`docs/design/first-external-review.md`, *Measured*).
+
+**`base-1.1.1`**
+
+- The Falco sudo exclusion compares `proc.args`, not `proc.cmdline`: a symlink
+  named `sudo tailscale` gave the excluded cmdline while asking sudo for `login`,
+  and the tripwire stayed quiet on a command sudoers refused.
+- `falco` joins Alloy's audit bypass: a developer-driven flood of Falco
+  detections shares the sudo detection's rate-limit bucket (1098 of 1301 lines
+  dropped in the measurement), so Falco lines are no longer throttled.
+
 ## 1.1.0
 
 Fixes from the first external review (`docs/design/first-external-review.md`).

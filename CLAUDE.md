@@ -113,7 +113,10 @@ negated selector routes the audit processes around `stage.limit`. Re-running the
 same A/B on a staging VM after the fix gave 3 verdicts emitted → 3 in Loki under
 an 11,561-line flood, with the flood itself still cut to ~10% and alert 1 firing.
 Do not reason about this from the config — reproduce it, and check **Loki**,
-not the VM's journal.
+not the VM's journal. Falco's detections share one `unit` bucket the same way
+(measured 2026-09-09: a 1300-line credential-store flood in 3 s dropped 1098
+lines from the bucket the sudo detection sits in), so `falco` is on the bypass
+selector too.
 
 The selector keys on `_COMM` rather than `SYSLOG_IDENTIFIER`, which raises the
 bar — `logger -t sudo` forges the latter trivially (measured:
@@ -214,13 +217,16 @@ pages. Only a two-revision rollout removes it. Accepted here as one page on one
 converge; if you ship a similar grant/exclusion pair for something a developer
 often uses, promote the exclusion on its own first.
 
-The exclusion must be **full-cmdline equality** against measured spellings, never
-`contains`/`startswith`/`endswith`. `proc.cmdline` is argv and argv is
-attacker-chosen: `contains` and `endswith` are satisfied by wrapping
-(`sudo sh -c id "tailscale login"`), and `startswith` is satisfied by any trailing
-argument — which silences probing that sudoers itself refuses. Read the exact
-`proc.cmdline` off a real detection rather than guessing it here; an exclusion
-that does not match is indistinguishable from no exclusion until someone is paged.
+The exclusion must be **`proc.args` equality** against measured spellings —
+argv without argv[0] — never `contains`/`startswith`/`endswith`, and never
+`proc.cmdline`. argv is attacker-chosen: `contains` and `endswith` are satisfied
+by wrapping (`sudo sh -c id "tailscale login"`), `startswith` by any trailing
+argument, and `proc.cmdline` equality by a symlink named `sudo tailscale`
+(measured 2026-09-09: `~/"sudo tailscale" login` has cmdline
+`sudo tailscale login`, sudoers refuses it, and the tripwire stayed quiet) — each
+silences probing that sudoers itself refuses. Read the exact `proc.args` off a
+real detection rather than guessing it here; an exclusion that does not match is
+indistinguishable from no exclusion until someone is paged.
 
 ## Release
 
