@@ -87,6 +87,8 @@ Security-group *ingress* is left alone on purpose: a developer opening a port on
 
 The Traps entry on "every route to the asset" gets the EBS direct API as its fourth found omission. `validation.tftest.hcl` gains one assertion per group (the rendered boundary contains the action). `docs/design/per-vm-aws-access.md` lists the additions in its boundary table.
 
+The IGW/route-table one-call blackholes (`ec2:DetachInternetGateway`, `ec2:AssociateRouteTable`, and `ec2:DeleteNatGateway` if one is ever added) are not in this deny list, and that is a property of today's topology, not a review oversight: subnets are public with `map_public_ip_on_launch` and each has an explicit route-table association, so there is no NAT path whose loss silently strands the fleet the way a black-holed route does. A move to private subnets behind a NAT gateway removes that cover and must add these three actions to the deny list in the same change.
+
 ## 4. Gates (M1–M3)
 
 - **`preflight.sh` Loki probe:** `400` → `ok`; `401|403` → `bad` (unchanged); everything else, including `000`, `2xx`, `3xx`, `5xx` → `bad` with the code in the message. A tenant that legitimately cannot reach Loki from the workstation uses `PREFLIGHT=skip`, which already exists and is already documented as the only bypass. `test-preflight.sh` gains cases for `000`, `302`, `500`.
