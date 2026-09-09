@@ -190,10 +190,18 @@ if [ -f vms/main.tf ]; then
   # the pin is.
   for m in ec2 fleet_guards; do
     dir=${m//_/-}
+    # Depth-aware, so a nested block (e.g. a "tags = { ... }" whose closing
+    # "}" lands at column 0) is not mistaken for the end of the module block
+    # and does not hide a later source line. Braces inside strings are not
+    # handled — none of the sources here contain them.
     src=$(awk -v m="$m" '
-      $0 ~ "^module \"" m "\"" { inblock = 1; next }
-      inblock && /^}/            { inblock = 0 }
-      inblock && /^[[:space:]]*source[[:space:]]*=/ { print; exit }
+      $0 ~ "^module \"" m "\"" { depth = 1; next }
+      depth >= 1 {
+        if (/^[[:space:]]*source[[:space:]]*=/) { print; exit }
+        o = gsub(/\{/, "{"); c = gsub(/\}/, "}")
+        depth += o - c
+        if (depth <= 0) exit
+      }
     ' vms/main.tf)
     if [ -z "$src" ]; then
       echo "  ✗ module \"$m\": no source line found in vms/main.tf"
@@ -201,7 +209,19 @@ if [ -f vms/main.tf ]; then
     fi
     seen=$((seen + 1))
     case "$src" in
-      *"git::"*"//vms/modules/$dir?ref=$pin_sha"*) ;;
+      *"git::"*"//vms/modules/$dir?ref="*)
+        # The trailing wildcard above only anchors "git::" and the module
+        # subdirectory — it does not anchor the ref, so a SHA that merely
+        # STARTS with the pin (?ref=<pin_sha>deadbeef) would otherwise match.
+        # Extract the ref up to the closing quote and compare it exactly.
+        ref=${src#*"//vms/modules/$dir?ref="}
+        ref=${ref%%\"*}
+        if [ "$ref" != "$pin_sha" ]; then
+          echo "  ✗ module \"$m\": $src"
+          echo "    expected ref=$pin_sha, found ref=$ref"
+          bad=1
+        fi
+        ;;
       *) echo "  ✗ module \"$m\": $src"
          echo "    expected git::<repo>//vms/modules/$dir?ref=$pin_sha"
          bad=1 ;;

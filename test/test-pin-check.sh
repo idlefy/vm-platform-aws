@@ -282,6 +282,17 @@ check "names fleet_guards" "$(echo "$OUT" | grep -q 'fleet_guards' && echo 0 || 
 check "does not claim every source is pinned" "$(echo "$OUT" | grep -q 'every module source names' && echo 1 || echo 0)"
 teardown
 
+echo "== a ref that only starts with the pin is refused =="
+# A trailing wildcard on the case pattern would accept any ref that merely
+# STARTS with the pin — ?ref=<pin_sha>deadbeef is not the pinned commit.
+setup
+sed -i "s/ref=$SHA/ref=${SHA}deadbeef/g" "$TEN/vms/main.tf"
+OUT=$( cd "$TEN" && make pin-check 2>&1 )
+check "exit non-zero" "$([ $? -ne 0 ] && echo 0 || echo 1)"
+check "names a module" "$(echo "$OUT" | grep -Eq 'module "(ec2|fleet_guards)"' && echo 0 || echo 1)"
+check "says the ref differs" "$(echo "$OUT" | grep -q "found ref=${SHA}deadbeef" && echo 0 || echo 1)"
+teardown
+
 echo ""
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]
