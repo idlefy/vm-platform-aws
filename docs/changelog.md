@@ -18,7 +18,23 @@ Fixes from the first external review (`docs/design/first-external-review.md`).
   `ubuntu:root` bug — it installs into `~/.local/bin` — fixed in the same
   release.
 
-(The `v1.1.0` entries are added by PR B.)
+**`v1.1.0`**
+
+- A failed bootstrap fails closed: cloud-init's `NOPASSWD` grant is never
+  restored; the log goes to the serial console, recovered with
+  `aws ec2 get-console-output --latest` and replaced with
+  `terraform apply -replace=`.
+- The permissions boundary denies the EBS direct API, fleet network mutation
+  (NACL entries, routes, security-group egress, `RevokeSecurityGroupIngress`,
+  `ModifyNetworkInterfaceAttribute`), `TerminateInstances`/`RebootInstances`,
+  and console output.
+- `preflight` passes only on an HTTP `400` from Loki; `pin-check` checks
+  `module "ec2"` and `module "fleet_guards"` each by name against an exactly
+  anchored SHA; `make release` fetches the upstream before its reachability
+  check and re-checks the tag after the fetch.
+- Runbook: keys and tokens are created `0600` before they are written and never
+  pass through a command line; the shipping-off procedure re-locks and edits
+  both halves before promoting; a GNU userland is a stated prerequisite.
 
 ## 1.0.0
 

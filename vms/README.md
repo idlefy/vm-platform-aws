@@ -31,11 +31,13 @@ Terraform module for managing developer EC2 instances across multiple AWS region
 Each region must have the CINC validation key in SSM Parameter Store. One-time per region:
 
 ```bash
-# Replace <param-name> with cinc_ssm_parameter_name from your tenant.auto.tfvars
+# Replace <param-name> with cinc_ssm_parameter_name from your tenant.auto.tfvars.
+# The key goes through a 0600 file, never through --value "$(cat …)": an argument
+# is readable in `ps` for as long as the call runs.
 aws ssm put-parameter \
   --name "<param-name>" \
   --type SecureString \
-  --value "$(cat <your-org>-validator.pem)" \
+  --value "file://<path to your-org-validator.pem>" \
   --region <region> \
   --profile <your-aws-profile>
 ```
@@ -250,9 +252,10 @@ gone.
   Escape hatch: `unset AWS_SHARED_CREDENTIALS_FILE` in your shell. `~/.aws/config`
   is *not* affected: phase A deliberately does not set `AWS_CONFIG_FILE`, so
   profiles, regions and SSO sessions defined there keep working.
-- **`make ssh` needs `USER=admin` spelled out.** `cinc/Makefile`'s `ssh` target
-  defaults `SSH_USER` from `$(USER)`, which Make inherits from the environment, so
-  omitting it silently tries to log in as your local username.
+- **`make ssh` logs in as `admin` unless told otherwise.** `cinc/Makefile`'s
+  `ssh` target reads `USER` only when it is given on the command line
+  (`make ssh INSTANCE=… USER=ubuntu`); the environment's `$USER` is ignored on
+  purpose, so omitting it never tries your local username.
 
 ### Troubleshooting
 
