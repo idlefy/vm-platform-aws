@@ -1,0 +1,108 @@
+# Runs the gates `make release` runs, on every pull request
+# and every push to main, so a PR cannot merge
+# a tree nobody gated. Nothing here reaches AWS: every terraform test uses
+# mock_provider, the broker and Loki-token tests stub `aws` on PATH, and the
+# pin tests build their own bare repository in a temp dir. No secrets are
+# configured and none are needed — the only network traffic is tool downloads.
+#
+# Two jobs, one per release stream (see CLAUDE.md "Release"), so a failure names
+# the stream it belongs to. The lists mirror CLAUDE.md "Verify your own edits";
+# change them together.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  terraform:
+    name: vX.Y.Z stream (modules + skeleton)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing after checkout needs git auth; the pin tests use local bare
+          # repos. Do not leave the token in .git/config for PR-controlled code.
+          persist-credentials: false
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.16.0
+          # The wrapper swallows exit codes into outputs; the scripts here
+          # read `terraform`'s exit status directly.
+          terraform_wrapper: false
+
+      - name: boundary-check
+        run: make boundary-check
+
+      - name: test-skeleton-sync
+        run: make test-skeleton-sync
+
+      - name: smoke
+        run: make smoke
+
+      - name: terraform test — modules/ec2
+        working-directory: vms/modules/ec2
+        run: terraform init -backend=false -no-color && terraform test -no-color
+
+      - name: terraform test — modules/fleet-guards
+        working-directory: vms/modules/fleet-guards
+        run: terraform init -backend=false -no-color && terraform test -no-color
+
+      - name: script tests (no chef needed)
+        run: |
+          set -e
+          for t in test/test-release-gate.sh \
+                   test/test-resolve-pin.sh \
+                   test/test-boundary-check.sh \
+                   test/test-placeholder-check.sh \
+                   test/test-prepare.sh \
+                   test/test-pin-to-worktree.sh \
+                   test/test-preflight.sh \
+                   test/test-get-started-skill.sh; do
+            echo "=== $t"
+            "$t"
+          done
+
+  cookbook:
+    name: base-X.Y.Z stream (cookbook)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing after checkout needs git auth; the pin tests use local bare
+          # repos. Do not leave the token in .git/config for PR-controlled code.
+          persist-credentials: false
+
+      # Cinc Workstation, same major as the workstations that cut releases.
+      # It brings cookstyle, chef-cli (`chef install`, needed by
+      # test-pin-check) and ChefSpec in one package.
+      - name: install Cinc Workstation
+        run: |
+          curl -fsSL https://omnitruck.cinc.sh/install.sh \
+            | sudo bash -s -- -P cinc-workstation -v 26
+          cookstyle --version
+          chef --version
+
+      - name: lint
+        working-directory: cinc
+        run: make lint
+
+      - name: chefspec
+        working-directory: cinc
+        run: make test
+
+      - name: test-broker
+        working-directory: cinc
+        run: make test-broker
+
+      - name: test-loki-token
+        working-directory: cinc
+        run: make test-loki-token
+
+      - name: test-pin-check
+        run: ./test/test-pin-check.sh

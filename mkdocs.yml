@@ -1,0 +1,59 @@
+site_name: vm-platform-aws
+site_description: Hardened developer VMs on AWS — Terraform + CINC, built to be managed by Idlefy.
+site_url: https://idlefy.github.io/vm-platform-aws/
+repo_url: https://github.com/idlefy/vm-platform-aws
+repo_name: idlefy/vm-platform-aws
+edit_uri: ""
+docs_dir: docs
+strict: true
+
+theme:
+  name: material
+  logo: assets/logo.png
+  favicon: assets/favicon-64.png
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - search.highlight
+    - content.code.copy
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: light blue
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: light blue
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+plugins:
+  - search
+
+nav:
+  - Home: index.md
+  - Runbook: runbook.md
+  - Design:
+      - Sudo audit alerting: design/sudo-audit-alerting.md
+      - Log shipping: design/log-shipping.md
+      - Optional log shipping: design/optional-log-shipping.md
+      - Per-VM AWS access: design/per-vm-aws-access.md
+  - Versioning: versioning.md
+  - Changelog: changelog.md

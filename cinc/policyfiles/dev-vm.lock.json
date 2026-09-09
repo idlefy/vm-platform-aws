@@ -1,0 +1,52 @@
+{
+  "revision_id": "c92cb6ef69fb74228ddb0417f3736d37b2778a56ea7882cf593554e3f82b5099",
+  "name": "dev-vm",
+  "run_list": [
+    "recipe[base::default]"
+  ],
+  "included_policy_locks": [
+
+  ],
+  "cookbook_locks": {
+    "base": {
+      "version": "1.0.0",
+      "identifier": "6060ff1ba8efdaa32c754e4a14cc97a84ec9eeb8",
+      "dotted_decimal_identifier": "27128246561206234.45929303540110540.166749132156600",
+      "source": "../cookbooks/base",
+      "cache_key": null,
+      "scm_info": null,
+      "source_options": {
+        "path": "../cookbooks/base"
+      }
+    }
+  },
+  "default_attributes": {
+    "base": {
+      "traefik": {
+        "acme_email": "admin@example.com",
+        "domain_root": "example.com"
+      },
+      "loki": {
+        "ssm_parameter_name": "/developer-vms/observability/loki-token",
+        "url": "https://logs-prod-000.grafana.net/loki/api/v1/push",
+        "username": "000000"
+      }
+    }
+  },
+  "override_attributes": {
+
+  },
+  "solution_dependencies": {
+    "Policyfile": [
+      [
+        "base",
+        ">= 0.0.0"
+      ]
+    ],
+    "dependencies": {
+      "base (1.0.0)": [
+
+      ]
+    }
+  }
+}

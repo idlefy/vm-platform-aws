@@ -1,0 +1,3 @@
+node_name        "admin"
+client_key       File.expand_path("../admin.pem", __FILE__)
+chef_server_url  "https://cinc.REPLACE_ME/organizations/REPLACE_ME"

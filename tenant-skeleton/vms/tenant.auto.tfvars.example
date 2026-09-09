@@ -1,0 +1,36 @@
+# Per-tenant values for the developer-VMs Terraform root.
+#
+# Copy this file to `tenant.auto.tfvars` and fill in your own values.
+# `tenant.auto.tfvars` is gitignored — never commit your real config.
+#
+# After editing: `terraform plan` should show changes only if values differ
+# from whatever is currently deployed. On a fresh tenant, plan creates
+# everything from scratch.
+
+aws_profile     = "your-aws-cli-profile"
+route53_zone_id = "Z01234567ABCDEFGHIJKL"
+
+# SSM parameter prefix is your call. Convention: /<scope>/<service>/<key>.
+# The tenant-setup skill derives /developer-vms/cinc/<org-slug>-validator-key,
+# which is the same convention with the org in the name — use either, as long as
+# the SecureString you create in each region carries exactly this string.
+cinc_ssm_parameter_name = "/developer-vms/cinc/validator-key"
+
+# Log shipping to Grafana Cloud Loki. This flag and
+# `default['base']['loki']['enabled']` in cinc/policyfiles/dev-vm.rb are ONE
+# decision: `cd cinc && make preflight` fails if they disagree. Not using
+# Grafana Cloud? Set log_shipping = false and loki_ssm_parameter_name = null.
+log_shipping            = true
+loki_ssm_parameter_name = "/developer-vms/observability/loki-token"
+
+# Idlefy. Every VM is tagged `idlefy = "enabled"` so Idlefy can find it and
+# stop/start/reboot it on your schedule — the tag is a label, the platform grants
+# Idlefy nothing; Idlefy's own role is what you connect at https://idlefy.com.
+# false ⇒ the platform adds no `idlefy` tag (a VM's own `tags` still apply).
+# To opt a single VM out instead, give it `tags = { idlefy = "disabled" }` in
+# instances.auto.tfvars.
+idlefy_managed = true
+
+# Full CINC server URL including the org path.
+# org = "Chef organization" — see infra/ansible/roles/cinc-server/defaults/main.yml.
+cinc_server_url = "https://cinc.infra.example.com/organizations/your-org"

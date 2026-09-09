@@ -1,0 +1,43 @@
+# Managed by CINC (base::traefik). Local edits are reverted every 30 minutes.
+[Unit]
+Description=Traefik reverse proxy for published services
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=5s
+# Rootless docker talks to its own socket under XDG_RUNTIME_DIR. Set it
+# explicitly rather than relying on the CLI's current context: docker.rb already
+# takes that position for the developer's shell, and a context left pointing
+# elsewhere would otherwise break this unit silently.
+Environment=DOCKER_HOST=unix://%t/docker.sock
+# --rm plus an unconditional pre-removal: the container is recreated from the
+# pinned digest on every start, so bumping the image is a template change plus a
+# restart rather than a manual `docker rm` nobody remembers.
+#
+# platform-traefik, not traefik: this shares a docker namespace with the
+# developer, the pre-removal takes the name unconditionally, and `traefik` is
+# exactly what someone experimenting with a proxy of their own would call it.
+# A prefix nobody types by accident lets the removal stay unconditional without
+# ever destroying a container we do not own.
+ExecStartPre=-/usr/bin/docker rm -f platform-traefik
+# The configuration DIRECTORY is mounted, never the individual files. Docker
+# creates a missing -v source as a directory, so a per-file mount of `users`
+# would have Docker create it as an empty directory on a VM where the password
+# has not been generated yet — and the recipe's File.exist? guard is true for a
+# directory, so the password would then never be generated, on any converge,
+# silently. A single-file mount is also pinned to an inode, so editing `users`
+# with anything that replaces the file would detach it from what Traefik reads.
+ExecStart=/usr/bin/docker run --rm --name platform-traefik \
+  --network web \
+  -p 80:80 -p 443:443 \
+  -v %t/docker.sock:/var/run/docker.sock:ro \
+  -v %h/.config/traefik:/etc/traefik:ro \
+  -v %h/.local/share/traefik:/acme \
+  <%= @image %>
+ExecStop=/usr/bin/docker stop platform-traefik
+
+[Install]
+WantedBy=default.target

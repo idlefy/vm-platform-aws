@@ -1,0 +1,89 @@
+# yaml-language-server: $schema=https://storage.googleapis.com/coderabbit_public_assets/schema.v2.json
+#
+# CodeRabbit config for idlefy/vm-platform-aws. Lives on main; overrides the
+# web-UI settings. Docs: https://docs.coderabbit.ai/guides/configure-coderabbit
+
+language: en-US
+
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: false
+  abort_on_close: true
+
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - main
+
+  # Generated or binary: nothing to review.
+  path_filters:
+    - "!**/*.lock.json"
+    - "!**/*.png"
+    - "!**/*.jpg"
+    - "!**/*.svg"
+    - "!**/*.ico"
+    - "!site/**"
+
+  path_instructions:
+    - path: "vms/modules/**"
+      instructions: >-
+        A change to a module input must update tenant-skeleton/ in the same PR.
+        Flag any variable added, renamed or removed without a matching skeleton
+        change (tenant-skeleton/vms/variables.tf, main.tf, the .example file and
+        tests/skeleton.tftest.hcl).
+    - path: "cinc/cookbooks/base/**"
+      instructions: >-
+        The Alloy version pin in recipes/alloy.rb and the unattended-upgrades
+        blacklist in recipes/unattended_upgrades.rb are one change; flag either
+        moving alone. Never accept a resource that echoes a secret's value.
+    - path: "tenant-skeleton/**"
+      instructions: >-
+        This is a public template. Flag any real domain, hostname, account ID,
+        person's login, email, SSH public key or IP address; only example.com,
+        RFC 5737 addresses and documentation placeholders belong here.
+    - path: "docs/**"
+      instructions: >-
+        Public documentation. Flag any real domain, hostname, account ID,
+        person's login, email, SSH public key or IP address; only example.com,
+        RFC 5737 addresses and documentation placeholders belong here.
+    - path: ".github/**"
+      instructions: >-
+        Pin third-party actions to a commit SHA with the tag in a trailing
+        comment. Flag untrusted PR input used in run steps.
+
+  tools:
+    tflint:
+      enabled: true
+    checkov:
+      enabled: true
+    rubocop:
+      enabled: true
+    shellcheck:
+      enabled: true
+    markdownlint:
+      enabled: true
+    yamllint:
+      enabled: true
+    actionlint:
+      enabled: true
+    gitleaks:
+      enabled: true
+
+chat:
+  auto_reply: true
+
+knowledge_base:
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "CLAUDE.md"
+      - "tenant-skeleton/CLAUDE.md"
+  learnings:
+    scope: auto
+  pull_requests:
+    scope: auto

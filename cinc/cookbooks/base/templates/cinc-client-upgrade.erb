@@ -1,0 +1,44 @@
+#!/bin/bash
+# Managed by CINC — base::cinc_client. Do not edit on the VM.
+#
+# Moves the CINC client to the version pinned in the cookbook. Nothing here
+# auto-updates: the client changes only when the pinned version in
+# base::cinc_client changes and the policy is pushed and promoted.
+#
+# This runs as ExecStartPre of cinc-client.service, i.e. before the client
+# starts, rather than as a resource inside the converge. A converge runs out of
+# /opt/cinc and Ruby loads files lazily as it goes, so replacing that tree
+# mid-run can leave one run reading two versions of the client. Upgrading first
+# means the client that reads the policy is already the pinned one.
+#
+# The unit calls this with a leading '-', so a failure here is logged and
+# ignored: a bad version, a network outage or a checksum mismatch leaves the
+# VM converging on its current client instead of not converging at all. That
+# matters — this file is delivered by the same mechanism it gates.
+set -euo pipefail
+
+WANT_VERSION="<%= @version %>"
+WANT_SHA256="<%= @sha256 %>"
+
+have=$(dpkg-query -W -f='${Version}' cinc 2>/dev/null || true)
+have=${have%-*} # strip the packaging revision: 19.3.14-1 -> 19.3.14
+
+if [ "$have" = "$WANT_VERSION" ]; then
+  exit 0
+fi
+
+echo "cinc-client-upgrade: ${have:-none} -> ${WANT_VERSION}"
+
+deb=$(mktemp /tmp/cinc-upgrade-XXXXXX.deb)
+trap 'rm -f "$deb"' EXIT
+
+# ubuntu/24.04 matches the VM's own release and CINC publishes a native build
+# for it. See the same note in vms/modules/ec2/user_data.tf before changing it.
+curl -fsSL --retry 3 --retry-delay 2 \
+  "https://downloads.cinc.sh/files/stable/cinc/${WANT_VERSION}/ubuntu/24.04/cinc_${WANT_VERSION}-1_amd64.deb" \
+  -o "$deb"
+
+echo "${WANT_SHA256}  ${deb}" | sha256sum -c - >/dev/null
+
+dpkg -i "$deb"
+echo "cinc-client-upgrade: now $(dpkg-query -W -f='${Version}' cinc)"

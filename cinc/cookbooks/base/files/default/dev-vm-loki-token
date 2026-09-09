@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# Fetch the Grafana Cloud Loki push token from SSM and publish it for Alloy.
+#
+# Usage: dev-vm-loki-token <aws-region> <ssm-parameter-name>
+#
+# Managed by CINC base::alloy — do not edit on the VM, changes are reverted on
+# the next converge.
+#
+# This is a script rather than inline Ruby in the recipe for two reasons. It can
+# be tested against a stubbed `aws` (see cinc/test/test-loki-token.sh), which the
+# cookbook has no ChefSpec harness to do otherwise; and the token value never
+# passes through a Chef resource's content or an execute's command line, so there
+# is nothing for Chef to print and nothing for `ps` to show.
+#
+# Exit codes:
+#   0   token is current (written now, or already correct)
+#   10  fetch failed; any existing token was left untouched
+#
+# 10 is NOT a hard failure by design. The recipe treats it as warn-and-continue,
+# matching base::aws_access — a transient SSM error must disable one feature for
+# one converge, not abort the run and skip every recipe ordered after it.
+
+set -uo pipefail
+
+REGION="${1:-}"
+PARAM="${2:-}"
+DEST="${LOKI_TOKEN_DEST:-/etc/alloy/loki-token}"
+
+if [ -z "$REGION" ] || [ -z "$PARAM" ]; then
+  echo "dev-vm-loki-token: WARN: region and parameter name are both required" >&2
+  exit 10
+fi
+
+TMP=""
+ERR=""
+cleanup() {
+  [ -n "$TMP" ] && rm -f "$TMP"
+  [ -n "$ERR" ] && rm -f "$ERR"
+}
+trap cleanup EXIT
+
+# Written to a temp file in the destination directory rather than a variable, so
+# the value never becomes a shell variable that could be echoed by `set -x` or
+# leak through the environment of a child process.
+TMP=$(mktemp "$(dirname "$DEST")/.loki-token.XXXXXX") || exit 10
+chmod 0600 "$TMP"
+
+# --with-decryption is load-bearing: the parameter is a SecureString, and without
+# it the CLI returns the KMS ciphertext, which would be published as the token and
+# 401 on every push. The test suite asserts it appears in the recorded argv.
+#
+# stderr is captured rather than discarded so the WARN below can carry the actual
+# AWS error. Silently swallowing it turns "the parameter does not exist" and
+# "throttled" into the same unhelpful message.
+ERR=$(mktemp) || exit 10
+if ! aws ssm get-parameter \
+      --name "$PARAM" \
+      --with-decryption \
+      --region "$REGION" \
+      --query 'Parameter.Value' \
+      --output text > "$TMP" 2>"$ERR"; then
+  echo "dev-vm-loki-token: WARN: could not read $PARAM from SSM in $REGION; keeping any existing token: $(tr '\n' ' ' < "$ERR")" >&2
+  rm -f "$ERR"
+  exit 10
+fi
+rm -f "$ERR"
+
+# An empty parameter is a failure, not a valid token. Writing it would leave
+# Alloy authenticating with the empty string and failing every push — which looks
+# identical to a network problem in the logs.
+#
+# Checked with grep rather than -s: `aws ... --output text` always terminates
+# its output with a trailing newline, so an empty parameter value still produces
+# a 1-byte file and `[ -s "$TMP" ]` alone would call it non-empty. grep -q also
+# keeps the value off stdout.
+if ! grep -q '[^[:space:]]' "$TMP"; then
+  echo "dev-vm-loki-token: WARN: $PARAM is empty; keeping any existing token" >&2
+  exit 10
+fi
+
+# Unchanged value: re-assert mode and ownership before leaving, then stop.
+#
+# Without this the early exit skips the chmod/chown below, so a stray `chmod 0644`
+# by an admin would survive every future converge — no Chef resource manages this
+# file, deliberately, so nothing else would ever put it back. The platform's
+# revert-on-converge promise has to hold for the one secret on disk.
+if [ -f "$DEST" ] && cmp -s "$TMP" "$DEST"; then
+  chmod 0640 "$DEST" || exit 10
+  if [ "$(id -u)" = "0" ]; then
+    chown root:alloy "$DEST" || exit 10
+  fi
+  exit 0
+fi
+
+chmod 0640 "$TMP" || exit 10
+# Ownership needs root. Skipped when unprivileged so the test suite can run as a
+# normal user; a real converge always runs as root, and Task 7 verifies the
+# resulting owner on a live VM.
+if [ "$(id -u)" = "0" ]; then
+  chown root:alloy "$TMP" || exit 10
+fi
+
+mv -f "$TMP" "$DEST" || exit 10
+TMP=""
+
+systemctl try-restart alloy.service >/dev/null 2>&1 || true
+exit 0

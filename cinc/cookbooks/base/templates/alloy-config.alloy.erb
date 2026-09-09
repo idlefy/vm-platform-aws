@@ -1,0 +1,281 @@
+// Managed by CINC base::alloy — do not edit. Reverted on the next converge.
+//
+// Design: docs/design/log-shipping.md
+//
+// Two mechanisms, deliberately: relabel_rules promotes the two fields we WANT as
+// labels, and format_as_json + stage.json feeds everything else into structured
+// metadata. Do not "simplify" this into a single labelmap — the widely-copied
+// forum recipe that does so omits label_drop, leaving every field as a label as
+// well, so cardinality does not fall at all and nothing looks wrong.
+//
+// The label inventory is split across three places in this file; here it is in
+// one spot. The labels this recipe sets: instance, region and public_ip come from
+// loki.source.journal's own labels argument below; unit and level come from
+// loki.relabel's relabel_rules; job comes from stage.static_labels in
+// loki.process. service_name is not set anywhere here — Loki derives it itself.
+//
+// public_ip is present only when the VM has one, so a stream carries either five
+// labels or six. It costs no cardinality: its value is a function of instance, so
+// it creates no stream combination that instance did not already create. That is
+// the whole test for whether a label is affordable here — a label that varies
+// independently of the others multiplies streams, one that is derived from an
+// existing label does not.
+
+// max_age is a multi-day-outage backstop, not a normal read bound: in steady
+// state the saved cursor governs the position, so a longer window costs
+// nothing. sdjournal's seekToStart discards that cursor and jumps to
+// now - max_age whenever the entry it points at is older than that, so too
+// short a value here silently loses everything journald otherwise still
+// holds — a crash loop, a bad config, the first converge before the token
+// exists, or Idlefy keeping the VM stopped over a weekend. 72h covers a
+// weekend; journald's own retention remains the backstop beyond that.
+loki.source.journal "journal" {
+  forward_to     = [loki.process.journal.receiver]
+  format_as_json = true
+  max_age        = "72h"
+  relabel_rules  = loki.relabel.journal.rules
+
+  // The public_ip line is emitted only when one was resolved. An empty label
+  // value would be silently dropped by Loki anyway, but omitting the line keeps
+  // the rendered config honest about what the VM actually has, and keeps a
+  // private-only VM from advertising a label it cannot fill.
+  labels = {
+    instance  = "<%= @vm_name %>",
+    region    = "<%= @region %>",
+<% if @public_ip && !@public_ip.empty? -%>
+    public_ip = "<%= @public_ip %>",
+<% end -%>
+  }
+}
+
+// forward_to is empty on purpose: this component exists only to export `rules`
+// for the journal source above.
+loki.relabel "journal" {
+  forward_to = []
+
+  rule {
+    source_labels = ["__journal__systemd_unit"]
+    target_label  = "unit"
+  }
+
+  // priority_keyword, not the numeric priority: Alloy's mapping of the numeric
+  // PRIORITY to emerg/alert/crit/error/warning/notice/info/debug, so we do not
+  // reimplement it. Note "error", not syslog's "err" — query {level="error"}.
+  rule {
+    source_labels = ["__journal_priority_keyword"]
+    target_label  = "level"
+  }
+}
+
+loki.process "journal" {
+  forward_to = [loki.write.grafana_cloud.receiver]
+
+  // job is set here, not in loki.source.journal's own labels, because Alloy's
+  // main branch already contains labelMap["job"] = opts.id, applied AFTER a
+  // source's labels are copied in — not yet in a released version, but this
+  // fleet auto-updates Alloy (unattended_upgrades.rb watches apt.grafana.com),
+  // so it can land under us. If it does, a job set at the source silently
+  // becomes "loki.source.journal.journal" fleet-wide, service_name follows it,
+  // and every query anchored on {job="dev-vm"} — which is all of the security
+  // alerting — goes quiet while every VM keeps shipping. Setting it in
+  // loki.process instead survives that: nothing after this stage overwrites it.
+  stage.static_labels {
+    values = { job = "dev-vm" }
+  }
+
+  stage.json {
+    expressions = {
+      message           = "MESSAGE",
+      boot_id           = "_BOOT_ID",
+      transport         = "_TRANSPORT",
+      pid               = "_PID",
+      syslog_identifier = "SYSLOG_IDENTIFIER",
+      comm              = "_COMM",
+      exe               = "_EXE",
+      uid               = "_UID",
+      audit_loginuid    = "_AUDIT_LOGINUID",
+    }
+  }
+
+  // These are searchable without creating a stream. boot_id in particular MUST
+  // NOT become a label: Idlefy reboots idle VMs, so a new boot_id appears on
+  // every machine almost daily and would multiply streams across every unit and
+  // level. Grafana's own Linux integration labels it; they do not assume daily
+  // reboots and we must.
+  //
+  // exe (_EXE) is shipped to be LOOKED AT, never selected on. Together with comm
+  // it is the only way a responder sees, in a panel, that a line claiming to be
+  // sudo does not come from the sudo binary.
+  //
+  // Read it as corroboration, never as proof, and in one direction only. An exe
+  // that points somewhere other than the sudo binary on a line claiming to be
+  // sudo is a strong signal. On this AMI that path is /usr/bin/sudo — check it
+  // against a real line rather than trusting this comment, because under sudo-rs
+  // it is /usr/lib/cargo/bin/sudo and an AMI bump would make every genuine line
+  // look wrong.
+  //
+  // An exe that is ABSENT proves nothing either way: journald fills _EXE
+  // best-effort by reading /proc/PID/exe when the line arrives, so a sender that
+  // has already exited leaves it empty — and sudo writes its verdict immediately
+  // before exiting. Measured 2026-08-11 over 30 days of the live fleet: present
+  // on 148 of 151 real sudo lines, the three misses being that exact race.
+  // Calling a missing exe a forgery would mean calling real escalation attempts
+  // forgeries.
+  //
+  // Do not move any selector onto it: _EXE is forgeable too (a lingering sender
+  // wins journald's /proc race, and an unprivileged mount namespace can point it
+  // at any path — measured 2026-08-11), and keying the limiter bypass on it would
+  // need eleven absolute paths, one of which moves between releases (sudo is
+  // /usr/lib/cargo/bin/sudo under sudo-rs). Cost: ~20-40 bytes per line against
+  // the free tier — the modal value is a systemd path like
+  // /usr/lib/systemd/systemd-journald, not the shorter /usr/bin/sudo. See the
+  // "Log volume against the free tier" panel.
+  stage.structured_metadata {
+    values = {
+      boot_id           = "",
+      transport         = "",
+      pid               = "",
+      syslog_identifier = "",
+      comm              = "",
+      exe               = "",
+      uid               = "",
+      audit_loginuid    = "",
+    }
+  }
+
+  // The audit identifiers bypass the limiter entirely. Everything else is
+  // throttled per unit.
+  //
+  // Per-unit scoping alone was NOT enough, and the way it failed is the whole
+  // reason this branch exists. An interactive `sudo` is journaled under the
+  // invoking shell's login session scope — session-N.scope, a unit the
+  // DEVELOPER owns — not under a unit of its own. Their `logger` flood lands in
+  // that same scope, so the limiter bucketed flood and escalation-refused
+  // verdict together and `drop = true` discarded both. Measured on the live
+  // fleet 2026-08-05, same VM and same command minutes apart: with no flood, 1
+  // verdict emitted and 1 reached Loki; under an ~11,500-line flood in the same
+  // scope, 3 verdicts emitted and 0 reached Loki. Alert 1 — the one that goes to
+  // a human — returned zero on a real escalation attempt, and the saturation
+  // proxy did not compensate, because it counts ARRIVED lines and the limiter is
+  // holding those down by construction (mid-flood it read 1 against a threshold
+  // of 1000). sshd survived the same attack only because ssh.service is its own
+  // unit; sudo had no such luck.
+  //
+  // So the audit trail is routed around the limiter rather than merely
+  // partitioned from the noise. A developer can still burn budget with a flood —
+  // that is what the limiter is for — but they can no longer make their own
+  // escalation attempt disappear, which is this system's primary requirement.
+  //
+  // audit_src is a scratch label, not a shipped one: stage.match can only select
+  // on labels, and comm lives in structured metadata. It is removed by the
+  // stage.label_drop below, so it never reaches loki.write and never creates a
+  // stream. Keep the two in sync — a scratch label added here and not dropped
+  // there becomes a fleet-wide label.
+  //
+  // The list is the processes whose loss would be a hole in the audit trail:
+  // sudo (escalation, granted and refused), sshd (logins), su, and the account
+  // and group management tools. Adding a chatty process here hands a developer
+  // an unmetered channel, so add only what is genuinely audit.
+  //
+  // An entry whose _COMM is missing gets an empty audit_src, does not match the
+  // alternation, and is therefore throttled — the safe default.
+  //
+  // There are NO drop stages here, and none by priority may ever be added: sshd
+  // logs successful logins at INFO and sudo at NOTICE.
+  //
+  // Entries with no "unit" label (kernel-transport lines) are never throttled —
+  // limit.go's shouldThrottle returns false when the label is absent. That is
+  // a deliberate choice, not an oversight: for an audit pipeline, unlimited
+  // beats dropped.
+  //
+  // max_distinct_labels is 10000 because limit.go raises anything lower to
+  // that floor itself and logs a warning on every start otherwise — a value
+  // here below it is a no-op that only adds noise to the log this pipeline's
+  // health is judged by.
+  //
+  // Undocumented interaction with max_age above: after a multi-day outage,
+  // catch-up replays the backlog faster than real time, while this limiter
+  // still allows only 20 lines/s per unit and drops the rest. So the 72h
+  // backstop fully recovers only units quieter than roughly 20 lines/s over
+  // the replay window — true of the audit units this exists for (ssh.service,
+  // sudo) but not of a chatty unit. Anyone lowering `rate` on the grounds that
+  // steady-state traffic looks quiet would silently gut the backstop without
+  // touching max_age at all.
+  // comm (_COMM), NOT syslog_identifier — but understand exactly what that buys,
+  // because an earlier version of this comment overstated it and a design was
+  // built on the overstatement.
+  //
+  // SYSLOG_IDENTIFIER is a string in the message: `logger -t sudo "anything"`
+  // sets it from an unprivileged shell, verified on a live VM 2026-08-05, which
+  // produced syslog_identifier=sudo, comm=logger, uid=1000. Keying the bypass
+  // there would hand every developer an unmetered channel.
+  //
+  // _COMM is harder to set but NOT unforgeable. journald reads it from
+  // /proc/PID/comm of the sender, and the sender owns that: exec through a
+  // symlink named `sudo` sets it (the kernel takes comm from the exec path's
+  // basename), and prctl(PR_SET_NAME, "sudo") sets it at runtime. Both verified
+  // 2026-08-11. No journald field authenticates a sudo event — and the accurate
+  // form of that is narrower than "no field can be trusted at all". Every
+  // _-prefixed field describes the sending process, and most are also set by it,
+  // as _COMM and _EXE are. _UID is not: the kernel fills it from SCM_CREDENTIALS.
+  // Nor is the unit label, which journald derives from the sender's cgroup. Those
+  // two constrain provenance and do anchor queries elsewhere in this pipeline's
+  // alerts; they just cannot establish that sudo ran, because a genuine sudo
+  // verdict carries the developer's own uid and their own session scope. The
+  // authoritative escalation detector is therefore a Falco rule, whose events
+  // come from the kernel; see base::falco.
+  //
+  // So this selector is best-effort: it keeps genuine audit processes off the
+  // limiter, which is its job. Real audit lines carry comm=sudo and comm=sshd,
+  // confirmed in Loki — which is why those two names anchor the list below. A
+  // developer who renames a flooding process `sudo` gets an unmetered channel
+  // and forged verdicts — noisy and costly, but it does NOT let them suppress
+  // their own real verdict, because that takes the bypass too. Suppression is
+  // what base 0.6.0 fixed and it stays fixed.
+  stage.labels {
+    values = { audit_src = "comm" }
+  }
+
+  // action defaults to "keep": entries matching the selector run the nested
+  // stages, entries that do not are passed through untouched. The selector is
+  // negated, so the audit processes are the ones that skip stage.limit.
+  stage.match {
+    selector = `{audit_src!~"sudo|sshd|su|useradd|usermod|userdel|groupadd|groupdel|gpasswd|chpasswd|passwd"}`
+
+    stage.limit {
+      rate                = 20
+      burst               = 200
+      by_label_name       = "unit"
+      max_distinct_labels = 10000
+      drop                = true
+    }
+  }
+
+  // Must stay after stage.match and before loki.write. Dropping it earlier
+  // leaves the selector nothing to match on; not dropping it at all ships a
+  // per-identifier label and multiplies streams.
+  stage.label_drop {
+    values = ["audit_src"]
+  }
+
+  // Restores a readable line. Without this every entry stays raw JSON.
+  stage.output {
+    source = "message"
+  }
+}
+
+loki.write "grafana_cloud" {
+  endpoint {
+    url = "<%= @loki_url %>"
+
+    // password_file, not password. This config is itself 0640 root:alloy in a
+    // 0750 directory, so the developer cannot read it either way — the reason is
+    // the converge, not the file. An inline password would become the content of
+    // a Chef template resource, and Chef prints a content diff on change and
+    // streams it to a journal this very system ships to a third party.
+    basic_auth {
+      username      = "<%= @loki_user %>"
+      password_file = "/etc/alloy/loki-token"
+    }
+  }
+}

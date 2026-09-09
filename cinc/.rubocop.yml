@@ -1,0 +1,15 @@
+# Cookstyle configuration for `make lint`.
+#
+# Lives in a file rather than as inline `rubocop:disable` comments because the
+# fleet's workstations and CI run different cookstyle majors (8.x and 9.x,
+# measured 2026-09-05). Both ship Chef/Correctness/ServiceResource, but only
+# 9.x's matcher recognises `systemctl start`; on 8.x the offense never fires,
+# so an inline disable is itself flagged as redundant. A config exclusion is
+# silent on both.
+
+# aws_access.rb kicks a Type=oneshot unit with `systemctl start` on purpose —
+# it is a one-off refresh with ignore_failure, not a service state to converge
+# to. The recipe comment above the resource carries the full reasoning.
+Chef/Correctness/ServiceResource:
+  Exclude:
+    - 'cookbooks/base/recipes/aws_access.rb'

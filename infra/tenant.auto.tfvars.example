@@ -1,0 +1,21 @@
+# Per-tenant values for the shared security infra (CINC server).
+#
+# Copy this file to `tenant.auto.tfvars` and fill in your own values.
+# `tenant.auto.tfvars` is gitignored — never commit your real config.
+
+aws_profile     = "your-aws-cli-profile"
+account_name    = "your-account-slug"
+route53_zone_id = "Z01234567ABCDEFGHIJKL"
+
+# FQDNs in your Route53 zone. These become A-records pointing at the EIPs.
+cinc_server_fqdn  = "cinc.infra.example.com"
+
+# AWS key pairs created in the account. The CINC EC2 uses the first one.
+ssh_key_pairs = {
+  "Admin_User" = "ssh-ed25519 AAAA... admin@example"
+}
+
+# Ops SSH public keys appended to the `admin` user's authorized_keys on each infra server.
+master_ssh_keys = [
+  "ssh-ed25519 AAAA... ops-engineer-1@example",
+]

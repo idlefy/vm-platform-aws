@@ -1,0 +1,17 @@
+[Unit]
+Description=CINC Client periodic run
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Leading '-' is deliberate: if the pinned-version upgrade fails, log it and run
+# the client anyway. Without it a bad pin or a network blip would stop the VM
+# converging at all — and converging is how the pin gets corrected.
+ExecStartPre=-/usr/local/sbin/cinc-client-upgrade
+ExecStart=/usr/bin/cinc-client
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target
