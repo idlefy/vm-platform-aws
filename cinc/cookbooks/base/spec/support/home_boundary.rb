@@ -9,17 +9,58 @@
 # future recipe fails.
 HOME_WRITERS = %w(directory file template cookbook_file link remote_file).freeze
 
+# Matches an execute command that reaches into /home/ubuntu by any of the
+# spellings seen in this cookbook: the literal path, $HOME (when HOME is set
+# to it), or a ~ubuntu tilde-expansion.
+HOME_UBUNTU_COMMAND = %r{/home/ubuntu|\$HOME|~ubuntu\b}.freeze
+
 RSpec.shared_examples 'root never writes under /home/ubuntu' do
   it 'has no root-run file resource under /home/ubuntu' do
     offenders = chef_run.resource_collection.all_resources.select do |r|
-      HOME_WRITERS.include?(r.declared_type.to_s) && r.path.to_s.start_with?('/home/ubuntu/')
+      HOME_WRITERS.include?(r.declared_type.to_s) && r.path.to_s.match?(%r{\A/home/ubuntu(/|\z)})
     end
     expect(offenders.map(&:to_s)).to eq([])
   end
 
   it 'runs every execute that names /home/ubuntu as ubuntu' do
+    # A literal substring match on "/home/ubuntu" misses a root-run execute
+    # that reaches the same place via $HOME (with HOME set to it) or a
+    # ~ubuntu tilde-expansion — both walk past a plain command.include? check.
     offenders = chef_run.resource_collection.all_resources.select do |r|
-      r.declared_type.to_s == 'execute' && r.command.to_s.include?('/home/ubuntu') && r.user != 'ubuntu'
+      next false unless r.declared_type.to_s == 'execute' && r.user != 'ubuntu'
+
+      command_hits_home = r.command.to_s.match?(HOME_UBUNTU_COMMAND)
+      env_sets_home = r.environment.is_a?(Hash) && r.environment.key?('HOME')
+      command_hits_home || env_sets_home
+    end
+    expect(offenders.map(&:to_s)).to eq([])
+  end
+
+  it 'runs every guard that names /home/ubuntu as ubuntu' do
+    # A not_if/only_if guard is itself a command Chef shells out to run. If
+    # its string mentions /home/ubuntu but its command_opts do not say
+    # user: 'ubuntu', the guard runs as whatever the parent resource's
+    # privileges are — root, on these resources — and can be fooled by the
+    # same symlink trick the resource action itself is guarded against.
+    offenders = []
+    chef_run.resource_collection.all_resources.each do |r|
+      next unless %w(execute directory file template cookbook_file).include?(r.declared_type.to_s)
+
+      (r.not_if + r.only_if).each do |conditional|
+        command = conditional.command
+        next unless command.is_a?(String) && command.include?('/home/ubuntu')
+
+        offenders << "#{r} guard #{command.inspect}" unless conditional.command_opts[:user] == 'ubuntu'
+      end
+    end
+    expect(offenders).to eq([])
+  end
+
+  it 'runs every ubuntu-user execute as the ubuntu group with HOME set to /home/ubuntu' do
+    offenders = chef_run.resource_collection.all_resources.select do |r|
+      next false unless r.declared_type.to_s == 'execute' && r.user == 'ubuntu'
+
+      r.group != 'ubuntu' || !(r.environment.is_a?(Hash) && r.environment['HOME'] == '/home/ubuntu')
     end
     expect(offenders.map(&:to_s)).to eq([])
   end

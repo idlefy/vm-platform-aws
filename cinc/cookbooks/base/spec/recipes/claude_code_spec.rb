@@ -16,6 +16,10 @@ describe 'base::claude_code' do
 
   it_behaves_like 'root never writes under /home/ubuntu'
 
+  it 'declares the staging root, the new trust anchor, explicitly' do
+    expect(chef_run).to create_directory('/usr/share/dev-vm/home').with(owner: 'root', group: 'root', mode: '0755')
+  end
+
   it 'stages the two files root-owned and world-readable under /usr/share/dev-vm/home' do
     expect(chef_run).to create_directory('/usr/share/dev-vm/home/.claude').with(owner: 'root', group: 'root', mode: '0755', recursive: true)
     expect(chef_run).to create_cookbook_file('/usr/share/dev-vm/home/.claude/statusline-command.sh').with(owner: 'root', mode: '0644')

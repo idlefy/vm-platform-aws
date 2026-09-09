@@ -9,7 +9,8 @@ require 'json'
 execute 'install-claude-code' do
   command 'curl -fsSL https://claude.ai/install.sh | bash -s stable'
   user 'ubuntu'
-  environment 'HOME' => '/home/ubuntu'
+  group 'ubuntu'
+  environment('HOME' => '/home/ubuntu')
   not_if 'test -x /home/ubuntu/.local/bin/claude', user: 'ubuntu'
 end
 
@@ -18,6 +19,16 @@ end
 # — so root stages content under /usr/share/dev-vm/home and ubuntu copies it
 # into place with its own privileges. See docs/design/first-external-review.md
 # §1 and spec/support/home_boundary.rb, which fails any recipe that regresses.
+#
+# The staging root itself is the new trust anchor: declare it explicitly so
+# its owner/mode do not depend on mkdir_p's umask.
+directory '/usr/share/dev-vm/home' do
+  owner 'root'
+  group 'root'
+  mode '0755'
+  recursive true
+end
+
 staged = '/usr/share/dev-vm/home/.claude'
 
 directory staged do
