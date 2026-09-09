@@ -197,6 +197,16 @@ check "says HEAD is not an ancestor" "$(echo "$OUT" | grep -qi 'not an ancestor'
 check "no tag created" "$(git -C "$WORK" rev-parse -q --verify base-0.11.0 >/dev/null && echo 1 || echo 0)"
 teardown
 
+echo "== a tag that exists only on the remote is refused after the fetch brings it in =="
+setup 0.11.0
+# Someone else already cut this number; the local clone has not seen it yet.
+git -C "$ORIGIN" update-ref refs/tags/base-0.11.0 "$(git -C "$WORK" rev-parse HEAD)"
+OUT=$(cd "$WORK" && make release TAG=base-0.11.0 2>&1); rc=$?
+check "exit non-zero" "$([ $rc -ne 0 ] && echo 0 || echo 1)"
+check "says the tag already exists" "$(echo "$OUT" | grep -q 'already exists' && echo 0 || echo 1)"
+check "the gates did not run" "$(echo "$OUT" | grep -q 'lint stub' && echo 1 || echo 0)"
+teardown
+
 echo ""
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]
