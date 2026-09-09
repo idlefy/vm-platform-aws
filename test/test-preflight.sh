@@ -198,6 +198,39 @@ rm "$T/vms/variables.tf"
 rc=$(run_preflight)
 check "exit 1" "$([ "$rc" = 1 ]; echo $?)"
 check "names the skeleton" "$(grep -q 'does not declare log_shipping' "$T/out"; echo $?)"
+printf 'variable "log_shipping" { type = bool }\n' > "$T/vms/variables.tf"
+
+echo "== loki unreachable (curl 000) fails preflight =="
+fixture true /t/loki
+cat > "$PF" <<'RB'
+default['base']['loki']['enabled']            = true
+default['base']['loki']['ssm_parameter_name'] = '/t/loki'
+default['base']['loki']['url']                = 'https://l.example.com/push'
+default['base']['loki']['username']           = '1'
+RB
+wired_main_tf
+printf '#!/usr/bin/env bash\necho 000\n' > "$T/bin/curl"
+rc=$(run_preflight)
+check "exit 1" "$([ "$rc" = 1 ]; echo $?)"
+check "names the unreachable URL" "$(grep -q 'could not reach' "$T/out"; echo $?)"
+
+echo "== loki redirect (302) fails preflight =="
+printf '#!/usr/bin/env bash\necho 302\n' > "$T/bin/curl"
+rc=$(run_preflight)
+check "exit 1" "$([ "$rc" = 1 ]; echo $?)"
+check "names http 302" "$(grep -q 'http 302' "$T/out"; echo $?)"
+
+echo "== loki server error (500) fails preflight =="
+printf '#!/usr/bin/env bash\necho 500\n' > "$T/bin/curl"
+rc=$(run_preflight)
+check "exit 1" "$([ "$rc" = 1 ]; echo $?)"
+check "names http 500" "$(grep -q 'http 500' "$T/out"; echo $?)"
+
+echo "== loki 400 still passes =="
+printf '#!/usr/bin/env bash\necho 400\n' > "$T/bin/curl"
+rc=$(run_preflight)
+check "exit 0" "$([ "$rc" = 0 ]; echo $?)"
+check "credentials accepted" "$(grep -q 'credentials accepted' "$T/out"; echo $?)"
 
 echo
 echo "passed: $PASS  failed: $FAIL"

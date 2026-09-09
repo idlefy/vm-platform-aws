@@ -263,9 +263,8 @@ else
     case "$CODE" in
       400)     ok   "$R — credentials accepted" ;;
       401|403) bad  "$R — REJECTED by Loki (http $CODE): wrong token, or wrong username/tenant" ;;
-      204|200) warn "$R — accepted but returned $CODE; expected 400 for an empty body" ;;
-      000)     warn "$R — could not reach $LOKI_URL" ;;
-      *)       warn "$R — unexpected http $CODE" ;;
+      000)     bad  "$R — could not reach $LOKI_URL (curl got no HTTP status). If this workstation cannot reach Loki, PREFLIGHT=skip is the documented bypass" ;;
+      *)       bad  "$R — http $CODE from Loki; only 400 proves the token (an empty body is a bad request from a good credential)" ;;
     esac
   done
 fi
