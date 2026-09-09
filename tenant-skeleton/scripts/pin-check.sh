@@ -182,28 +182,34 @@ if [ -f vms/main.tf ]; then
 
   bad=0
   seen=0
-  while IFS= read -r line; do
+  # Each of the two published modules is checked by name. A filter on git::
+  # lines alone let one pinned module hide an unpinned one — the review's
+  # reproduction was ec2 pinned, fleet_guards on a local path, "every module
+  # source names <sha>" printed. The repository host is deliberately not
+  # checked: the test harness pins to a file:// bare repo, and the SHA is what
+  # the pin is.
+  for m in ec2 fleet_guards; do
+    dir=${m//_/-}
+    src=$(awk -v m="$m" '
+      $0 ~ "^module \"" m "\"" { inblock = 1; next }
+      inblock && /^}/            { inblock = 0 }
+      inblock && /^[[:space:]]*source[[:space:]]*=/ { print; exit }
+    ' vms/main.tf)
+    if [ -z "$src" ]; then
+      echo "  ✗ module \"$m\": no source line found in vms/main.tf"
+      bad=1; continue
+    fi
     seen=$((seen + 1))
-    ref=${line##*\?ref=}
-    ref=${ref%%\"*}
-    [ "$ref" = "$pin_sha" ] && continue
-    echo "  ✗ $line"
-    bad=1
-  # -H, not just -n. grep prints the filename only when it is given more than
-  # one file, and a tenant has exactly one vms/main.tf — so the offending line
-  # would be reported as "8:  source = …" with nothing saying which file.
-  # Only real assignments feed the loop. A bare 'ref=' grep also matches the
-  # '# was: source = …' comments the offline-recovery path keeps, in both
-  # directions: the commented copies counted as live sources (seen=2 on a tree
-  # with zero git pins), and a commented OLD source hard-failed a correct bump.
-  done < <(grep -Hn '^[[:space:]]*source[[:space:]]*=' vms/*.tf | grep 'git::')
+    case "$src" in
+      *"git::"*"//vms/modules/$dir?ref=$pin_sha"*) ;;
+      *) echo "  ✗ module \"$m\": $src"
+         echo "    expected git::<repo>//vms/modules/$dir?ref=$pin_sha"
+         bad=1 ;;
+    esac
+  done
 
-  # Zero matches is a failure, not a pass. grep prints nothing when no file
-  # carries a git:: source, the loop body never runs, and without this the next
-  # line would report "every module source names <sha>" having checked none —
-  # which is exactly what a tenant that reverted to local module paths would see.
   if [ "$seen" -eq 0 ]; then
-    echo "no git:: module source under vms/*.tf, but local.platform_pin names $pin_tag"
+    echo "no module \"ec2\" / \"fleet_guards\" block with a source under vms/main.tf, but local.platform_pin names $pin_tag"
     echo "  Either this tenant was switched back to local module paths, or the"
     echo "  sources were rewritten into a form this check does not recognise."
     echo "  Both mean the pin above describes something nothing consumes."

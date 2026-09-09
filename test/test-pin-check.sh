@@ -141,7 +141,11 @@ sed -i "0,/ref=$SHA/{s/ref=$SHA/ref=0000000000000000000000000000000000000000/}" 
 OUT=$( cd "$TEN" && make pin-check 2>&1 )
 check "exit non-zero" "$([ $? -ne 0 ] && echo 0 || echo 1)"
 check "names the disagreement" "$(echo "$OUT" | grep -qi 'disagree' && echo 0 || echo 1)"
-check "names the offending line" "$(echo "$OUT" | grep -q 'vms/main.tf' && echo 0 || echo 1)"
+# ec2 is the first module block in the fixture, so the sed above (which
+# rewrites only the first ref= occurrence in the file) always lands on it.
+# pin-check now reports per module block rather than per source line, so the
+# offending module's name is what identifies the problem, not a filename.
+check "names the offending module" "$(echo "$OUT" | grep -q 'module "ec2"' && echo 0 || echo 1)"
 teardown
 
 echo "== a source that disagrees with local.platform_pin is caught =="
@@ -232,7 +236,12 @@ open(p, 'w').write(s)
 PY
 OUT=$( cd "$TEN" && make pin-check 2>&1 )
 check "exit non-zero" "$([ $? -ne 0 ] && echo 0 || echo 1)"
-check "says no git:: source consumes the pin" "$(echo "$OUT" | grep -qi 'no git:: module source' && echo 0 || echo 1)"
+# Both module blocks keep a (non-git) source line here, so per-module checking
+# counts them as "seen" and reports the disagreement rather than the
+# zero-blocks-found message — the tree is still refused, just under the more
+# specific per-module report, which names both modules on local paths.
+check "flags ec2 as unpinned" "$(echo "$OUT" | grep -q 'module "ec2"' && echo 0 || echo 1)"
+check "flags fleet_guards as unpinned" "$(echo "$OUT" | grep -q 'module "fleet_guards"' && echo 0 || echo 1)"
 teardown
 
 echo "== a commented-out old source next to a correct live one still passes =="
@@ -262,6 +271,15 @@ setup
 rm "$TEN/vms/main.tf"
 OUT=$( cd "$TEN" && make pin-check 2>&1 )
 check "exit 0" "$?"
+teardown
+
+echo "== one pinned module and one local-path module are caught =="
+setup
+sed -i "/^module \"fleet_guards\"/,/^}/ s|source = .*|source = \"../modules/fleet-guards\"|" "$TEN/vms/main.tf"
+OUT=$( cd "$TEN" && make pin-check 2>&1 )
+check "exit non-zero" "$([ $? -ne 0 ] && echo 0 || echo 1)"
+check "names fleet_guards" "$(echo "$OUT" | grep -q 'fleet_guards' && echo 0 || echo 1)"
+check "does not claim every source is pinned" "$(echo "$OUT" | grep -q 'every module source names' && echo 1 || echo 0)"
 teardown
 
 echo ""
