@@ -316,6 +316,38 @@ resource "aws_iam_policy" "identity_boundary" {
           "ec2:StopInstances",
           "ec2:DetachVolume",
           "ec2:AttachVolume",
+          # Routes found in the first external review (docs/design/first-external-review.md §3).
+          # EBS direct APIs read and write snapshot blocks without any ec2: call —
+          # the snapshot denies above do not cover them. Sixth instance of the
+          # multi-call-path omission CLAUDE.md documents.
+          "ebs:ListSnapshotBlocks",
+          "ebs:ListChangedBlocks",
+          "ebs:GetSnapshotBlock",
+          "ebs:StartSnapshot",
+          "ebs:PutSnapshotBlock",
+          "ebs:CompleteSnapshot",
+          # The fleet's egress is its audit transport: an ACL or route change
+          # black-holes Loki for every VM in the subnet, and the "no logs"
+          # condition cannot be alerted on over the transport that was cut.
+          # Ingress stays open — a developer opening a port on their own VM is
+          # the documented self-service.
+          "ec2:CreateNetworkAclEntry",
+          "ec2:ReplaceNetworkAclEntry",
+          "ec2:DeleteNetworkAclEntry",
+          "ec2:ReplaceNetworkAclAssociation",
+          "ec2:CreateRoute",
+          "ec2:ReplaceRoute",
+          "ec2:DeleteRoute",
+          "ec2:ReplaceRouteTableAssociation",
+          "ec2:DisassociateRouteTable",
+          "ec2:AuthorizeSecurityGroupEgress",
+          "ec2:RevokeSecurityGroupEgress",
+          "ec2:ModifySecurityGroupRules",
+          # Peers' availability, and the fail-closed bootstrap log (user_data.tf).
+          "ec2:TerminateInstances",
+          "ec2:RebootInstances",
+          "ec2:GetConsoleOutput",
+          "ec2:GetConsoleScreenshot",
         ]
         Resource = "*"
       },

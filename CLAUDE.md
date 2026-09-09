@@ -75,10 +75,12 @@ challenge one is to reproduce it.
 **A deny entry in the permissions boundary must cover every route to the asset,
 not the API that happens to name it.** The list blocks the snapshot path to a VM's
 root volume *and separately* `StopInstances` → `DetachVolume` → `AttachVolume`,
-because those three calls reach the same disk and need no `iam:PassRole`. Three
+because those three calls reach the same disk and need no `iam:PassRole`. Six
 omissions of exactly this shape have been found so far, each by a reviewer rather
-than by a test. When you add an entry, enumerate multi-call paths to the thing you
-are protecting.
+than by a test — the latest three (EBS direct-read of snapshots, fleet network
+mutation, console output) by an outside reviewer of `v1.0.0`; see
+`docs/design/first-external-review.md` §3. When you add an entry, enumerate
+multi-call paths to the thing you are protecting.
 
 **Alloy's version pin and its unattended-upgrades blacklist are one change.**
 `base::alloy` pins `alloy` to an exact version and `base::unattended_upgrades`
