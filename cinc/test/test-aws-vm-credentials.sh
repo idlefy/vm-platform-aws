@@ -226,6 +226,13 @@ REAL_ENV_FILE=/etc/hostname
 if [ ! -e "$REAL_ENV_FILE" ] || [ "$(stat -c '%u' "$REAL_ENV_FILE")" != "0" ]; then
   REAL_ENV_FILE=/proc/version
 fi
+# When the suite itself runs as root those files are "ours"; make a file that
+# is not (root can chown).
+if [ "$(id -u)" = "0" ]; then
+  REAL_ENV_FILE="$WORK/foreign.env"
+  printf 'VM_NAME=x\n' > "$REAL_ENV_FILE"
+  chown nobody "$REAL_ENV_FILE" && chmod 0644 "$REAL_ENV_FILE"
+fi
 PATH="$STUB:$PATH" \
 AWS_VM_ENV_FILE="$REAL_ENV_FILE" \
 AWS_VM_OUT_DIR="$OUT" \
