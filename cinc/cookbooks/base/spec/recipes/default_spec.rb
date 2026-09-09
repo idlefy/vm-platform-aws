@@ -3,17 +3,6 @@
 # One converge of the whole run list, asserting the home-directory boundary
 # across every recipe at once. Per-recipe specs prove each fix; this one is
 # what a recipe added next year fails.
-#
-# KNOWN FAILURE (not introduced by this spec, left for the controller to
-# rule on): the fourth shared example — "runs every ubuntu-user execute as
-# the ubuntu group with HOME set to /home/ubuntu" — fails on
-# execute[install-werf] in recipes/werf.rb. That resource sets
-# `user 'ubuntu'` and `environment 'HOME' => '/home/ubuntu'` but never sets
-# `group 'ubuntu'`, so Chef's resource default group applies instead.
-# recipes/werf.rb was not part of Tasks 2-4 (claude_code.rb, docker.rb,
-# traefik.rb) and is out of this task's scope (the brief names only this
-# file), so it is left unmodified. Once fixed, this comment and its example
-# can be dropped from the concern list.
 require 'chefspec'
 require_relative '../../libraries/imds'
 require_relative '../support/home_boundary'
