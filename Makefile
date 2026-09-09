@@ -75,7 +75,9 @@ release: ## Gate and cut an artifact tag (usage: make release TAG=base-X.Y.Z | v
 	   || { echo "refusing: could not fetch $${up%%/*} to check that HEAD is reachable for consumers."; exit 1; }; \
 	 git merge-base --is-ancestor HEAD "$$up" \
 	   || { echo "refusing: HEAD is not an ancestor of $$up."; \
-	        echo "          Push and merge first, so the tagged commit is reachable for consumers."; exit 1; }
+	        echo "          Push and merge first, so the tagged commit is reachable for consumers."; exit 1; }; \
+	 if git rev-parse -q --verify "refs/tags/$(TAG)" >/dev/null; then \
+	   echo "refusing: tag $(TAG) already exists on $${up%%/*} (the fetch brought it in). Tags are immutable — use a new number."; exit 1; fi
 	@case "$(TAG)" in base-*) \
 	  want=$$(printf '%s' "$(TAG)" | sed 's/^base-//'); \
 	  have=$$(sed -n "s/^version[[:space:]]*'\\(.*\\)'.*/\\1/p" $(METADATA)); \
