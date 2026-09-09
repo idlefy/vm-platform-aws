@@ -83,7 +83,7 @@ Additions to `DenyEscalationAndBootstrapSecrets` in `vms/modules/ec2/iam.tf`:
 | Other instances' availability | `ec2:TerminateInstances`, `ec2:RebootInstances` (`StopInstances` already present) | destroy a peer's VM |
 | Bootstrap logs | `ec2:GetConsoleOutput`, `ec2:GetConsoleScreenshot` | read §2's failure log from another VM |
 
-Security-group *ingress* is left alone on purpose: a developer opening a port on their own VM is the existing, documented self-service, and the boundary is `Resource = "*"` — a per-instance condition would be new design. Egress and ACLs are denied because they are the fleet's shared audit path.
+Security-group *ingress* authorize is left allowed as a reviewed exception: the boundary is `Resource = "*"` and cannot scope it to the calling VM, and an added rule lands on the one security group the whole fleet shares — a per-instance condition would be new design. Ingress *revoke* is denied, because one call deletes that shared rule set and locks the fleet out. Egress and ACLs are denied because they are the fleet's shared audit path.
 
 The Traps entry on "every route to the asset" gets the EBS direct API as its fourth found omission. `validation.tftest.hcl` gains one assertion per group (the rendered boundary contains the action). `docs/design/per-vm-aws-access.md` lists the additions in its boundary table.
 
