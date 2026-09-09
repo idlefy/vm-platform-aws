@@ -67,20 +67,40 @@ execute 'install-rootless-docker' do
 end
 
 # Set DOCKER_HOST in ubuntu's profile
-file '/home/ubuntu/.docker-env' do
+#
+# Staged by root, copied by ubuntu: root never writes under /home/ubuntu
+# (docs/design/first-external-review.md §1; spec/support/home_boundary.rb).
+directory '/usr/share/dev-vm/home' do
+  owner 'root'
+  group 'root'
+  mode '0755'
+  recursive true
+end
+
+file '/usr/share/dev-vm/home/.docker-env' do
   content <<~SH
     export DOCKER_HOST=unix://#{runtime_dir}/docker.sock
     export PATH=/usr/bin:$PATH
   SH
-  owner 'ubuntu'
-  group 'ubuntu'
+  owner 'root'
+  group 'root'
   mode '0644'
+end
+
+execute 'ubuntu-docker-env' do
+  command 'install -m 0644 /usr/share/dev-vm/home/.docker-env /home/ubuntu/.docker-env'
+  user 'ubuntu'
+  group 'ubuntu'
+  environment('HOME' => '/home/ubuntu')
+  not_if 'cmp -s /usr/share/dev-vm/home/.docker-env /home/ubuntu/.docker-env', user: 'ubuntu'
 end
 
 execute 'add-docker-env-to-bashrc' do
   command 'echo \'[ -f ~/.docker-env ] && . ~/.docker-env\' >> /home/ubuntu/.bashrc'
   user 'ubuntu'
-  not_if 'grep -q docker-env /home/ubuntu/.bashrc'
+  group 'ubuntu'
+  environment('HOME' => '/home/ubuntu')
+  not_if 'grep -q docker-env /home/ubuntu/.bashrc', user: 'ubuntu'
 end
 
 # DOCKER_HOST for BOTH shells. ~/.docker-env + the .bashrc line above predate
