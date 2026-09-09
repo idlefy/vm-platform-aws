@@ -14,7 +14,9 @@ Fixes from the first external review (`docs/design/first-external-review.md`).
   symlink, owned by another uid, or writable beyond its owner.
 - `execute[install-werf]` now runs as `ubuntu:ubuntu`; it ran as `ubuntu:root`
   because the group was never set, so everything trdl created under the home
-  directory carried gid 0.
+  directory carried gid 0. `execute[install-claude-code]` had the same
+  `ubuntu:root` bug — it installs into `~/.local/bin` — fixed in the same
+  release.
 
 (The `v1.1.0` entries are added by PR B.)
 

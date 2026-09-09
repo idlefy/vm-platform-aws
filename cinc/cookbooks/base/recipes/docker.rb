@@ -70,6 +70,7 @@ end
 #
 # Staged by root, copied by ubuntu: root never writes under /home/ubuntu
 # (docs/design/first-external-review.md §1; spec/support/home_boundary.rb).
+# Also declared in base::claude_code; Chef runs both — keep the two byte-identical.
 directory '/usr/share/dev-vm/home' do
   owner 'root'
   group 'root'
