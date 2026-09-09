@@ -24,6 +24,9 @@ decision is made.
   Workstation package supplies `chef`, `knife` and `cinc-client`. The version
   this was built against is pinned in
   [`cinc/README.md` § Prerequisites](https://github.com/idlefy/vm-platform-aws/blob/main/cinc/README.md#prerequisites).
+- A GNU userland: the Makefiles and `scripts/` use `sed -i`, `grep -P` and
+  `install -D` in their GNU forms. On macOS install `coreutils` and `gnu-sed`
+  and put their `gnubin` directories first on `PATH`.
 
 ## 1. Create the Terraform state bucket
 
@@ -148,8 +151,8 @@ records the policyfile as it stood when it was written, and `make push` runs
 it refuse with "policyfile has changes not in the lock", because `chef install`
 honours the lock and would upload the previous content. One `bump-cookbook` in
 this order covers both the tag and the attributes. (If you do edit an attribute
-later — a new Loki URL, a moved domain — re-lock with a bare `make
-bump-cookbook`, no `TAG`, which re-resolves at the current pin.)
+later — a new Loki URL, a moved domain — re-lock **before `make push`** with a
+bare `make bump-cookbook`, no `TAG`, which re-resolves at the current pin.)
 
 **Not shipping logs to Grafana Cloud?** Decide it here, before §5. Set
 `default['base']['loki']['enabled'] = false` and delete the three `loki` lines
@@ -196,26 +199,28 @@ server build. It finishes by printing the paths of the two keys it created:
 `/etc/cinc-project/admin.pem` and `/etc/cinc-project/<org>-validator.pem`.
 
 ```bash
-# 4. Fetch the knife admin key from the server (it is root-owned, mode 0600)
+# 4. Fetch the knife admin key from the server (it is root-owned, mode 0600).
+#    Create the destination 0600 first: a redirect under umask 022 would
+#    otherwise create it world-readable for the instant before chmod.
+install -m 0600 /dev/null cinc/.chef/admin.pem
 ssh ubuntu@<CINC_IP> 'sudo cat /etc/cinc-project/admin.pem' > cinc/.chef/admin.pem
-chmod 600 cinc/.chef/admin.pem
 ```
 
 ```bash
 # 5. Put the CINC validator key in SSM — ONCE PER REGION you deploy into.
 #    SSM is region-scoped, and Terraform never creates this parameter: it
 #    manages only the IAM grant that names it.
-ssh ubuntu@<CINC_IP> 'sudo cat /etc/cinc-project/<org>-validator.pem' > /tmp/validator.pem
-chmod 600 /tmp/validator.pem
+f="$(mktemp)"                      # 0600 already, unpredictable name
+ssh ubuntu@<CINC_IP> 'sudo cat /etc/cinc-project/<org>-validator.pem' > "$f"
 
 aws ssm put-parameter \
   --name "<cinc_ssm_parameter_name from vms/tenant.auto.tfvars>" \
   --type SecureString \
-  --value "file:///tmp/validator.pem" \
+  --value "file://$f" \
   --region <region> \
   --profile <profile>
 
-shred -u /tmp/validator.pem
+shred -u "$f"
 ```
 
 Full reference, including what the IAM grant does and does not cover:
@@ -354,9 +359,10 @@ rotation.
    # world-readable in `ps` for as long as the call runs, and it lands in your
    # shell history besides. Same reasoning as scripts/preflight.sh, which passes
    # the token to curl through a config file rather than -u.
-   TOKEN_FILE="$(mktemp)"; chmod 600 "$TOKEN_FILE"
+   TOKEN_FILE="$(mktemp)"                     # 0600, unpredictable name
    trap 'rm -f "$TOKEN_FILE"' EXIT
-   printf '%s' "<the token>" > "$TOKEN_FILE"     # or paste with: read -rs > "$TOKEN_FILE"
+   read -rs -p 'Grafana token: ' TOKEN; echo   # typed, never on a command line
+   printf '%s' "$TOKEN" > "$TOKEN_FILE"; unset TOKEN
 
    aws ssm put-parameter \
      --name "<loki_ssm_parameter_name from tenant.auto.tfvars>" \
@@ -473,13 +479,25 @@ out immediately instead.
 
 ### Turning shipping off on a fleet that is already running
 
-The order matters, and it is not the one that looks natural. Policyfile first —
-`enabled = false`, then `make push && make promote` — then wait for every VM to
-converge past the teardown, and only then set `log_shipping = false` and
-`loki_ssm_parameter_name = null` in Terraform and apply. The token script leaves
-an existing token untouched when its fetch is denied, so removing the IAM grant
-first leaves Alloy shipping on its last token while the tenant believes shipping
-is off. Turning it on is the mirror: Terraform first, then the policyfile.
+The order matters, and it is not the one that looks natural. `preflight` runs
+inside `make promote` and refuses when the policyfile and `tenant.auto.tfvars`
+disagree, so the two are edited together and *applied* apart:
+
+1. In `cinc/policyfiles/dev-vm.rb` set `default['base']['loki']['enabled'] = false`.
+2. `make bump-cookbook` (bare — re-locks at the current tag; the lock covers
+   attributes, and `make push` refuses a lock that does not match).
+3. `cd cinc && make push`.
+4. In `vms/tenant.auto.tfvars` set `log_shipping = false` and
+   `loki_ssm_parameter_name = null`, but **do not apply yet**.
+5. `make promote`. Preflight now sees both halves agree.
+6. Wait until every VM has converged past the teardown (`knife status`, or the
+   Alloy unit gone on each VM), then `cd vms && terraform apply`.
+
+Applying Terraform before step 6 removes the IAM grant while Alloy is still
+installed; the token script leaves an existing token untouched when its fetch
+is denied, so the fleet keeps shipping on its last token while the tenant
+believes shipping is off. Turning it on is the mirror: Terraform first, then
+steps 1–3 with `enabled = true`.
 
 ## Defaults you may want to change
 
