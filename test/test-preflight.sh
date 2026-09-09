@@ -209,7 +209,7 @@ default['base']['loki']['url']                = 'https://l.example.com/push'
 default['base']['loki']['username']           = '1'
 RB
 wired_main_tf
-printf '#!/usr/bin/env bash\necho 000\n' > "$T/bin/curl"
+printf '#!/usr/bin/env bash\necho 000\nexit 28\n' > "$T/bin/curl"
 rc=$(run_preflight)
 check "exit 1" "$([ "$rc" = 1 ]; echo $?)"
 check "names the unreachable URL" "$(grep -q 'could not reach' "$T/out"; echo $?)"
