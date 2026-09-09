@@ -185,6 +185,18 @@ check "names both streams" "$(echo "$OUT" | grep -q 'base-X.Y.Z' && echo "$OUT" 
 check "no tag created" "$(git -C "$WORK" rev-parse -q --verify 3.1.0 >/dev/null && echo 1 || echo 0)"
 teardown
 
+echo "== a stale local tracking ref is refused: the remote no longer has HEAD =="
+setup
+( cd "$WORK" && echo x > x && git add x && git -c user.email=t@t -c user.name=t commit -qm second && git push -q origin main )
+FIRST=$(git -C "$WORK" rev-parse HEAD~1)
+# The remote loses the second commit; the local origin/main still names it.
+git -C "$ORIGIN" update-ref refs/heads/main "$FIRST"
+OUT=$(cd "$WORK" && make release TAG=base-0.11.0 2>&1); rc=$?
+check "exit non-zero" "$([ $rc -ne 0 ] && echo 0 || echo 1)"
+check "says HEAD is not an ancestor" "$(echo "$OUT" | grep -qi 'not an ancestor' && echo 0 || echo 1)"
+check "no tag created" "$(git -C "$WORK" rev-parse -q --verify base-0.11.0 >/dev/null && echo 1 || echo 0)"
+teardown
+
 echo ""
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]

@@ -53,7 +53,9 @@ test-boundary-check: ## Test the boundary guard (no network)
 # while a tag names a commit, and nothing in git binds the two — so this target
 # does: it refuses a dirty tree, refuses a HEAD that consumers cannot reach,
 # prints the SHA before the gates run, and tags that SHA explicitly rather than
-# whatever HEAD becomes later.
+# whatever HEAD becomes later. The reachability check fetches first: a local
+# `origin/main` is only as fresh as the last fetch, and a stale one certified a
+# commit the remote no longer had (first external review, M3).
 release: ## Gate and cut an artifact tag (usage: make release TAG=base-X.Y.Z | vX.Y.Z)
 	@[ -n "$(TAG)" ] || { echo "usage: make release TAG=base-X.Y.Z (cookbook) | vX.Y.Z (terraform)"; exit 1; }
 	@printf '%s\n' "$(TAG)" | grep -Eq '^(base-|v)[0-9]+\.[0-9]+\.[0-9]+$$' \
@@ -69,6 +71,8 @@ release: ## Gate and cut an artifact tag (usage: make release TAG=base-X.Y.Z | v
 	  || { echo "refusing: this branch tracks no upstream, so the gate cannot tell whether"; \
 	       echo "          the commit it is about to tag is reachable for consumers."; \
 	       echo "          Set one: git branch --set-upstream-to=<remote>/<branch>"; exit 1; }; \
+	 git fetch --quiet "$${up%%/*}" \
+	   || { echo "refusing: could not fetch $${up%%/*} to check that HEAD is reachable for consumers."; exit 1; }; \
 	 git merge-base --is-ancestor HEAD "$$up" \
 	   || { echo "refusing: HEAD is not an ancestor of $$up."; \
 	        echo "          Push and merge first, so the tagged commit is reachable for consumers."; exit 1; }
