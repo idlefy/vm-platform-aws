@@ -282,7 +282,7 @@ limits, both SSM parameter-name shapes, the unknown-bundle-name and
 fleet-wide unique-name preconditions, and the shapes that must be *accepted* —
 an empty catalog, a VM with a real bundle, two distinctly-named VMs in
 different regions, a one-character parameter path. `hardening.tftest.hcl`
-(8, fixture with one VM): the user_data and permissions-boundary pins, the
+(9, fixture with one VM): the user_data and permissions-boundary pins, the
 `log_shipping` grant on/off/inconsistent, and the `idlefy` tag default, off
 and override. `unknown_bundle.tftest.hcl` (2). Each guard is paired with a
 negative control deliberately: a precondition that rejected everything would

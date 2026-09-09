@@ -159,6 +159,10 @@ Statement = [
       "ec2:RebootInstances",
       "ec2:GetConsoleOutput",
       "ec2:GetConsoleScreenshot",
+      "ec2:DetachInternetGateway",
+      "ec2:DeleteInternetGateway",
+      "ec2:AssociateRouteTable",
+      "ec2:DeleteNatGateway",
     ]
     Resource = "*"
   },
