@@ -259,6 +259,24 @@ Each VM auto-bootstraps in ~3 minutes after `apply`: installs CINC, fetches the
 validation key from SSM, registers with the CINC server, runs the first
 converge.
 
+A VM that has not registered with the CINC server five minutes after `apply`
+failed its bootstrap. It fails **closed**: the cloud image's `NOPASSWD` grant
+for `ubuntu` is removed first and is never restored, so nobody can log in and
+read `/var/log/user-data.log`. The bootstrap writes that log to the serial
+console instead:
+
+```bash
+aws ec2 get-console-output --instance-id <id> --region <region> --profile <profile> --output text | tail -60
+```
+
+Fix the cause (a validator key missing in that region, a policy group that does
+not exist, a network that cannot reach the CINC server) and replace the
+instance — the bootstrap only runs on first boot:
+
+```bash
+cd vms && terraform apply -replace='module.ec2["<region>"].aws_instance.this["<vm>"]'
+```
+
 Steps 6–9 are in that order, rather than one `make push && make promote`,
 because `promote` enforces three things and each of them can stop you. It runs
 `preflight` first, which fails on a Loki parameter missing in any region. It

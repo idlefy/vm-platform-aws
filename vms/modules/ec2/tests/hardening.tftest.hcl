@@ -78,7 +78,17 @@ run "user_data_fails_closed_on_imds" {
 
   assert {
     condition     = strcontains(base64decode(aws_instance.this["vm"].user_data_base64), "bootstrap_failed; exit 1")
-    error_message = "A FATAL validation branch must call bootstrap_failed itself before exiting — an explicit exit does not fire the ERR trap, so a bare 'exit 1' here would skip the sudoers restore."
+    error_message = "A FATAL validation branch must call bootstrap_failed itself before exiting — an explicit exit does not fire the ERR trap, so a bare 'exit 1' here would leave the validation key on disk."
+  }
+
+  assert {
+    condition     = !strcontains(base64decode(aws_instance.this["vm"].user_data_base64), "90-cloud-init-users.bak")
+    error_message = "The bootstrap must never keep a copy of cloud-init's NOPASSWD grant: restoring it on failure hands the developer root, IMDS and the bootstrap role (first external review, C2)."
+  }
+
+  assert {
+    condition     = strcontains(base64decode(aws_instance.this["vm"].user_data_base64), "> /dev/console")
+    error_message = "A failed bootstrap must write its log to the serial console — with sudo gone, get-console-output is the only diagnosis path."
   }
 
 }
