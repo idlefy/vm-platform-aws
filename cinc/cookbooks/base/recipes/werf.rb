@@ -8,7 +8,8 @@ execute 'install-werf' do
     rm -f /tmp/werf-install.sh
   SH
   user 'ubuntu'
-  environment 'HOME' => '/home/ubuntu'
+  group 'ubuntu'
+  environment('HOME' => '/home/ubuntu')
   # werf.io/install.sh does not install a `werf` binary: it installs *trdl* to
   # ~/bin and registers the werf TUF repo, and the shell activates a version on
   # login via the `trdl use werf` line it appends to ~/.zshrc and ~/.zprofile.
