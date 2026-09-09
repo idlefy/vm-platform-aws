@@ -19,13 +19,13 @@ exec > /var/log/user-data.log 2>&1
 # key — the instance profile is a secret from the first second, so there is
 # no stage at which a restore is safe. Diagnosis goes through the serial
 # console instead: the handler below copies this log there, and the operator
-# reads it with `aws ec2 get-console-output` and replaces the instance.
+# reads it with `aws ec2 get-console-output --latest` and replaces the instance.
 
 bootstrap_failed() {
   rm -f /etc/cinc/validation.pem
   {
     echo "BOOTSTRAP FAILED: validation key removed; developer sudo stays revoked. Log follows."
-    tail -c 60000 /var/log/user-data.log
+    tail -c 56000 /var/log/user-data.log
   } > /dev/console 2>/dev/null || true
 }
 trap bootstrap_failed ERR
