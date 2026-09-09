@@ -22,9 +22,14 @@ describe 'base::default' do
 
   before do
     allow(DevVm::Imds).to receive(:region).and_return('eu-central-1')
-    # Guards are irrelevant to the boundary; answer them all the same way so the
-    # resource collection is complete. false = "run it", which keeps every
-    # execute in the collection with its command and user intact.
+    # base::nvidia_docker returns at compile time unless /dev/nvidia0 exists, so
+    # on a GPU-less runner none of its resources would enter the collection and
+    # the boundary would not be checked there. Pretend the device exists.
+    allow(::File).to receive(:exist?).and_call_original
+    allow(::File).to receive(:exist?).with('/dev/nvidia0').and_return(true)
+    # Guards never remove a resource from the collection — they only decide
+    # whether its action runs — so any answer works; give them all the same one
+    # so no string guard raises CommandNotStubbed.
     stub_command(/.*/).and_return(false)
   end
 
