@@ -236,11 +236,18 @@ loki.process "journal" {
     values = { audit_src = "comm" }
   }
 
+  // falco is on the list for the same reason sudo is: every Falco detection on
+  // a VM shares one `unit` bucket, and the developer chooses the volume. Measured
+  // 2026-09-09 (base-1.1.0): 1300 credential-store denials in 3 s plus one sudo
+  // detection gave 1301 journal lines and 1098 limiter drops — whether the sudo
+  // line survived was a coin toss. Unmetered Falco is noisy and costly; a dropped
+  // escalation detection is the failure this pipeline exists to prevent.
+  //
   // action defaults to "keep": entries matching the selector run the nested
   // stages, entries that do not are passed through untouched. The selector is
   // negated, so the audit processes are the ones that skip stage.limit.
   stage.match {
-    selector = `{audit_src!~"sudo|sshd|su|useradd|usermod|userdel|groupadd|groupdel|gpasswd|chpasswd|passwd"}`
+    selector = `{audit_src!~"sudo|sshd|su|useradd|usermod|userdel|groupadd|groupdel|gpasswd|chpasswd|passwd|falco"}`
 
     stage.limit {
       rate                = 20
