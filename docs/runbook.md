@@ -456,8 +456,10 @@ rotation.
    `tenant.auto.tfvars` and the policyfile, and that the token **actually
    authenticates against Loki in each region** — which is the only thing that
    catches a rotation that skipped one. Authentication is proven with an empty
-   request body (good credentials give `400`, bad ones `401`), so nothing is
-   ingested and no stream is created. It also resolves every `policy_arns` entry
+   request body (good credentials give `400`; `401` or `403` is a bad token;
+   anything else — unreachable, a redirect, a server error — also fails,
+   because none of those proves the token), so nothing is ingested and no
+   stream is created. It also resolves every `policy_arns` entry
    in `access_bundles.auto.tfvars`, a typo in which is otherwise invisible until
    a VM gets `AccessDenied` days later.
 
