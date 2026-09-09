@@ -65,6 +65,11 @@ VM_NAME=devbox
 REGION=eu-north-1
 UBUNTU_GID=1000
 ENVEOF
+  # Mirror the real deployment's `mode '0600'` (aws_access.rb). Without this the
+  # mode depends on the ambient umask — a umask of 002 yields 0664, which the
+  # broker's env-file guard correctly refuses, and every later test would fail
+  # for a reason that has nothing to do with what it is testing.
+  chmod 0600 "$WORK/aws-access.env"
 
   export STUB_PARAM_JSON='{"identity_role_arn":"arn:aws:iam::111122223333:role/dev-vm-id-devbox-eu-north-1","session_name":"devbox","region":"eu-north-1"}'
   export STUB_CREDS_JSON='{"Credentials":{"AccessKeyId":"ASIAEXAMPLE","SecretAccessKey":"secret123","SessionToken":"token456"}}'
@@ -178,6 +183,36 @@ rm -rf "$OUT"
 run_broker >/dev/null 2>&1; rc=$?
 check "exit code is 1" "$rc" "1"
 check "directory not created" "$([ -e "$OUT" ] && echo yes || echo no)" "no"
+teardown
+
+echo "== a symlinked env file is refused before it is sourced =="
+setup
+mv "$WORK/aws-access.env" "$WORK/real.env"
+ln -s "$WORK/real.env" "$WORK/aws-access.env"
+run_broker >/dev/null 2>&1; rc=$?
+check "exit code is 1" "$rc" "1"
+check "nothing published" "$([ -e "$OUT/credentials" ] && echo yes || echo no)" "no"
+check "no aws call was made" "$([ -e "$WORK/stub-args" ] && echo yes || echo no)" "no"
+teardown
+
+echo "== a group-writable env file is refused before it is sourced =="
+setup
+chmod 0660 "$WORK/aws-access.env"
+run_broker >/dev/null 2>&1; rc=$?
+check "exit code is 1" "$rc" "1"
+check "nothing published" "$([ -e "$OUT/credentials" ] && echo yes || echo no)" "no"
+check "no aws call was made" "$([ -e "$WORK/stub-args" ] && echo yes || echo no)" "no"
+teardown
+
+echo "== an env file owned by someone else is refused before it is sourced =="
+setup
+# Unprivileged harness: the owner check compares against $(id -u), so the only
+# foreign owner reachable here is a file that does not exist as a regular file.
+# Cover it with a directory in the env file's place: not a regular file → refused.
+rm -f "$WORK/aws-access.env"; mkdir "$WORK/aws-access.env"
+run_broker >/dev/null 2>&1; rc=$?
+check "exit code is 1" "$rc" "1"
+check "nothing published" "$([ -e "$OUT/credentials" ] && echo yes || echo no)" "no"
 teardown
 
 echo ""
