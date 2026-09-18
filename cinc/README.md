@@ -32,6 +32,7 @@ cinc/
         kubernetes.rb           # kubectl (apt, pinned minor) + helm (tarball, pinned version)
         nodejs.rb               # Node.js 24 LTS from NodeSource
         claude_code.rb          # Claude Code CLI (claude.ai/install.sh, per-user for ubuntu)
+        codex.rb                # Codex CLI (chatgpt.com/codex/install.sh, per-user) + bubblewrap and the AppArmor profile its sandbox needs
         gh.rb                   # GitHub CLI from cli.github.com
         shell_default.rb        # zsh as the login shell for ubuntu
         yq.rb                   # yq (pinned binary, SHA256-checked)
@@ -165,6 +166,7 @@ kernel updates apply without anyone scheduling a reboot.
 | Tailscale (pkgs.tailscale.com) | yes | Deliberately unlike Falco, and the reasoning is recorded in `unattended_upgrades.rb`: `tailscaled` also runs as root *and* is invocable by an unprivileged user through a path-matched sudoers rule, so the exposure is larger — but neither of the things that force the Alloy and Falco pins (a version-locked config template, a breaking CLI) applies. Note tailscaled's own c2n `/update` RPC is a second channel that `Package-Blacklist` cannot reach. |
 | Falco (download.falco.org) | **no** | The site is deliberately *absent* from `Origins-Pattern`, so unattended cannot see the package at all; `falco` is also blacklisted as belt-and-braces. Bump in `falco.rb`. |
 | Claude Code (claude.ai/install.sh) | user-managed | Per-user install via official installer; `claude update` from the user's shell. Not an apt repo; unattended-upgrades does not apply. |
+| Codex (chatgpt.com/codex/install.sh) | user-managed | Same shape as Claude Code: per-user install, `codex update` from the user's shell, not an apt repo. Its sandbox dependency `bubblewrap` **is** an apt package (Ubuntu `${distro_codename}`), so that half is patched automatically. |
 
 The two `no` rows are not oversights, and both carry a cost worth stating: a
 pinned package receives no automatic security patches. For Alloy the pin exists

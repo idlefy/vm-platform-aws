@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.2.0
+
+**`base-1.2.0`**
+
+- `base::codex` installs the Codex CLI for `ubuntu` via the official installer,
+  the same per-user shape as `base::claude_code`.
+- The same recipe installs `bubblewrap` and loads Ubuntu's
+  `bwrap-userns-restrict` AppArmor profile, which ships unloaded in
+  `apparmor-profiles` on 24.04. Both halves are one change: Codex takes the
+  first `bwrap` on `PATH` and falls back to a copy it bundles under `~/.codex`,
+  and that copy sits at a path no profile attaches to — so under
+  `kernel.apparmor_restrict_unprivileged_userns=1` it cannot create a user
+  namespace and Codex runs unsandboxed after one warning. The profile grants
+  `userns` to `/usr/bin/bwrap` alone; the sysctl is left at 1.
+
 ## 1.1.1
 
 Live verification of the first external review (`docs/design/first-external-review.md`, *Measured*).
