@@ -21,13 +21,36 @@
 #    to, so unshare(CLONE_NEWUSER) returns EPERM. Installing /usr/bin/bwrap
 #    moves Codex onto a path Ubuntu's own bwrap-userns-restrict profile covers.
 #
-# On 24.04 that profile ships *unloaded*, in apparmor-profiles' extra-profiles
-# directory — installing the package is not enough, the file has to land in
-# /etc/apparmor.d and be parsed. It grants userns to /usr/bin/bwrap alone;
-# processes inside the sandbox stay restricted, and so does every other binary
-# on the VM. Setting the sysctl to 0 would lift the restriction fleet-wide for
-# anything that asks, which is the opposite of what this VM is for — so this
-# recipe does not, and spec/recipes/codex_spec.rb fails a change that does.
+# On 24.04 that profile ships *unloaded*, as
+# /usr/share/apparmor/extra-profiles/bwrap-userns-restrict from
+# apparmor-profiles — installing the package is not enough, the file has to
+# land in /etc/apparmor.d and be parsed. Read off the noble source package:
+# d/apparmor-profiles.install ships it there, and d/apparmor.maintscript
+# carries `rm_conffile /etc/apparmor.d/bwrap-userns-restrict`, because Ubuntu
+# enabled it by default once, broke saving files in Flatpak apps with it
+# (LP: #2072811) and reverted. So loading it is the supported way to turn it
+# on, not a workaround — and it is a second reason to use remote_file rather
+# than a copy-once execute: if a maintainer script ever removes the file
+# again, the next converge puts it back.
+#
+# What the profile actually does is narrower than its name suggests, and the
+# accurate version matters if you ever weigh it. Its own header says it
+# "allows almost everything": /usr/bin/bwrap gets `allow capability`,
+# `allow file rwlkm /{**,}`, network, ptrace, mount, pivot_root and `allow
+# userns`. That is not a loss of confinement — bwrap was unconfined before —
+# it is the price of granting userns through AppArmor at all. The part that
+# holds is the stack: children go to `px /** -> bwrap//&unpriv_bwrap`, and
+# unpriv_bwrap carries `audit deny capability`. So bwrap can build a sandbox
+# but cannot be turned into a general-purpose way around the userns
+# restriction.
+#
+# Setting the sysctl to 0 would lift that restriction fleet-wide for anything
+# that asks, which is the opposite of what this VM is for — so this recipe
+# does not, and spec/recipes/codex_spec.rb fails a change that does.
+#
+# The header also warns the profile "can break some use cases". Those are
+# flatpak and snap confinement corner cases; neither is on these VMs, where
+# bwrap has exactly one caller.
 
 %w(bubblewrap apparmor-profiles).each do |pkg|
   package pkg
@@ -69,6 +92,17 @@ end
 # developer's shell profile; ~/.local/bin is already on PATH via the
 # /etc/zsh/zshenv that base::shell_default writes, so that is redundant here
 # rather than load-bearing.
+#
+# Deliberately unpinned, and a review has already asked. The installer honours
+# CODEX_RELEASE, but the not_if below makes this resource run once per VM ever,
+# so a pin would fix only the version a VM is born with: the developer's own
+# `codex update` moves it afterwards, and bumping the pin would reach no
+# existing VM because the guard blocks the re-run. The string would go stale
+# while looking authoritative. Integrity is covered without it — the installer
+# verifies the release archive against its SHA-256 metadata, over TLS. Same
+# shape as base::claude_code's `bash -s stable`. If reproducible versions are
+# ever wanted here, the honest change is a pinned tarball with a checksum in
+# the uv.rb/yq.rb shape, not an environment variable behind a once-only guard.
 execute 'install-codex' do
   command 'curl -fsSL https://chatgpt.com/codex/install.sh | sh'
   user 'ubuntu'

@@ -12,8 +12,14 @@
   first `bwrap` on `PATH` and falls back to a copy it bundles under `~/.codex`,
   and that copy sits at a path no profile attaches to — so under
   `kernel.apparmor_restrict_unprivileged_userns=1` it cannot create a user
-  namespace and Codex runs unsandboxed after one warning. The profile grants
-  `userns` to `/usr/bin/bwrap` alone; the sysctl is left at 1.
+  namespace and Codex runs unsandboxed after one warning. Ubuntu ships that
+  profile disabled — `d/apparmor.maintscript` even `rm_conffile`s it out of
+  `/etc/apparmor.d` — after enabling it by default once broke Flatpak file
+  saving (LP: #2072811), so loading it is the supported way to turn it on.
+  It is permissive towards `bwrap` itself; what it buys is the stack into
+  `unpriv_bwrap`, which carries `audit deny capability`, so bwrap cannot
+  become a general-purpose way around the restriction. The sysctl is left
+  at 1.
 
 ## 1.1.1
 
