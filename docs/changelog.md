@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.2.1
+
+**`base-1.2.1`**
+
+- werf was installed but invisible to the shells that automate it.
+  `werf.io/install.sh` appends its `trdl use werf` activation to `~/.zshrc`
+  and `~/.zprofile`, which zsh reads only for interactive and login shells, so
+  a non-interactive `zsh -c 'werf ...'` — an ssh command, a CI step, an
+  agent's shell tool — resolved nothing. Measured on a staging VM
+  2026-09-18: `zsh -c 'whence -p werf'` printed nothing while an interactive
+  shell resolved werf to `~/.trdl/repositories/werf/releases/2.76.0/...`.
+- Fixed the way this cookbook already fixes this class of problem (see
+  `base::docker`, `base::aws_access`): `base::werf` writes a root-owned
+  `/etc/dev-vm/werf-env.sh` and `/etc/profile.d/dev-vm-werf.sh`, and
+  `base::shell_default` sources it from `/etc/zsh/zshenv`. Not `~/.zshenv` —
+  root cannot write there, the copy would have to be create-once (so a
+  developer with an existing file never gets the fix, and a deleted one is
+  never restored), and measured on the same VM `zsh -f -c` skips `~/.zshenv`
+  while still running `/etc/zsh/zshenv`.
+- `spec/recipes/shell_default_spec.rb` is new and fails an `/etc/dev-vm`
+  drop-in that no line in `/etc/zsh/zshenv` reaches — a failure that is
+  otherwise silent.
+
 ## 1.2.0
 
 **`base-1.2.0`**
