@@ -28,13 +28,13 @@ cinc/
         docker.rb               # Rootless Docker CE + Compose
         traefik.rb              # Traefik reverse proxy + per-VM basic auth (publishing)
         nvidia_docker.rb        # NVIDIA Container Toolkit + CDI (auto-detect GPU)
-        werf.rb                 # werf v2 deployment tool
+        werf.rb                 # werf v2 deployment tool (trdl) + the /etc/dev-vm activation non-interactive shells need
         kubernetes.rb           # kubectl (apt, pinned minor) + helm (tarball, pinned version)
         nodejs.rb               # Node.js 24 LTS from NodeSource
         claude_code.rb          # Claude Code CLI (claude.ai/install.sh, per-user for ubuntu)
         codex.rb                # Codex CLI (chatgpt.com/codex/install.sh, per-user) + bubblewrap and the AppArmor profile its sandbox needs
         gh.rb                   # GitHub CLI from cli.github.com
-        shell_default.rb        # zsh as the login shell for ubuntu
+        shell_default.rb        # zsh as the login shell for ubuntu; owns /etc/zsh/zshenv and the lines that reach every /etc/dev-vm drop-in
         yq.rb                   # yq (pinned binary, SHA256-checked)
         uv.rb                   # uv / uvx Python toolchain
         tailscale.rb            # Tailscale package + daemon (the sudo grant lives in sudoers.rb)

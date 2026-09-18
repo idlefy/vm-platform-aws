@@ -40,9 +40,12 @@ end
 #    is acceptable here — the stock content is comments + one dead stanza;
 #    unattended-upgrades runs with --force-confold so our version survives.
 #
-# 4) Source /etc/dev-vm/shell-env.sh, written by base::aws_access. Ubuntu's
-#    /etc/zsh/zprofile does not source /etc/profile, so zsh needs this line to
-#    see the same environment that /etc/profile.d/dev-vm.sh gives bash.
+# 4) Source the gated files under /etc/dev-vm, written by base::aws_access,
+#    base::docker and base::werf. Ubuntu's /etc/zsh/zprofile does not source
+#    /etc/profile, so zsh needs these lines to see the same environment that
+#    /etc/profile.d/dev-vm*.sh gives bash. Each recipe owns its own file and
+#    this one owns the line that reaches it; add a file there, add a line here.
+#    spec/recipes/shell_default_spec.rb fails a drop-in that has no line.
 file '/etc/zsh/zshenv' do
   content <<~ZSHENV
     # /etc/zsh/zshenv: system-wide .zshenv file for zsh(1).
@@ -62,6 +65,8 @@ file '/etc/zsh/zshenv' do
     [ -r /etc/dev-vm/shell-env.sh ] && . /etc/dev-vm/shell-env.sh
 
     [ -r /etc/dev-vm/docker-env.sh ] && . /etc/dev-vm/docker-env.sh
+
+    [ -r /etc/dev-vm/werf-env.sh ] && . /etc/dev-vm/werf-env.sh
   ZSHENV
   owner 'root'
   group 'root'
