@@ -74,6 +74,8 @@ EOF
   cat > "$STUB/cinc-client" <<'EOF'
 #!/usr/bin/env bash
 printf 'ARGS %s\n' "$*" >> "$CINC_LOG"
+printf 'SIGNED_BY %s\n' "${DEV_VM_POLICY_SIGNED_BY-<unset>}" >> "$CINC_LOG"
+printf 'GROUP %s\n' "${DEV_VM_POLICY_GROUP-<unset>}" >> "$CINC_LOG"
 conf=
 while [ $# -gt 0 ]; do [ "$1" = "-c" ] && conf=$2; shift; done
 [ -n "$conf" ] && sed 's/^/CONF /' "$conf" >> "$CINC_LOG"
@@ -225,6 +227,10 @@ check "every S3 call names the bucket region" "$(ok [ "$(grep -c -- '--region eu
 check "reads the production envelope" "$(ok grep -q -- "--key $PREFIX/$POLICY/production.json" "$AWS_LOG")"
 check "records the serial" "$(ok grep -q "^$NOW $REV $SHA$" "$WORK/state/last-serial")"
 check "status says ok" "$(ok grep -q ' ok ' "$WORK/state/status")"
+# base::cinc_client refuses a signers set that drops the key that signed the
+# revision it is converging; this is how it learns which key that was.
+check "tells the converge who signed" "$(ok grep -qx 'SIGNED_BY ops' "$CINC_LOG")"
+check "tells the converge the group" "$(ok grep -qx 'GROUP production' "$CINC_LOG")"
 check "state tree is 0700" "$(ok [ "$(stat -c %a "$WORK/state")" = 700 ])"
 check "run dir is 0700" "$(ok [ "$(stat -c %a "$WORK/run")" = 700 ])"
 teardown
@@ -263,6 +269,9 @@ REV=$(newrev); SHA=$(make_archive "$REV")
 publish stranger dev-vm-policy-production serial=$((NOW + 60))
 expect_rejected "$(fetch)" "unknown signer"
 check "unknown signer: says why" "$(ok grep -qi 'signature' "$WORK/err")"
+# Nothing was verified on this run, so the converge must not be told a signer:
+# the recipe then keeps the signers set it already has.
+check "fallback: no signer passed to the converge" "$(ok grep -qx 'SIGNED_BY ' "$CINC_LOG")"
 : > "$CINC_LOG"
 ENVELOPE_AS=production publish ci dev-vm-policy-staging policy_group=production serial=$((NOW + 60))
 expect_rejected "$(fetch)" "staging signature presented as production"
@@ -341,6 +350,26 @@ rc=$(fetch)
 check "matching signers_sha256: exit 0" "$(ok [ "$rc" = 0 ])"
 teardown
 
+echo "== POLICY_MIN_SERIAL refuses anything older, first boot included =="
+# A bucket writer can serve a new VM an old, validly signed envelope; with no
+# rotation since, signers_sha256 matches. The operator raises the floor after a
+# security fix, and nothing below it converges anywhere.
+setup
+echo "POLICY_MIN_SERIAL=$((NOW + 1))" >> "$WORK/etc/policy.conf"
+REV=$(newrev); SHA=$(make_archive "$REV")
+publish ops dev-vm-policy-production
+rc=$(fetch)
+check "first boot, below the floor: exit 12" "$(ok [ "$rc" = 12 ])"
+check "below the floor: no converge" "$(ok [ "$(converges)" = 0 ])"
+check "says why" "$(ok grep -q 'POLICY_MIN_SERIAL' "$WORK/err")"
+publish ops dev-vm-policy-production serial=$((NOW + 1))
+rc=$(fetch)
+check "at the floor: exit 0" "$(ok [ "$rc" = 0 ])"
+echo "POLICY_MIN_SERIAL=soon" >> "$WORK/etc/policy.conf"
+rc=$(fetch)
+check "malformed floor: exit 70" "$(ok [ "$rc" = 70 ])"
+teardown
+
 echo "== delivery failures count to three before the unit fails =="
 setup; baseline
 for n in 1 2; do
@@ -402,7 +431,10 @@ check "current archive kept" "$(ok [ -e "$WORK/state/archives/$REV.tgz" ])"
 check "two archives at most" "$(ok [ "$(find "$WORK/state/archives" -name '*.tgz' | wc -l)" -le 2 ])"
 teardown
 
-echo "== the launcher falls back to .prev on an internal error only =="
+echo "== the launcher falls back to .prev only when the script cannot run =="
+# Not on 70 or any other code the script can be driven to from outside — a full
+# disk, a missing directory — or anyone able to cause one could downgrade the
+# fleet to a .prev whose bug the current version fixed.
 setup
 mkdir -p "$WORK/sbin"
 for v in "" .prev; do
@@ -411,19 +443,42 @@ for v in "" .prev; do
   chmod +x "$WORK/sbin/dev-vm-policy-fetch$v"
 done
 export DEV_VM_POLICY_FETCH="$WORK/sbin/dev-vm-policy-fetch"
-RC=70 "$LAUNCH" >/dev/null 2>&1; rc=$?
-check "internal error: .prev ran" "$(ok grep -q '^fetch.prev' "$WORK/launch.log")"
-check "internal error: .prev's exit code" "$(ok [ "$rc" = 0 ])"
-: > "$WORK/launch.log"
+for code in 2 126 127; do
+  RC=$code "$LAUNCH" >/dev/null 2>&1; rc=$?
+  check "exit $code: .prev ran" "$(ok grep -q '^fetch\.prev' "$WORK/launch.log")"
+  check "exit $code: .prev's exit code" "$(ok [ "$rc" = 0 ])"
+  : > "$WORK/launch.log"
+done
+for code in 1 70; do
+  RC=$code "$LAUNCH" >/dev/null 2>&1; rc=$?
+  check "exit $code: no fallback" "$(grep -q '^fetch\.prev' "$WORK/launch.log" && echo 1 || echo 0)"
+  check "exit $code: exit code kept" "$(ok [ "$rc" = "$code" ])"
+  : > "$WORK/launch.log"
+done
 RC=12 "$LAUNCH" >/dev/null 2>&1; rc=$?
 check "rejection: no fallback" "$(grep -q '^fetch\.prev' "$WORK/launch.log" && echo 1 || echo 0)"
 check "rejection: exit code kept" "$(ok [ "$rc" = 12 ])"
 : > "$WORK/launch.log"
 rm "$WORK/sbin/dev-vm-policy-fetch.prev"
-RC=70 "$LAUNCH" >/dev/null 2>&1; rc=$?
-check "no .prev: exit code kept" "$(ok [ "$rc" = 70 ])"
+RC=127 "$LAUNCH" >/dev/null 2>&1; rc=$?
+check "no .prev: exit code kept" "$(ok [ "$rc" = 127 ])"
 unset DEV_VM_POLICY_FETCH
 teardown
+
+echo "== the self-test passes against the fixture the cookbook ships =="
+FIXTURE="$ROOT/cinc/cookbooks/base/files/default/policy-fetch-selftest"
+"$FETCH" --self-test "$FIXTURE" >/dev/null 2>&1
+check "exit 0" "$(ok [ $? = 0 ])"
+
+echo "== the self-test fails a script that cannot verify =="
+SCRATCH=$(mktemp -d)
+# shellcheck disable=SC2016  # the pattern is the script's literal text
+sed 's/-n "\$NAMESPACE"/-n wrong-namespace/' "$FETCH" > "$SCRATCH/broken"
+chmod +x "$SCRATCH/broken"
+check "the mutation applied" "$(cmp -s "$FETCH" "$SCRATCH/broken" && echo 1 || echo 0)"
+"$SCRATCH/broken" --self-test "$FIXTURE" >/dev/null 2>&1
+check "exit non-zero" "$(ok [ $? != 0 ])"
+rm -rf "$SCRATCH"
 
 echo "== default paths are the ones user_data and the cookbook write =="
 check "policy.conf" "$(ok grep -qF 'DEV_VM_POLICY_CONF:-/etc/dev-vm/policy.conf' "$FETCH")"

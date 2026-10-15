@@ -1,20 +1,27 @@
 #!/bin/sh
 # dev-vm-policy-run — the unit's ExecStart. Runs dev-vm-policy-fetch, and if
-# that exits with anything but one of its documented codes, runs the previous
-# version instead.
+# that could not run at all, runs the previous version instead.
 #
 # Only user_data writes this file; the cookbook never does. The cookbook
 # replaces dev-vm-policy-fetch itself (via .new and --self-test, keeping
 # .prev), so a broken fetch shipped in a revision could otherwise never run
-# the converge that repairs it. Falling back costs nothing in safety: .prev
-# makes every check the current version makes.
+# the converge that repairs it.
+#
+# "Could not run" is narrow on purpose: 126/127 (not executable, not found) and
+# 2 (bash's syntax error). The script's own codes — 70 included — and any
+# runtime failure are passed through. Every one of those can be driven from
+# outside the script (a full disk, a missing directory), and falling back on
+# them would let whoever drives one downgrade the VM to a .prev whose bug the
+# current version fixed. A runtime bug is what --self-test catches before a
+# version is installed at all.
 
 FETCH=${DEV_VM_POLICY_FETCH:-/usr/local/sbin/dev-vm-policy-fetch}
 
 "$FETCH" "$@"
 rc=$?
 case "$rc" in
-  0|11|12|13|14) exit "$rc" ;;
+  2|126|127) ;;
+  *) exit "$rc" ;;
 esac
 if [ -x "$FETCH.prev" ]; then
   echo "dev-vm-policy-run: $FETCH exited $rc; running the previous version" >&2

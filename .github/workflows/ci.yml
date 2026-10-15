@@ -42,6 +42,9 @@ jobs:
       - name: test-skeleton-sync
         run: make test-skeleton-sync
 
+      - name: test-fetch-sync
+        run: make test-fetch-sync
+
       - name: smoke
         run: make smoke
 
@@ -107,6 +110,9 @@ jobs:
       - name: test-policy-fetch
         working-directory: cinc
         run: make test-policy-fetch
+
+      - name: test-fetch-sync
+        run: make test-fetch-sync
 
       - name: test-pin-check
         run: ./test/test-pin-check.sh

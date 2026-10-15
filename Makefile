@@ -5,7 +5,7 @@ METADATA := cinc/cookbooks/base/metadata.rb
 POLICYFILE  := cinc/policyfiles/dev-vm.rb
 LOCKFILE    := cinc/policyfiles/dev-vm.lock.json
 
-.PHONY: help release test-release-gate boundary-check test-boundary-check smoke pin-check test-pin-check test-skeleton-sync
+.PHONY: help release test-release-gate boundary-check test-boundary-check smoke pin-check test-pin-check test-skeleton-sync test-fetch-sync
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -31,6 +31,9 @@ test-pin-check: ## Test the pin gate (needs a local git remote only)
 
 test-skeleton-sync: ## Prove tenant-skeleton's script copies have not drifted
 	@./test/test-skeleton-sync.sh
+
+test-fetch-sync: ## Prove the module and cookbook copies of dev-vm-policy-fetch are identical
+	@./test/test-fetch-sync.sh
 
 smoke: ## Gate the module interface against tenant-skeleton (needs no AWS)
 	@./scripts/smoke.sh
@@ -93,9 +96,11 @@ release: ## Gate and cut an artifact tag (usage: make release TAG=base-X.Y.Z | v
 	           && $(MAKE) -C cinc test \
 	           && $(MAKE) -C cinc test-broker \
 	           && $(MAKE) -C cinc test-loki-token \
-	           && $(MAKE) -C cinc test-policy-fetch ;; \
+	           && $(MAKE) -C cinc test-policy-fetch \
+	           && ./test/test-fetch-sync.sh ;; \
 	   v*)     ./scripts/boundary-check.sh \
 	           && ./test/test-skeleton-sync.sh \
+	           && ./test/test-fetch-sync.sh \
 	           && ./scripts/smoke.sh ;; \
 	 esac \
 	 && git tag "$(TAG)" "$$sha" \

@@ -47,7 +47,11 @@ STUB
 #!/bin/sh
 echo "skeleton-sync stub"
 STUB
-  chmod +x "$WORK/test/test-skeleton-sync.sh"
+  cat > "$WORK/test/test-fetch-sync.sh" <<'STUB'
+#!/bin/sh
+echo "fetch-sync stub"
+STUB
+  chmod +x "$WORK/test/test-skeleton-sync.sh" "$WORK/test/test-fetch-sync.sh"
   chmod +x "$WORK/scripts/boundary-check.sh" "$WORK/scripts/smoke.sh"
   cp "$ROOT/Makefile" "$WORK/Makefile"
   printf "version         '%s'\n" "${1:-0.11.0}" > "$WORK/cinc/cookbooks/base/metadata.rb"
@@ -155,6 +159,7 @@ check "exit 0" "$?"
 check "ran the boundary guard" "$(echo "$OUT" | grep -q 'boundary stub' && echo 0 || echo 1)"
 check "ran the smoke gate" "$(echo "$OUT" | grep -q 'smoke stub' && echo 0 || echo 1)"
 check "ran the skeleton-sync guard" "$(echo "$OUT" | grep -q 'skeleton-sync stub' && echo 0 || echo 1)"
+check "ran the fetch-sync guard" "$(echo "$OUT" | grep -q 'fetch-sync stub' && echo 0 || echo 1)"
 check "no chefspec on the v path" "$(echo "$OUT" | grep -q 'chefspec stub' && echo 1 || echo 0)"
 check "tag exists on HEAD" "$([ "$(git -C "$WORK" rev-parse v9.0.0 2>/dev/null)" = "$(git -C "$WORK" rev-parse HEAD)" ] && echo 0 || echo 1)"
 teardown
@@ -177,6 +182,8 @@ check "no smoke gate on the cookbook path" "$(echo "$OUT" | grep -q 'smoke stub'
 check "no skeleton-sync guard on the cookbook path" "$(echo "$OUT" | grep -q 'skeleton-sync stub' && echo 1 || echo 0)"
 check "ran the cookstyle gate" "$(echo "$OUT" | grep -q 'lint stub' && echo 0 || echo 1)"
 check "ran the chefspec gate" "$(echo "$OUT" | grep -q 'chefspec stub' && echo 0 || echo 1)"
+# Both streams ship a copy of dev-vm-policy-fetch, so both refuse a drifted one.
+check "ran the fetch-sync guard on the cookbook path" "$(echo "$OUT" | grep -q 'fetch-sync stub' && echo 0 || echo 1)"
 teardown
 
 echo "== a tag in neither stream is refused =="

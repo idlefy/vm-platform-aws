@@ -1,0 +1,6 @@
+#!/bin/sh
+# self-test stub: succeed only if pointed at an extracted archive and told who signed.
+conf=''
+while [ $# -gt 0 ]; do [ "$1" = "-c" ] && conf=$2; shift; done
+repo=$(sed -n 's/^chef_repo_path "\(.*\)"$/\1/p' "$conf")
+[ -f "$repo/Policyfile.lock.json" ] && [ "${DEV_VM_POLICY_SIGNED_BY:-}" = selftest ]
