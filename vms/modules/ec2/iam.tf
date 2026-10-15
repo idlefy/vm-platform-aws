@@ -418,8 +418,40 @@ resource "aws_iam_policy" "identity_boundary" {
           "ec2:ModifyVpcEndpoint",
           "route53resolver:AssociateFirewallRuleGroup",
           "route53resolver:AssociateResolverRule",
+          # ...and their siblings on what already exists: an endpoint deleted,
+          # a rule rewritten inside a firewall rule group already associated.
+          "ec2:DeleteVpcEndpoints",
+          "route53resolver:CreateFirewallRule",
+          "route53resolver:UpdateFirewallRule",
+          "route53resolver:UpdateFirewallRuleGroupAssociation",
+          # A second review pass. IMDS switched off on a peer takes its
+          # bootstrap role, so it fetches nothing again (and the options call
+          # can weaken IMDSv2 as well). Block Public Access and DisableRegion
+          # cut off a whole region's internet egress, or the region itself.
+          # Eleventh instance of the multi-call-path omission.
+          "ec2:ModifyInstanceMetadataOptions",
+          "ec2:ModifyInstanceMetadataDefaults",
+          "ec2:ModifyVpcBlockPublicAccessOptions",
+          "account:DisableRegion",
+          # A peer's name: its fqdn resolves to its EIP, so moving the EIP to
+          # a machine the developer controls (or releasing it) takes the name
+          # and whatever ACME will issue for it. The record itself is denied
+          # in DenyFleetZoneRecords below.
+          "ec2:AssociateAddress",
+          "ec2:DisassociateAddress",
+          "ec2:ReleaseAddress",
+          # Peers' availability, with TerminateInstances and RebootInstances.
+          "ec2:SendDiagnosticInterrupt",
         ]
         Resource = "*"
+      },
+      # The fleet's DNS records, on the fleet's zone only: a developer whose
+      # bundle declares route53 for some other zone keeps it.
+      {
+        Sid      = "DenyFleetZoneRecords"
+        Effect   = "Deny"
+        Action   = ["route53:ChangeResourceRecordSets"]
+        Resource = "arn:aws:route53:::hostedzone/${var.route53_zone_id}"
       },
       # The policy bucket. See "The policy bucket" in the deny-list notes above.
       {

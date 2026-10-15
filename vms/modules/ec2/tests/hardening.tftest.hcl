@@ -389,6 +389,15 @@ run "kms_bucket_adds_decrypt_and_key_denies" {
     policy_kms_key_arn = "arn:aws:kms:eu-central-1:123456789012:key/11111111-2222-3333-4444-555555555555"
   }
 
+  # IAM refuses a managed policy over 6,144 characters (whitespace excluded;
+  # jsonencode emits none). The boundary is the longest document this module
+  # writes and grows with every deny entry; this run has the most statements,
+  # and the 1,500 left over is for the Allow list a VM's bundles declare.
+  assert {
+    condition     = length(aws_iam_policy.identity_boundary["vm"].policy) < 6144 - 1500
+    error_message = "The identity boundary is too close to IAM's 6,144-character managed-policy limit: ${length(aws_iam_policy.identity_boundary["vm"].policy)} characters."
+  }
+
   assert {
     condition     = strcontains(aws_iam_role_policy.bootstrap["vm"].policy, "kms:Decrypt")
     error_message = "With SSE-KMS the bootstrap role needs kms:Decrypt on the key."
@@ -421,6 +430,29 @@ run "boundary_denies_writes_to_the_policy_bucket" {
       ] : strcontains(aws_iam_policy.identity_boundary["vm"].policy, "\"${action}\"")
     ])
     error_message = "The boundary must deny the one-call routes that freeze policy delivery fleet-wide."
+  }
+
+  # The second pass. IMDS switched off on a peer takes its role, so it fetches
+  # nothing; VPC Block Public Access and DisableRegion cut a whole region off;
+  # moving a peer's EIP or rewriting its DNS record hands its name — and an
+  # ACME certificate for it — to a machine the developer controls.
+  assert {
+    condition = alltrue([
+      for action in [
+        "ec2:ModifyInstanceMetadataOptions", "ec2:ModifyInstanceMetadataDefaults",
+        "ec2:ModifyVpcBlockPublicAccessOptions", "account:DisableRegion",
+        "ec2:AssociateAddress", "ec2:DisassociateAddress", "ec2:ReleaseAddress",
+        "ec2:SendDiagnosticInterrupt", "ec2:DeleteVpcEndpoints",
+        "route53resolver:UpdateFirewallRule", "route53resolver:CreateFirewallRule",
+        "route53resolver:UpdateFirewallRuleGroupAssociation",
+      ] : strcontains(aws_iam_policy.identity_boundary["vm"].policy, "\"${action}\"")
+    ])
+    error_message = "The boundary must deny the routes the second review pass found."
+  }
+
+  assert {
+    condition     = strcontains(aws_iam_policy.identity_boundary["vm"].policy, "\"route53:ChangeResourceRecordSets\"") && strcontains(aws_iam_policy.identity_boundary["vm"].policy, "arn:aws:route53:::hostedzone/Z00000000000000000TEST")
+    error_message = "Record changes must be denied on the fleet's own zone, and only there."
   }
 
   assert {
