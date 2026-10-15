@@ -427,32 +427,72 @@ run "boundary_denies_writes_to_the_policy_bucket" {
         "ec2:ModifyVpcAttribute", "ec2:AssociateDhcpOptions",
         "ec2:CreateVpcEndpoint", "ec2:ModifyVpcEndpoint",
         "route53resolver:AssociateFirewallRuleGroup", "route53resolver:AssociateResolverRule",
-      ] : strcontains(aws_iam_policy.identity_boundary["vm"].policy, "\"${action}\"")
+        ] : anytrue([
+          for st in jsondecode(aws_iam_policy.identity_boundary["vm"].policy).Statement :
+          st.Effect == "Deny" && anytrue([
+            for p in flatten([st.Action]) : can(regex("^${replace(p, "*", ".*")}$", action))
+          ])
+      ])
     ])
     error_message = "The boundary must deny the one-call routes that freeze policy delivery fleet-wide."
   }
 
-  # The second pass. IMDS switched off on a peer takes its role, so it fetches
-  # nothing; VPC Block Public Access and DisableRegion cut a whole region off;
-  # moving a peer's EIP or rewriting its DNS record hands its name — and an
-  # ACME certificate for it — to a machine the developer controls.
+  # Siblings, not just the action a review happened to name: each of these
+  # reaches the same asset as one already denied. Checked semantically — is
+  # the action matched by some Deny pattern, wildcards included — because the
+  # boundary now denies whole families with wildcards to stay inside IAM's
+  # 6,144-character limit and to cover siblings by construction.
   assert {
     condition = alltrue([
       for action in [
+        # IMDS switched off on a peer takes its bootstrap role.
         "ec2:ModifyInstanceMetadataOptions", "ec2:ModifyInstanceMetadataDefaults",
-        "ec2:ModifyVpcBlockPublicAccessOptions", "account:DisableRegion",
-        "ec2:AssociateAddress", "ec2:DisassociateAddress", "ec2:ReleaseAddress",
-        "ec2:SendDiagnosticInterrupt", "ec2:DeleteVpcEndpoints",
-        "route53resolver:UpdateFirewallRule", "route53resolver:CreateFirewallRule",
-        "route53resolver:UpdateFirewallRuleGroupAssociation",
-      ] : strcontains(aws_iam_policy.identity_boundary["vm"].policy, "\"${action}\"")
+        # A whole region's egress, or the region.
+        "ec2:ModifyVpcBlockPublicAccessOptions", "ec2:DeleteVpcBlockPublicAccessExclusion",
+        "ec2:ModifyVpcBlockPublicAccessExclusion", "account:DisableRegion",
+        # Gateway endpoints add their own routes; their policy can deny the bucket.
+        "ec2:CreateVpcEndpoint", "ec2:ModifyVpcEndpoint", "ec2:DeleteVpcEndpoints",
+        # DNS for the VPC.
+        "ec2:ModifyVpcAttribute", "ec2:AssociateDhcpOptions",
+        "route53resolver:AssociateFirewallRuleGroup", "route53resolver:UpdateFirewallRule",
+        "route53resolver:CreateFirewallRule", "route53resolver:UpdateFirewallRuleGroupAssociation",
+        "route53resolver:UpdateFirewallConfig", "route53resolver:UpdateFirewallDomains",
+        "route53resolver:AssociateResolverRule", "route53resolver:UpdateResolverRule",
+        # A peer's name: its fqdn is its EIP.
+        "ec2:AssociateAddress", "ec2:DisassociateAddress", "ec2:ReleaseAddress", "ec2:ModifyAddressAttribute",
+        # Peers' availability.
+        "ec2:SendDiagnosticInterrupt",
+        # The fleet's zone.
+        "route53:ChangeResourceRecordSets", "route53:DeleteHostedZone",
+        "route53:EnableHostedZoneDNSSEC", "route53:DisableHostedZoneDNSSEC",
+        "route53:CreateKeySigningKey", "route53:ActivateKeySigningKey",
+        "route53:DeactivateKeySigningKey", "route53:DeleteKeySigningKey",
+        ] : anytrue([
+          for st in jsondecode(aws_iam_policy.identity_boundary["vm"].policy).Statement :
+          st.Effect == "Deny" && anytrue([
+            for p in flatten([st.Action]) : can(regex("^${replace(p, "*", ".*")}$", action))
+          ])
+      ])
     ])
-    error_message = "The boundary must deny the routes the second review pass found."
+    error_message = "Every sibling route to a peer's IMDS, its name, the region's egress or the VPC's DNS must be denied."
+  }
+
+  # Wildcards must not swallow the reads a developer legitimately needs.
+  assert {
+    condition = alltrue([
+      for action in ["ec2:DescribeAddresses", "ec2:DescribeInstances", "route53:ListHostedZones"] : !anytrue([
+        for st in jsondecode(aws_iam_policy.identity_boundary["vm"].policy).Statement :
+        st.Effect == "Deny" && anytrue([
+          for p in flatten([st.Action]) : can(regex("^${replace(p, "*", ".*")}$", action))
+        ])
+      ])
+    ])
+    error_message = "A deny wildcard matches a read-only call it was never meant to cover."
   }
 
   assert {
-    condition     = strcontains(aws_iam_policy.identity_boundary["vm"].policy, "\"route53:ChangeResourceRecordSets\"") && strcontains(aws_iam_policy.identity_boundary["vm"].policy, "arn:aws:route53:::hostedzone/Z00000000000000000TEST")
-    error_message = "Record changes must be denied on the fleet's own zone, and only there."
+    condition     = strcontains(aws_iam_policy.identity_boundary["vm"].policy, "arn:aws:route53:::hostedzone/Z00000000000000000TEST")
+    error_message = "Zone changes must be denied on the fleet's own zone, and only there."
   }
 
   assert {

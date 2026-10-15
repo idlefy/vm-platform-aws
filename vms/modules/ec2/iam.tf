@@ -405,52 +405,54 @@ resource "aws_iam_policy" "identity_boundary" {
           "ec2:DeleteInternetGateway",
           "ec2:AssociateRouteTable",
           "ec2:DeleteNatGateway",
-          # One call each black-holes the subnet's S3 and Loki without touching
-          # a route or an ACL: DNS switched off for the VPC, the VPC's DHCP
-          # options pointed at other resolvers, a gateway endpoint (it adds its
-          # own routes, no ec2:CreateRoute needed) whose policy denies the
-          # policy bucket, and Resolver rules that drop or redirect the
-          # lookups. Found by a security review of this list; tenth instance of
-          # the multi-call-path omission.
+          # Families, not single actions, from here on. Three security-review
+          # passes over this list each found a sibling of something already
+          # denied; a wildcard covers the siblings by construction and keeps
+          # the document inside IAM's 6,144-character limit (see the size test
+          # in hardening.tftest.hcl). Some do match reads — DescribeVpcEndpoints,
+          # Resolver's List/Get, GetInstanceMetadataDefaults — and that is
+          # accepted; the test pins the reads that must stay open
+          # (DescribeInstances, DescribeAddresses, ListHostedZones).
+          #
+          # The VPC's DNS and its endpoints: DNS switched off, DHCP options
+          # pointed at other resolvers, Resolver firewall or forwarding rules,
+          # or a gateway endpoint (it adds its own routes, no ec2:CreateRoute)
+          # whose policy denies the bucket — each black-holes S3 and Loki for
+          # the subnet in one call.
           "ec2:ModifyVpcAttribute",
           "ec2:AssociateDhcpOptions",
-          "ec2:CreateVpcEndpoint",
-          "ec2:ModifyVpcEndpoint",
-          "route53resolver:AssociateFirewallRuleGroup",
-          "route53resolver:AssociateResolverRule",
-          # ...and their siblings on what already exists: an endpoint deleted,
-          # a rule rewritten inside a firewall rule group already associated.
-          "ec2:DeleteVpcEndpoints",
-          "route53resolver:CreateFirewallRule",
-          "route53resolver:UpdateFirewallRule",
-          "route53resolver:UpdateFirewallRuleGroupAssociation",
-          # A second review pass. IMDS switched off on a peer takes its
-          # bootstrap role, so it fetches nothing again (and the options call
-          # can weaken IMDSv2 as well). Block Public Access and DisableRegion
-          # cut off a whole region's internet egress, or the region itself.
-          # Eleventh instance of the multi-call-path omission.
-          "ec2:ModifyInstanceMetadataOptions",
-          "ec2:ModifyInstanceMetadataDefaults",
-          "ec2:ModifyVpcBlockPublicAccessOptions",
+          "ec2:*VpcEndpoint*",
+          "route53resolver:*",
+          # IMDS switched off on a peer takes its bootstrap role, so it never
+          # fetches policy again; the same calls can weaken IMDSv2.
+          "ec2:*InstanceMetadata*",
+          # A whole region's internet egress, or the region itself.
+          "ec2:*VpcBlockPublicAccess*",
           "account:DisableRegion",
-          # A peer's name: its fqdn resolves to its EIP, so moving the EIP to
-          # a machine the developer controls (or releasing it) takes the name
-          # and whatever ACME will issue for it. The record itself is denied
-          # in DenyFleetZoneRecords below.
-          "ec2:AssociateAddress",
-          "ec2:DisassociateAddress",
-          "ec2:ReleaseAddress",
+          # A peer's name: its fqdn resolves to its EIP, so moving or releasing
+          # the EIP hands the name — and what ACME will issue for it — to a
+          # machine the developer controls. `*Address` stops short of
+          # DescribeAddresses. The zone itself is DenyFleetZoneChanges below.
+          "ec2:*Address",
+          "ec2:ModifyAddressAttribute",
           # Peers' availability, with TerminateInstances and RebootInstances.
           "ec2:SendDiagnosticInterrupt",
         ]
         Resource = "*"
       },
-      # The fleet's DNS records, on the fleet's zone only: a developer whose
-      # bundle declares route53 for some other zone keeps it.
+      # The fleet's zone, and only that zone: a developer whose bundle
+      # declares route53 for some other zone keeps it. Records point peers'
+      # names elsewhere; deleting the zone or breaking its DNSSEC makes them
+      # resolve nowhere.
       {
-        Sid      = "DenyFleetZoneRecords"
-        Effect   = "Deny"
-        Action   = ["route53:ChangeResourceRecordSets"]
+        Sid    = "DenyFleetZoneChanges"
+        Effect = "Deny"
+        Action = [
+          "route53:ChangeResourceRecordSets",
+          "route53:DeleteHostedZone",
+          "route53:*HostedZoneDNSSEC",
+          "route53:*KeySigningKey",
+        ]
         Resource = "arn:aws:route53:::hostedzone/${var.route53_zone_id}"
       },
       # The policy bucket. See "The policy bucket" in the deny-list notes above.
