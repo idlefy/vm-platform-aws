@@ -1,10 +1,9 @@
 POLICYFILES_DIR := policyfiles
-KNIFE_CONFIG    := ./.chef/knife.rb
 
 POLICYFILES := $(wildcard $(POLICYFILES_DIR)/*.rb)
 LOCKFILES   := $(POLICYFILES:.rb=.lock.json)
 
-.PHONY: help preflight add-region push promote clean node-delete ssh
+.PHONY: help preflight add-region push promote clean ssh
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -20,43 +19,66 @@ preflight: ## Check per-region secrets, Loki auth and policy ARNs (needs AWS; re
 add-region: ## Wire a new AWS region into vms/ (usage: make add-region REGION=eu-west-1)
 	@../scripts/add-region.sh $(REGION)
 
+# The bucket, its owner and region, the prefix and the signers all come from
+# ../vms, the same values the VMs were built with, read in one terraform console
+# call. The signers verify what is already in the bucket; the signers a revision
+# INSTALLS come from its lock (base.policy.signers), and policy-publish.sh
+# refuses a key that set does not contain.
+#
+# Runs in the recipe's shell: writes the signers to a temp file, exports
+# POLICY_* and AWS_PROFILE. Prints nothing secret — none of it is.
+POLICY_ENV = set -eu; \
+	cfg=$$(cd ../vms && echo 'jsonencode({profile=var.aws_profile,bucket=var.policy_bucket,owner=var.policy_bucket_owner,region=var.policy_bucket_region,prefix=var.policy_prefix,signers=var.policy_signers})' \
+	       | terraform console 2>/dev/null | tail -1) \
+	  || { echo "could not read the policy settings from ../vms — is it initialised?"; exit 1; }; \
+	POLICY_SIGNERS_FILE=$$(mktemp); trap 'rm -f "$$POLICY_SIGNERS_FILE"' EXIT; \
+	penv=$$(printf '%s' "$$cfg" | python3 -I -c 'import json,shlex,sys; d=json.loads(json.loads(sys.stdin.read())); open(sys.argv[1],"w").write("".join(l+"\n" for l in d["signers"])); [print("export %s=%s" % (k, shlex.quote(str(d[v])))) for k,v in (("AWS_PROFILE","profile"),("POLICY_BUCKET","bucket"),("POLICY_BUCKET_OWNER","owner"),("POLICY_BUCKET_REGION","region"),("POLICY_PREFIX","prefix"))]' "$$POLICY_SIGNERS_FILE") \
+	  || { echo "could not read the policy settings from ../vms — is it initialised?"; exit 1; }; \
+	eval "$$penv"; export POLICY_SIGNERS_FILE
+
 # pin-check first, then `chef install` — NOT `chef update`.
 #
 # chef update re-resolves and rewrites the lock. On the push path that means
 # every push adopts whatever the pinned tag currently points at, silently, and
 # the recorded SHA protects nothing. chef install honours the lock, so what is
-# pushed is what was reviewed and committed.
+# published is what was reviewed and committed.
 #
 # The gate is what makes install safe: chef install is equally silent about a
 # policyfile that has been edited past its lock, and the policyfile is where all
 # tenant configuration lives. See `make -C .. pin-check`.
-push: ## Push policies to staging (pin-check + install from lock + push)
+#
+# What a push writes: the archive, once per revision, and a signed staging
+# envelope naming it — see ../scripts/policy-publish.sh. Signed with
+# SIGNING_KEY (default ~/.ssh/id_ed25519; a .pub path signs through ssh-agent).
+push: ## Publish policies to staging (pin-check + install from lock + signed envelope)
 	@$(MAKE) -C .. pin-check
 	@echo ""
-	@echo "⚠  Pushing to STAGING policy group"
+	@echo "⚠  Publishing to STAGING"
 	@echo "   Policies will NOT affect production VMs until promoted."
 	@echo ""
-	@for pf in $(POLICYFILES); do \
+	@$(POLICY_ENV); \
+	for pf in $(POLICYFILES); do \
 		name=$$(basename "$$pf" .rb); \
 		echo "--- Materialising $$name from its lock ---"; \
 		( cd $(POLICYFILES_DIR) && FILTER_BRANCH_SQUELCH_WARNING=1 chef install "$$(basename $$pf)" ) \
-		  || { echo "chef install failed for $$name — not pushing"; exit 1; }; \
-		echo "--- Pushing $$name -> staging ---"; \
-		chef push staging "$$pf" -c $(KNIFE_CONFIG) \
-		  || { echo "chef push failed for $$name"; exit 1; }; \
+		  || { echo "chef install failed for $$name — not publishing"; exit 1; }; \
+		echo "--- Publishing $$name -> staging ---"; \
+		../scripts/policy-publish.sh push "$$pf" \
+		  || { echo "publishing failed for $$name"; exit 1; }; \
 	done
 	@echo ""
-	@echo "✓ Policies pushed to staging"
+	@echo "✓ Policies published to staging"
 	@echo ""
 	@echo "Next steps:"
-	@echo "  1. Test on a staging VM (set policy_group=staging in client.rb)"
+	@echo "  1. Watch a staging VM converge it (within 30 min, or: sudo systemctl start cinc-client)"
 	@echo "  2. Run: make promote"
 # The gate is mechanical, not procedural. "Never promote without push plus
 # staging verification", and "run preflight before a promote that touches
 # deployed config", were rules an operator could simply not follow:
 # nothing stopped a policyfile edit, a skipped `make push`, and a promote of
-# content staging never carried. So promote now refuses unless the staging
-# policy group already names the revision_id in the committed lock.
+# content staging never carried. So promote refuses unless the staging envelope
+# verifies and names the revision_id in the committed lock — checked for every
+# policy (`policy-publish.sh staged`) before the prompt, and again by each write.
 #
 # It does NOT prove a VM converged — no command can — so the confirmation prompt
 # stays, and the text below says what the check did and did not establish.
@@ -68,24 +90,14 @@ promote: ## Promote staging policies to production (preflight + staging revision
 	  echo "   then come up green and ship no logs."; \
 	else $(MAKE) preflight; fi
 	@$(MAKE) -C .. pin-check
-	@for pf in $(POLICYFILES); do \
-		name=$$(basename "$$pf" .rb); \
-		lock="$${pf%.rb}.lock.json"; \
-		want=$$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['revision_id'])" "$$lock") \
-		  || { echo "refusing: cannot read revision_id from $$lock"; exit 1; }; \
-		have=$$(knife raw /policy_groups/staging -c $(KNIFE_CONFIG) 2>/dev/null \
-		         | python3 -c "import json,sys;d=json.load(sys.stdin);print(d['policies'].get('$$name',{}).get('revision_id',''))") \
-		  || { echo "refusing: could not read the staging policy group from the CINC server"; exit 1; }; \
-		[ "$$want" = "$$have" ] \
-		  || { echo "refusing: staging does not carry the revision this tree would promote."; \
-		       echo "  lock     $$want"; \
-		       echo "  staging  $${have:-<no such policy in staging>}"; \
-		       echo "  Run 'make push' and verify a staging VM converges before promoting."; exit 1; }; \
-		echo "  ok   staging carries $$name at $$want"; \
+	@$(POLICY_ENV); \
+	for pf in $(POLICYFILES); do \
+		../scripts/policy-publish.sh staged "$$pf" \
+		  || { echo "  Run 'make push' and verify a staging VM converges before promoting."; exit 1; }; \
 	done
 	@echo ""
 	@echo "╔══════════════════════════════════════════════════════════════╗"
-	@echo "║  WARNING: This will push policies to ALL production VMs    ║"
+	@echo "║  WARNING: This will publish policies to ALL production VMs  ║"
 	@echo "║  Changes will apply on next cinc-client run (~30 min)      ║"
 	@echo "╚══════════════════════════════════════════════════════════════╝"
 	@echo ""
@@ -93,23 +105,15 @@ promote: ## Promote staging policies to production (preflight + staging revision
 	@echo "having converged on it — confirm you have run one before answering."
 	@echo ""
 	@read -p "Type 'yes' to confirm: " confirm && [ "$$confirm" = "yes" ] || (echo "Aborted."; exit 1)
-	@for pf in $(POLICYFILES); do \
+	@$(POLICY_ENV); \
+	for pf in $(POLICYFILES); do \
 		name=$$(basename "$$pf" .rb); \
-		echo "--- Pushing $$name -> production ---"; \
-		chef push production "$$pf" -c $(KNIFE_CONFIG) \
-		  || { echo "chef push failed for $$name — production is now partially promoted"; exit 1; }; \
+		echo "--- Promoting $$name -> production ---"; \
+		../scripts/policy-publish.sh promote "$$pf" \
+		  || { echo "promoting $$name failed — production is now partially promoted"; exit 1; }; \
 	done
 	@echo ""
 	@echo "✓ Policies promoted to production"
-
-node-delete: ## Delete a node from CINC (usage: make node-delete NODE=test_vm)
-	@[ -n "$(NODE)" ] || (echo "Usage: make node-delete NODE=<name>"; exit 1)
-	@echo "Deleting node: $(NODE)"
-	@echo ""
-	-knife node delete $(NODE) -y -c $(KNIFE_CONFIG)
-	-knife client delete $(NODE) -y -c $(KNIFE_CONFIG)
-	@echo ""
-	@echo "✓ Node $(NODE) cleaned up"
 
 # `USER` is exported by every login shell and make imports the environment as
 # variables, so `$(or $(USER),admin)` resolved to the operator's own login name

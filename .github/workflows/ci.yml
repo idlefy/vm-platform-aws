@@ -45,6 +45,9 @@ jobs:
       - name: test-fetch-sync
         run: make test-fetch-sync
 
+      - name: test-policy-publish
+        run: make test-policy-publish
+
       - name: smoke
         run: make smoke
 

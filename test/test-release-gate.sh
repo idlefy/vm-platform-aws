@@ -51,7 +51,11 @@ STUB
 #!/bin/sh
 echo "fetch-sync stub"
 STUB
-  chmod +x "$WORK/test/test-skeleton-sync.sh" "$WORK/test/test-fetch-sync.sh"
+  cat > "$WORK/test/test-policy-publish.sh" <<'STUB'
+#!/bin/sh
+echo "policy-publish stub"
+STUB
+  chmod +x "$WORK/test/test-skeleton-sync.sh" "$WORK/test/test-fetch-sync.sh" "$WORK/test/test-policy-publish.sh"
   chmod +x "$WORK/scripts/boundary-check.sh" "$WORK/scripts/smoke.sh"
   cp "$ROOT/Makefile" "$WORK/Makefile"
   printf "version         '%s'\n" "${1:-0.11.0}" > "$WORK/cinc/cookbooks/base/metadata.rb"

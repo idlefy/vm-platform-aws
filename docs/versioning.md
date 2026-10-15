@@ -6,7 +6,7 @@ public history starts at `1.0.0` for both.
 | Stream | Publishes | Gated by | A tenant pins it in |
 |---|---|---|---|
 | `base-X.Y.Z` | `cinc/cookbooks/base/**` | `cookstyle`, ChefSpec, the credential-broker, Loki-token and policy-delivery tests, and `test-fetch-sync`; `metadata.rb` must say `X.Y.Z` byte for byte | `cinc/policyfiles/dev-vm.rb` — `cookbook 'base', git: …, tag: 'base-X.Y.Z'` |
-| `vX.Y.Z` | `vms/modules/**` and `tenant-skeleton/**` | `boundary-check`, `test-skeleton-sync`, `test-fetch-sync`, the skeleton smoke test | `vms/main.tf` — `?ref=<full sha>` on both module sources, with the tag in a trailing comment |
+| `vX.Y.Z` | `vms/modules/**` and `tenant-skeleton/**` | `boundary-check`, `test-skeleton-sync`, `test-fetch-sync`, the publish-to-fetch test, the skeleton smoke test | `vms/main.tf` — `?ref=<full sha>` on both module sources, with the tag in a trailing comment |
 
 The two move independently: a cookbook fix is a `base-` tag with no `v` tag,
 and a module change is the reverse. A change to a module *input* always ships
