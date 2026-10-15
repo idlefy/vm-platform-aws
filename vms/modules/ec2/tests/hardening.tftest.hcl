@@ -462,6 +462,13 @@ run "boundary_denies_writes_to_the_policy_bucket" {
         "ec2:AssociateAddress", "ec2:DisassociateAddress", "ec2:ReleaseAddress", "ec2:ModifyAddressAttribute",
         # Peers' availability.
         "ec2:SendDiagnosticInterrupt",
+        # A private zone on the fleet's VPC overrides any public name — the
+        # S3 endpoint, Loki — for every VM; Profiles and Cloud Map attach
+        # zones and resolver rules to a VPC from their own namespaces.
+        "route53:CreateHostedZone", "route53:AssociateVPCWithHostedZone",
+        "route53:CreateVPCAssociationAuthorization",
+        "route53profiles:AssociateProfile", "route53profiles:AssociateResourceToProfile",
+        "servicediscovery:CreatePrivateDnsNamespace", "servicediscovery:UpdatePrivateDnsNamespace",
         # The fleet's zone.
         "route53:ChangeResourceRecordSets", "route53:DeleteHostedZone",
         "route53:EnableHostedZoneDNSSEC", "route53:DisableHostedZoneDNSSEC",
@@ -488,6 +495,17 @@ run "boundary_denies_writes_to_the_policy_bucket" {
       ])
     ])
     error_message = "A deny wildcard matches a read-only call it was never meant to cover."
+  }
+
+  # CreateHostedZone is denied only when it names a VPC: a developer whose
+  # bundle declares route53 can still create a public zone.
+  assert {
+    condition = anytrue([
+      for st in jsondecode(aws_iam_policy.identity_boundary["vm"].policy).Statement :
+      st.Effect == "Deny" && contains(flatten([st.Action]), "route53:CreateHostedZone") &&
+      try(st.Condition.Null["route53:VPCs"], "") == "false"
+    ])
+    error_message = "CreateHostedZone must be denied for private zones only (Null route53:VPCs = false)."
   }
 
   assert {

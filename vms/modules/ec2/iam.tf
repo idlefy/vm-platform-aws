@@ -423,6 +423,16 @@ resource "aws_iam_policy" "identity_boundary" {
           "ec2:AssociateDhcpOptions",
           "ec2:*VpcEndpoint*",
           "route53resolver:*",
+          # A private hosted zone on the fleet's VPC overrides any public name
+          # — the S3 endpoint, Loki — for every VM in it. Associating one, or
+          # authorising another account to, is denied outright; creating one
+          # is denied only when it names a VPC (DenyPrivateHostedZones below).
+          # Profiles and Cloud Map attach zones and resolver rules to a VPC
+          # from namespaces of their own.
+          "route53:AssociateVPCWithHostedZone",
+          "route53:CreateVPCAssociationAuthorization",
+          "route53profiles:*",
+          "servicediscovery:*PrivateDnsNamespace",
           # IMDS switched off on a peer takes its bootstrap role, so it never
           # fetches policy again; the same calls can weaken IMDSv2.
           "ec2:*InstanceMetadata*",
@@ -439,6 +449,15 @@ resource "aws_iam_policy" "identity_boundary" {
           "ec2:SendDiagnosticInterrupt",
         ]
         Resource = "*"
+      },
+      # Private zones only: a developer whose bundle declares route53 can still
+      # create a public one.
+      {
+        Sid       = "DenyPrivateHostedZones"
+        Effect    = "Deny"
+        Action    = ["route53:CreateHostedZone"]
+        Resource  = "*"
+        Condition = { Null = { "route53:VPCs" = "false" } }
       },
       # The fleet's zone, and only that zone: a developer whose bundle
       # declares route53 for some other zone keeps it. Records point peers'
