@@ -257,7 +257,8 @@ resource "aws_iam_instance_profile" "bootstrap" {
 #       Signing means a bucket writer cannot change WHAT a VM converges to.
 #       It can still stop updates or delete history: overwrite or delete an
 #       envelope, lock or expire objects so the next push fails, rewrite the
-#       bucket's policy, or re-encrypt it with a key the operator cannot use.
+#       bucket's policy, re-encrypt it with a key the operator cannot use,
+#       turn on requester-pays, or tier objects into an archive class.
 #       Object actions are scoped to <bucket>/<prefix>/*, bucket configuration
 #       to the bucket — a developer's own S3 elsewhere is untouched. Access
 #       points get their own entries because S3 authorises a request made
@@ -404,6 +405,19 @@ resource "aws_iam_policy" "identity_boundary" {
           "ec2:DeleteInternetGateway",
           "ec2:AssociateRouteTable",
           "ec2:DeleteNatGateway",
+          # One call each black-holes the subnet's S3 and Loki without touching
+          # a route or an ACL: DNS switched off for the VPC, the VPC's DHCP
+          # options pointed at other resolvers, a gateway endpoint (it adds its
+          # own routes, no ec2:CreateRoute needed) whose policy denies the
+          # policy bucket, and Resolver rules that drop or redirect the
+          # lookups. Found by a security review of this list; tenth instance of
+          # the multi-call-path omission.
+          "ec2:ModifyVpcAttribute",
+          "ec2:AssociateDhcpOptions",
+          "ec2:CreateVpcEndpoint",
+          "ec2:ModifyVpcEndpoint",
+          "route53resolver:AssociateFirewallRuleGroup",
+          "route53resolver:AssociateResolverRule",
         ]
         Resource = "*"
       },
@@ -442,6 +456,12 @@ resource "aws_iam_policy" "identity_boundary" {
           "s3:PutBucketObjectLockConfiguration",
           "s3:PutEncryptionConfiguration",
           "s3:DeleteBucket",
+          # Requester-pays makes every VM's GET fail; an archive tier makes the
+          # objects unreadable until restored; tags can be what the bucket
+          # policy's conditions read.
+          "s3:PutBucketRequestPayment",
+          "s3:PutIntelligentTieringConfiguration",
+          "s3:PutBucketTagging",
         ]
         Resource = "arn:aws:s3:::${var.policy_bucket}"
       },
@@ -456,6 +476,8 @@ resource "aws_iam_policy" "identity_boundary" {
           "s3:PutAccessPointPolicy",
           "s3:CreateMultiRegionAccessPoint",
           "s3:PutMultiRegionAccessPointPolicy",
+          "s3:CreateAccessPointForObjectLambda",
+          "s3:PutAccessPointPolicyForObjectLambda",
           "s3:CreateAccessGrantsInstance",
           "s3:CreateAccessGrantsLocation",
           "s3:CreateAccessGrant",

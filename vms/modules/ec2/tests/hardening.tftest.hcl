@@ -404,6 +404,25 @@ run "kms_bucket_adds_decrypt_and_key_denies" {
 run "boundary_denies_writes_to_the_policy_bucket" {
   command = plan
 
+  # Found by a security review of the first version of this list. Each is one
+  # call that stops every VM reading the bucket: requester-pays makes their
+  # GETs fail, an archive tier makes objects unreadable, and a DNS, DHCP or
+  # VPC-endpoint change black-holes S3 (and Loki) for the whole subnet —
+  # a gateway endpoint adds its routes without ec2:CreateRoute. Tenth instance
+  # of the multi-call-path omission.
+  assert {
+    condition = alltrue([
+      for action in [
+        "s3:PutBucketRequestPayment", "s3:PutIntelligentTieringConfiguration", "s3:PutBucketTagging",
+        "s3:CreateAccessPointForObjectLambda", "s3:PutAccessPointPolicyForObjectLambda",
+        "ec2:ModifyVpcAttribute", "ec2:AssociateDhcpOptions",
+        "ec2:CreateVpcEndpoint", "ec2:ModifyVpcEndpoint",
+        "route53resolver:AssociateFirewallRuleGroup", "route53resolver:AssociateResolverRule",
+      ] : strcontains(aws_iam_policy.identity_boundary["vm"].policy, "\"${action}\"")
+    ])
+    error_message = "The boundary must deny the one-call routes that freeze policy delivery fleet-wide."
+  }
+
   assert {
     condition = alltrue([
       for action in [
