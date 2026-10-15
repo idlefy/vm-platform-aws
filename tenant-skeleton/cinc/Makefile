@@ -77,8 +77,10 @@ push: ## Publish policies to staging (pin-check + install from lock + signed env
 # deployed config", were rules an operator could simply not follow:
 # nothing stopped a policyfile edit, a skipped `make push`, and a promote of
 # content staging never carried. So promote refuses unless the staging envelope
-# verifies and names the revision_id in the committed lock — checked for every
-# policy (`policy-publish.sh staged`) before the prompt, and again by each write.
+# verifies, names the revision_id in the committed lock, and points at an
+# archive that holds what that lock exports — checked for every policy
+# (`policy-publish.sh staged`, after `chef install` so the export can run)
+# before the prompt, and again by each write.
 #
 # It does NOT prove a VM converged — no command can — so the confirmation prompt
 # stays, and the text below says what the check did and did not establish.
@@ -92,6 +94,8 @@ promote: ## Promote staging policies to production (preflight + staging revision
 	@$(MAKE) -C .. pin-check
 	@$(POLICY_ENV); \
 	for pf in $(POLICYFILES); do \
+		( cd $(POLICYFILES_DIR) && FILTER_BRANCH_SQUELCH_WARNING=1 chef install "$$(basename $$pf)" >/dev/null ) \
+		  || { echo "chef install failed for $$(basename $$pf .rb) — not promoting"; exit 1; }; \
 		../scripts/policy-publish.sh staged "$$pf" \
 		  || { echo "  Run 'make push' and verify a staging VM converges before promoting."; exit 1; }; \
 	done
