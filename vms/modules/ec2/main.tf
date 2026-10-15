@@ -92,7 +92,9 @@ resource "aws_instance" "this" {
   associate_public_ip_address = true
   vpc_security_group_ids      = [aws_security_group.ec2.id]
 
-  user_data_base64 = base64encode(local.user_data_script)
+  # gzip: the plain script carries dev-vm-policy-fetch and no longer fits
+  # EC2's 16 KB user-data limit. cloud-init decompresses it.
+  user_data_base64 = base64gzip(local.user_data_script)
 
   metadata_options {
     http_endpoint               = "enabled"
@@ -130,12 +132,12 @@ resource "aws_instance" "this" {
   depends_on = [
     aws_ssm_parameter.access,
     aws_iam_role.identity,
-    # The inline policy is what actually grants the ssm:GetParameter the first
+    # The inline policy is what actually grants the s3:GetObject the first
     # boot performs (iam.tf, aws_iam_role_policy.bootstrap). Without it the
     # policy and the instance are unordered siblings, and a boot that beats the
-    # policy write dies at the validator-key fetch under set -e and never
-    # self-heals. This orders CREATION; IAM propagation delay after the write
-    # survives it — the race shrinks, it does not vanish.
+    # policy write finds nothing to converge and fails closed. This orders
+    # CREATION; IAM propagation delay after the write survives it — the race
+    # shrinks, it does not vanish, which is why user_data retries exit 14.
     aws_iam_role_policy.bootstrap,
   ]
 
@@ -146,8 +148,9 @@ resource "aws_instance" "this" {
     # would still stop/start every running VM in the region to rewrite the
     # attribute — a fleet-wide hard reboot that achieves nothing. Script
     # changes (CINC_VERSION bumps included — cinc_client.rb calls this pin the
-    # "bootstrap floor") reach new instances only; to re-bootstrap an existing
-    # VM, recreate it deliberately.
+    # "bootstrap floor"; policy_* inputs too) reach new instances only; a
+    # running VM's dev-vm-policy-fetch is kept current by the cookbook, and to
+    # re-bootstrap one, recreate it deliberately.
     ignore_changes = [ami, user_data_base64]
   }
 }

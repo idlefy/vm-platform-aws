@@ -75,12 +75,18 @@ module "ec2" {
 
   security_group_rules    = local.shared_security_group_rules
   route53_zone_id         = var.route53_zone_id
-  cinc_ssm_parameter_name = var.cinc_ssm_parameter_name
   loki_ssm_parameter_name = var.loki_ssm_parameter_name
   log_shipping            = var.log_shipping
   idlefy_managed          = var.idlefy_managed
-  cinc_server_url         = var.cinc_server_url
   access_bundles          = var.access_bundles
+
+  policy_bucket        = var.policy_bucket
+  policy_bucket_owner  = var.policy_bucket_owner
+  policy_bucket_region = var.policy_bucket_region
+  policy_prefix        = var.policy_prefix
+  policy_kms_key_arn   = var.policy_kms_key_arn
+  policy_signers       = var.policy_signers
+  policy_min_serial    = var.policy_min_serial
 
   ami_name_pattern = var.ami_name_pattern
   ami_owners       = var.ami_owners
@@ -124,19 +130,18 @@ resource "terraform_data" "assert_no_orphan_region_keys" {
 #
 # What breaks is not Terraform. IAM role names carry the region, so they do not
 # collide, and each VM gets its own instance — the plan looks entirely
-# reasonable. The collision is downstream: user_data writes
-# `node_name "$INSTANCE_NAME"` from the unqualified Name tag, so two same-named
-# VMs register as ONE CINC node and overwrite each other's attributes every 30
-# minutes. `make node-delete NODE=<name>` cannot say which one it means, and
-# outputs.instance_ids merges the regional maps, so one of the two silently
-# disappears from every consumer that resolves a VM by name.
+# reasonable. The collision is downstream: the unqualified Name tag becomes the
+# VM's node_name, and node_name is the Loki `instance` label — two same-named
+# VMs ship into one stream, and every alert grouped by instance treats them as
+# one machine. outputs.instance_ids merges the regional maps too, so one of the
+# two silently disappears from every consumer that resolves a VM by name.
 resource "terraform_data" "assert_no_duplicate_vm_names" {
   input = module.fleet_guards.duplicate_vm_names
 
   lifecycle {
     precondition {
       condition     = length(module.fleet_guards.duplicate_vm_names) == 0
-      error_message = "VM names must be unique across every region, and these appear more than once: ${join(", ", module.fleet_guards.duplicate_vm_names)}. The name becomes the CINC node_name, which is not region-qualified, so both VMs would share one node object and overwrite each other's attributes on every converge. Rename one of them."
+      error_message = "VM names must be unique across every region, and these appear more than once: ${join(", ", module.fleet_guards.duplicate_vm_names)}. The name becomes the node_name and the Loki instance label, neither region-qualified, so both VMs would ship logs and raise alerts as one machine. Rename one of them."
     }
   }
 }

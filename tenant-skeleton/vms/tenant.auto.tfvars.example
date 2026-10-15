@@ -10,11 +10,26 @@
 aws_profile     = "your-aws-cli-profile"
 route53_zone_id = "Z01234567ABCDEFGHIJKL"
 
-# SSM parameter prefix is your call. Convention: /<scope>/<service>/<key>.
-# The tenant-setup skill derives /developer-vms/cinc/<org-slug>-validator-key,
-# which is the same convention with the org in the name — use either, as long as
-# the SecureString you create in each region carries exactly this string.
-cinc_ssm_parameter_name = "/developer-vms/cinc/validator-key"
+# Policy delivery. There is no CINC server: `cd cinc && make push` exports
+# each policy, signs a manifest with your SSH key and writes both to a bucket
+# you own; every VM fetches, verifies and converges from it. Any bucket works —
+# same account or another one, SSE-S3 or SSE-KMS. The runbook has the bucket
+# policy a cross-account bucket needs. A dedicated bucket is recommended.
+policy_bucket        = "your-org-dev-vm-policies"
+policy_bucket_owner  = "123456789012"
+policy_bucket_region = "eu-central-1"
+# policy_prefix      = "dev-vm-policies"
+# policy_kms_key_arn = "arn:aws:kms:eu-central-1:123456789012:key/..."
+
+# The keys new VMs trust, one allowed_signers line per operator. Twin of
+# `default['base']['policy']['signers']` in cinc/policyfiles/dev-vm.rb —
+# `cd cinc && make preflight` fails if they disagree. Give CI only the staging
+# namespace, so it can never publish to production.
+policy_signers = [
+  "you@example.com namespaces=\"dev-vm-policy-staging,dev-vm-policy-production\" ssh-ed25519 AAAA...",
+]
+# Raise to a security fix's serial so no VM, new or running, accepts anything older.
+# policy_min_serial = 0
 
 # Log shipping to Grafana Cloud Loki. This flag and
 # `default['base']['loki']['enabled']` in cinc/policyfiles/dev-vm.rb are ONE
@@ -30,7 +45,3 @@ loki_ssm_parameter_name = "/developer-vms/observability/loki-token"
 # To opt a single VM out instead, give it `tags = { idlefy = "disabled" }` in
 # instances.auto.tfvars.
 idlefy_managed = true
-
-# Full CINC server URL including the org path.
-# org = "Chef organization" — see infra/ansible/roles/cinc-server/defaults/main.yml.
-cinc_server_url = "https://cinc.infra.example.com/organizations/your-org"

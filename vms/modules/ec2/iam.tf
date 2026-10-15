@@ -2,8 +2,10 @@ data "aws_caller_identity" "current" {}
 
 # Two roles per VM.
 #
-#   dev-vm-boot-<vm>-<region>  attached to the instance; reads the three bootstrap
-#                              secrets and may assume this VM's identity role.
+#   dev-vm-boot-<vm>-<region>  attached to the instance; reads the bootstrap
+#                              secrets (the Loki token, this VM's access
+#                              config), reads its own policy's envelopes and
+#                              archives, and may assume this VM's identity role.
 #                              Reachable only by root — imds.rb blocks IMDS for
 #                              every other uid.
 #
@@ -79,16 +81,26 @@ resource "aws_iam_role_policy" "bootstrap" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
+    Statement = concat([
       {
         Sid    = "ReadBootstrapSecretsAndOwnAccessConfig"
         Effect = "Allow"
         Action = ["ssm:GetParameter"]
         Resource = compact([
-          "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${var.cinc_ssm_parameter_name}",
           "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter/developer-vms/access/${each.key}",
           var.log_shipping ? local.loki_parameter_arn : "",
         ])
+      },
+      # Exact-key reads of this VM's own policy: its group envelopes and the
+      # archives they name. No s3:ListBucket — dev-vm-policy-fetch never lists,
+      # so a missing object reads as AccessDenied and the script says "missing
+      # or denied". policy_name is validated in variables.tf: a `*` in it
+      # would widen this to other policies.
+      {
+        Sid      = "ReadOwnPolicy"
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = ["arn:aws:s3:::${var.policy_bucket}/${var.policy_prefix}/${each.value.policy_name}/*"]
       },
       {
         Sid      = "AssumeOwnIdentityRole"
@@ -96,7 +108,15 @@ resource "aws_iam_role_policy" "bootstrap" {
         Action   = ["sts:AssumeRole", "sts:SetSourceIdentity"]
         Resource = [aws_iam_role.identity[each.key].arn]
       },
-    ]
+      ],
+      # SSE-KMS only. The key policy must allow it as well; IAM alone does not.
+      var.policy_kms_key_arn == null ? [] : [{
+        Sid      = "DecryptPolicyObjects"
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt"]
+        Resource = [var.policy_kms_key_arn]
+      }],
+    )
   })
 }
 
@@ -151,8 +171,9 @@ resource "aws_iam_instance_profile" "bootstrap" {
 #       do not restore it.
 #
 # Every entry in the deny list is a path from "developer holds identity-role
-# credentials" to either root on the VM or the three fleet-scoped bootstrap
-# secrets. They are not stylistic preferences; removing one re-opens a specific
+# credentials" to either root on the VM, the fleet-scoped bootstrap secrets
+# (the Loki token, peers' access config), or the policy bucket every VM
+# converges from. They are not stylistic preferences; removing one re-opens a specific
 # attack.
 #
 #   iam:*, organizations:*
@@ -166,7 +187,7 @@ resource "aws_iam_instance_profile" "bootstrap" {
 #   ssm:GetParameter*
 #       Wildcard, not an enumeration. It must cover GetParameterHistory, which
 #       returns each historical Value and honours --with-decryption — i.e. it
-#       reads the CINC validator key just as well as GetParameter does. A bundle
+#       reads the Loki token just as well as GetParameter does. A bundle
 #       carrying a routine "ssm:Get*" for app config would otherwise defeat the
 #       whole control.
 #
@@ -177,8 +198,8 @@ resource "aws_iam_instance_profile" "bootstrap" {
 #       with no PassRole and nothing for iam:* to catch.
 #
 #   ec2:RunInstances
-#       Launch an instance carrying a bootstrap instance profile and read both
-#       secrets as root on a machine the developer fully controls.
+#       Launch an instance carrying a bootstrap instance profile and read the
+#       bootstrap secrets as root on a machine the developer fully controls.
 #
 #   ec2:ModifyInstanceAttribute
 #       Cheaper than RunInstances and needs no PassRole: rewrite the user data of
@@ -196,7 +217,7 @@ resource "aws_iam_instance_profile" "bootstrap" {
 #       The short way to the same disk the snapshot entries below protect. A root
 #       volume can be detached once its instance is stopped, so: stop the victim,
 #       detach its root volume, attach it to a machine the developer already
-#       controls, mount it, read both secrets. Three calls, no snapshot, no
+#       controls, mount it, read the secrets. Three calls, no snapshot, no
 #       PassRole — which is why denying the snapshot chain alone was not enough.
 #       All three are needed, not just StopInstances: an instance that is already
 #       stopped skips the first step entirely.
@@ -215,7 +236,7 @@ resource "aws_iam_instance_profile" "bootstrap" {
 #   ec2:CreateSnapshot, ec2:CreateSnapshots, ec2:CopySnapshot,
 #   ec2:ModifySnapshotAttribute, ec2:CreateVolume
 #       Snapshot or copy the root volume, share it, mount it elsewhere, read
-#       /etc/cinc/client.pem and /etc/alloy/loki-token directly off disk.
+#       /etc/alloy/loki-token directly off disk.
 #
 #   ssm:StartSession, ssm:SendCommand, ssm:StartAutomationExecution,
 #   ssm:CreateAssociation, ssm:UpdateAssociation
@@ -226,12 +247,27 @@ resource "aws_iam_instance_profile" "bootstrap" {
 #       a property of a policy that can change, not of this boundary.
 #
 #   ssm:PutParameter, ssm:DeleteParameter*
-#       Integrity, not confidentiality: overwriting the validator-key parameter
-#       does not reveal it but breaks enrolment for every VM created afterwards.
-#       A second, distinct reason this deny matters: the same action also
-#       reaches the Loki token parameter, and overwriting that one does not
-#       break enrolment at all — it silently stops log shipping fleet-wide,
+#       Integrity, not confidentiality: overwriting the Loki token parameter
+#       does not reveal it, but it silently stops log shipping fleet-wide,
 #       since nothing re-fetches the old value and nothing alerts on a write.
+#       Overwriting a peer's /developer-vms/access/<vm> parameter rewrites what
+#       that VM's credential broker hands its developer.
+#
+#   The policy bucket (statements DenyPolicy* below)
+#       Signing means a bucket writer cannot change WHAT a VM converges to.
+#       It can still stop updates or delete history: overwrite or delete an
+#       envelope, lock or expire objects so the next push fails, rewrite the
+#       bucket's policy, or re-encrypt it with a key the operator cannot use.
+#       Object actions are scoped to <bucket>/<prefix>/*, bucket configuration
+#       to the bucket — a developer's own S3 elsewhere is untouched. Access
+#       points get their own entries because S3 authorises a request made
+#       through one against the ACCESS POINT's ARN, which a deny on the bucket
+#       ARN never matches; those are denied on "*". Known gaps, closed only by
+#       the bucket's own policy (see the runbook): writes through access points
+#       that already exist, and replication into the bucket —
+#       PutReplicationConfiguration is checked on the SOURCE bucket, and
+#       ReplicateObject on the replication role, not this one. Ninth instance
+#       of the multi-call-path omission; enumerated 2026-10-15.
 #
 # A boundary constrains permissions but not a role's trust policy. That is fine
 # here: the identity role trusts only its own bootstrap role.
@@ -248,7 +284,7 @@ resource "aws_iam_policy" "identity_boundary" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
+    Statement = concat([
       {
         Sid      = "AllowOnlyDeclaredNamespaces"
         Effect   = "Allow"
@@ -371,7 +407,81 @@ resource "aws_iam_policy" "identity_boundary" {
         ]
         Resource = "*"
       },
-    ]
+      # The policy bucket. See "The policy bucket" in the deny-list notes above.
+      {
+        Sid    = "DenyPolicyObjectWrites"
+        Effect = "Deny"
+        Action = [
+          # CopyObject and multipart uploads authorise as PutObject.
+          "s3:PutObject",
+          "s3:DeleteObject",
+          "s3:DeleteObjectVersion",
+          "s3:PutObjectRetention",
+          "s3:PutObjectLegalHold",
+          "s3:BypassGovernanceRetention",
+          "s3:PutObjectAcl",
+          "s3:PutObjectVersionAcl",
+          "s3:PutObjectTagging",
+          "s3:PutObjectVersionTagging",
+          "s3:DeleteObjectTagging",
+          "s3:DeleteObjectVersionTagging",
+        ]
+        Resource = "arn:aws:s3:::${var.policy_bucket}/${var.policy_prefix}/*"
+      },
+      {
+        Sid    = "DenyPolicyBucketConfiguration"
+        Effect = "Deny"
+        Action = [
+          "s3:PutBucketPolicy",
+          "s3:DeleteBucketPolicy",
+          "s3:PutBucketAcl",
+          "s3:PutBucketOwnershipControls",
+          "s3:PutBucketPublicAccessBlock",
+          "s3:PutLifecycleConfiguration",
+          "s3:PutBucketVersioning",
+          "s3:PutBucketObjectLockConfiguration",
+          "s3:PutEncryptionConfiguration",
+          "s3:DeleteBucket",
+        ]
+        Resource = "arn:aws:s3:::${var.policy_bucket}"
+      },
+      {
+        # Access points are authorised on their own ARN, never on the bucket's,
+        # so these cannot be scoped to the policy bucket. Batch Operations needs
+        # iam:PassRole, which iam:* denies; listed so it survives a narrowing.
+        Sid    = "DenyNewRoutesIntoS3"
+        Effect = "Deny"
+        Action = [
+          "s3:CreateAccessPoint",
+          "s3:PutAccessPointPolicy",
+          "s3:CreateMultiRegionAccessPoint",
+          "s3:PutMultiRegionAccessPointPolicy",
+          "s3:CreateAccessGrantsInstance",
+          "s3:CreateAccessGrantsLocation",
+          "s3:CreateAccessGrant",
+          "s3:CreateJob",
+        ]
+        Resource = "*"
+      },
+      ],
+      # Without the key the VMs cannot decrypt, and every converge fails.
+      var.policy_kms_key_arn == null ? [] : [{
+        Sid    = "DenyPolicyKeyTampering"
+        Effect = "Deny"
+        Action = [
+          "kms:ScheduleKeyDeletion",
+          "kms:DisableKey",
+          "kms:PutKeyPolicy",
+          "kms:CreateGrant",
+          "kms:RevokeGrant",
+          "kms:DeleteImportedKeyMaterial",
+          "kms:UpdateAlias",
+          "kms:TagResource",
+          "kms:UntagResource",
+        ]
+        Resource = var.policy_kms_key_arn
+      }],
+    )
   })
 
   tags = local.default_tags

@@ -41,10 +41,10 @@ variable "instances" {
   }))
   default = {}
 
-  # Only the two groups the CINC server actually carries. A typo here would
-  # otherwise produce a VM whose client.rb names a group that does not exist,
-  # and the failure surfaces as a VM that never converges — three minutes after
-  # apply reported success, with nothing in the plan to suggest it.
+  # Only the two groups the bucket carries envelopes for. user_data refuses
+  # any other PolicyGroup tag at first boot (fail closed), so a typo here would
+  # otherwise surface as a VM that never bootstraps — minutes after apply
+  # reported success, with nothing in the plan to suggest it.
   validation {
     condition = alltrue([
       for _, vm in var.instances : contains(["staging", "production"], vm.policy_group)
@@ -57,6 +57,16 @@ variable "instances" {
       for name, _ in var.instances : can(regex("^[a-z][a-z0-9-]{1,33}$", name))
     ])
     error_message = "VM names must be 2-34 chars, lowercase letters/digits/hyphen, starting with a letter. This keeps 'dev-vm-boot-<name>-<region>' within IAM's 64-char role-name limit and within the sts:SourceIdentity character set."
+  }
+
+  # policy_name is interpolated into the bootstrap grant's S3 resource ARN and
+  # into the keys the VM fetches. A `*` or `?` would widen the grant to other
+  # policies' envelopes; anything outside this shape is refused at first boot.
+  validation {
+    condition = alltrue([
+      for _, vm in var.instances : can(regex("^[a-z0-9][a-z0-9-]{0,62}$", vm.policy_name))
+    ])
+    error_message = "policy_name must be 1-63 chars of lowercase letters, digits and hyphens, starting with a letter or digit."
   }
 }
 
@@ -147,22 +157,99 @@ variable "route53_zone_id" {
   type        = string
 }
 
-variable "cinc_ssm_parameter_name" {
-  description = "SSM parameter name containing CINC validation key"
+# ---- policy delivery ------------------------------------------------------------
+# There is no CINC server. Each VM fetches a signed envelope and a
+# `chef export --archive` tarball from a bucket the tenant owns, and converges
+# in local mode. Design: docs/design/serverless-policy-delivery.md.
+
+variable "policy_bucket" {
+  description = "Name of the tenant-owned S3 bucket the policy archives and signed envelopes live in. The module never creates it."
   type        = string
 
-  # modules/ec2/iam.tf builds the grant by concatenation:
-  # "arn:aws:ssm:<region>:<account>:parameter${var.cinc_ssm_parameter_name}".
-  # Without the leading slash that yields ":parameterdeveloper-vms/..." — a
-  # syntactically valid ARN matching no parameter. The plan applies, the policy
-  # attaches, and the VM then fails at first boot with an AccessDenied on a name
-  # that looks correct in the console.
-  # The regex, not startswith(): "/" on its own also starts with a slash, and SSM
-  # has no parameter at the bare root, so that value would pass the check and then
-  # fail exactly the way a missing slash does.
   validation {
-    condition     = can(regex("^/.+", var.cinc_ssm_parameter_name))
-    error_message = "cinc_ssm_parameter_name must start with \"/\" and name something after it (e.g. \"/developer-vms/cinc/myorg-validator-key\"). The IAM grant concatenates this onto \":parameter\", so a missing slash produces a policy that matches nothing and a VM that cannot bootstrap."
+    condition     = can(regex("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$", var.policy_bucket))
+    error_message = "policy_bucket must be an S3 bucket name: 3-63 characters, lowercase letters, digits, dots and hyphens."
+  }
+}
+
+variable "policy_bucket_owner" {
+  description = "12-digit ID of the account that owns policy_bucket. Every fetch passes it as --expected-bucket-owner, so a bucket deleted and re-created under the same name in another account is refused by S3."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[0-9]{12}$", var.policy_bucket_owner))
+    error_message = "policy_bucket_owner must be a 12-digit AWS account ID."
+  }
+}
+
+variable "policy_bucket_region" {
+  description = "Region of policy_bucket. It may differ from aws_region; one bucket serves every region of the fleet."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[a-z]{2}(-[a-z]+)+-[0-9]+$", var.policy_bucket_region))
+    error_message = "policy_bucket_region must be an AWS region name such as \"eu-central-1\"."
+  }
+}
+
+variable "policy_prefix" {
+  description = "Key prefix inside policy_bucket under which <policy_name>/ lives. No leading or trailing slash."
+  type        = string
+  default     = "dev-vm-policies"
+
+  # It is interpolated into the bootstrap grant's resource ARN and into every
+  # S3 key the VM fetches. `*` or `?` would widen the grant; a leading or
+  # trailing slash would make keys that match nothing.
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_-][A-Za-z0-9._-]*(/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$", var.policy_prefix))
+    error_message = "policy_prefix must be one or more path segments of letters, digits, '.', '_' and '-', separated by single slashes, with no leading or trailing slash."
+  }
+}
+
+variable "policy_kms_key_arn" {
+  description = "ARN of the KMS key policy_bucket encrypts with, if it uses SSE-KMS. null for SSE-S3. When set, the bootstrap role gets kms:Decrypt on it; the key policy must allow that too."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.policy_kms_key_arn == null || can(regex("^arn:aws[a-z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[A-Za-z0-9-]+$", var.policy_kms_key_arn))
+    error_message = "policy_kms_key_arn must be a KMS key ARN (arn:aws:kms:<region>:<account>:key/<id>) or null. An alias ARN is refused: the grant would follow whatever key the alias is pointed at later."
+  }
+}
+
+variable "policy_signers" {
+  description = <<-EOT
+    The keys a VM trusts at first boot, one allowed_signers line each:
+      <principal> namespaces="dev-vm-policy-staging[,dev-vm-policy-production]"[,valid-before="YYYYMMDD"] ssh-ed25519 <key>
+    After first boot the cookbook attribute base.policy.signers governs; the two
+    are twins and `make preflight` checks that they agree.
+  EOT
+  type        = list(string)
+
+  # The same shape base::cinc_client (libraries/policy_signers.rb) enforces.
+  # namespaces= is mandatory — without it a staging-only key signs production —
+  # and cert-authority lines are refused, since they would trust every key a CA
+  # ever signed. The lines are written verbatim into a quoted heredoc at first
+  # boot, so the shape is also what keeps them from carrying anything else.
+  validation {
+    condition = length(var.policy_signers) > 0 && alltrue([
+      for l in var.policy_signers : can(regex(
+        "^[A-Za-z0-9._@-]+ namespaces=\"dev-vm-policy-(staging|production)(,dev-vm-policy-(staging|production))?\"(,valid-before=\"[0-9]{8}([0-9]{4}([0-9]{2})?)?Z?\")? (ssh-ed25519|sk-ssh-ed25519@openssh\\.com) [A-Za-z0-9+/]+={0,2}$",
+        l
+      ))
+    ])
+    error_message = "policy_signers must hold at least one line of the form <principal> namespaces=\"dev-vm-policy-staging[,dev-vm-policy-production]\" ssh-ed25519 <key>. cert-authority lines and lines without namespaces= are refused."
+  }
+}
+
+variable "policy_min_serial" {
+  description = "The lowest envelope serial any VM accepts, first boot included. A new VM has no history to compare against; raise this to a security fix's serial so nothing older converges anywhere."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.policy_min_serial >= 0 && floor(var.policy_min_serial) == var.policy_min_serial && var.policy_min_serial < 1000000000000
+    error_message = "policy_min_serial must be a whole number of Unix seconds, 0 or more."
   }
 }
 
@@ -177,9 +264,11 @@ variable "loki_ssm_parameter_name" {
   type        = string
   default     = null
 
-  # Same concatenation as cinc_ssm_parameter_name, same silent failure, one
-  # stage later: the VM boots and converges, dev-vm-loki-token exits 10 because
-  # the fetch is denied, and the node ships no logs while reporting healthy.
+  # modules/ec2/iam.tf builds the grant by concatenation:
+  # "arn:aws:ssm:<region>:<account>:parameter${var.loki_ssm_parameter_name}".
+  # Without the leading slash that is a valid ARN matching no parameter: the VM
+  # boots and converges, dev-vm-loki-token exits 10 because the fetch is
+  # denied, and the node ships no logs while reporting healthy.
   # `make preflight` catches this against the live account; this catches it at
   # plan time. Same regex-not-startswith reason: a bare "/" is not a parameter.
   # null is allowed here and judged in iam.tf against log_shipping — a
@@ -204,11 +293,6 @@ variable "idlefy_managed" {
   EOT
   type        = bool
   default     = true
-}
-
-variable "cinc_server_url" {
-  description = "CINC server URL including organization"
-  type        = string
 }
 
 

@@ -19,11 +19,17 @@ mock_provider "aws" {}
 variables {
   aws_profile             = "test-profile"
   route53_zone_id         = "Z00000000000000000TEST"
-  cinc_ssm_parameter_name = "/test/cinc-validator"
   log_shipping            = true
   loki_ssm_parameter_name = "/test/loki-token"
   idlefy_managed          = true
-  cinc_server_url         = "https://cinc.test.invalid/organizations/test"
+
+  policy_bucket        = "tenant-policies"
+  policy_bucket_owner  = "123456789012"
+  policy_bucket_region = "eu-central-1"
+  policy_prefix        = "dev-vm-policies"
+  policy_kms_key_arn   = null
+  policy_signers       = ["ops namespaces=\"dev-vm-policy-production\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMkEu+CUWYGvccB0PoBw6SX1d6kJOSy2vALB7cAntO+E"]
+  policy_min_serial    = 0
 
   instances      = {}
   ssh_key_pairs  = {}
