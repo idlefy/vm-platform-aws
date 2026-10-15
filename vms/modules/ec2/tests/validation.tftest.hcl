@@ -205,6 +205,34 @@ run "route53_family_without_the_flag_is_rejected" {
   expect_failures = [var.access_bundles]
 }
 
+# IAM matches service prefixes case-insensitively and expands wildcards in
+# them, so "EC2:*" or "e*2:*" means ec2 to AWS. The two namespace lists compare
+# exact strings and stay complete only because the shape validation refuses
+# both spellings. These pin that.
+run "an_uppercase_prefix_cannot_dodge_the_flag" {
+  command = plan
+  variables {
+    access_bundles = { "b" = { description = "ip", allowed_actions = ["EC2:AssociateAddress"] } }
+  }
+  expect_failures = [var.access_bundles]
+}
+
+run "a_wildcard_prefix_cannot_dodge_the_flag" {
+  command = plan
+  variables {
+    access_bundles = { "b" = { description = "media", allowed_actions = ["s*:GetObject"] } }
+  }
+  expect_failures = [var.access_bundles]
+}
+
+run "an_uppercase_prefix_cannot_dodge_the_iam_refusal" {
+  command = plan
+  variables {
+    access_bundles = { "b" = { description = "roles", allowed_actions = ["IAM:PassRole"] } }
+  }
+  expect_failures = [var.access_bundles]
+}
+
 run "s3_with_the_flag_plans" {
   command = plan
   variables {

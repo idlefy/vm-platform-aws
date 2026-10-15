@@ -112,6 +112,9 @@ variable "access_bundles" {
     error_message = "allowed_actions must not contain the literal \"*\". That turns the permissions boundary back into an open ceiling, which is precisely what it exists to prevent. List the service namespaces the bundle needs, e.g. [\"s3:*\", \"logs:*\"]."
   }
 
+  # The prefix must be a lowercase literal. IAM matches prefixes
+  # case-insensitively and expands wildcards in them, and both namespace lists
+  # below compare exact strings: "IAM:PassRole" or "e*2:*" would pass them.
   validation {
     condition = alltrue([
       for _, b in var.access_bundles : alltrue([
