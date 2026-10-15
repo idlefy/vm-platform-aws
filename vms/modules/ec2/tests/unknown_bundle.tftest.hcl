@@ -53,9 +53,10 @@ run "unknown_bundle_name_stops_the_plan" {
     }
     access_bundles = {
       "s3-media-dev" = {
-        description     = "correctly spelled"
-        policy_arns     = []
-        allowed_actions = ["s3:*"]
+        description           = "correctly spelled"
+        policy_arns           = []
+        allowed_actions       = ["s3:*"]
+        infrastructure_access = true
       }
     }
   }
@@ -81,9 +82,10 @@ run "correctly_spelled_bundle_plans" {
     }
     access_bundles = {
       "s3-media-dev" = {
-        description     = "correctly spelled"
-        policy_arns     = ["arn:aws:iam::111122223333:policy/s3-media-dev"]
-        allowed_actions = ["s3:*"]
+        description           = "correctly spelled"
+        policy_arns           = ["arn:aws:iam::111122223333:policy/s3-media-dev"]
+        allowed_actions       = ["s3:*"]
+        infrastructure_access = true
       }
     }
   }

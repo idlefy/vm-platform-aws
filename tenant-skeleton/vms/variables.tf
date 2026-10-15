@@ -84,9 +84,10 @@ variable "idlefy_managed" {
 variable "access_bundles" {
   description = "Named permission bundles referenced by instances[*].aws_access. Phase A: same-account managed policies only."
   type = map(object({
-    description     = string
-    policy_arns     = optional(list(string), [])
-    allowed_actions = list(string)
+    description           = string
+    policy_arns           = optional(list(string), [])
+    allowed_actions       = list(string)
+    infrastructure_access = optional(bool, false)
   }))
   default = {}
 }

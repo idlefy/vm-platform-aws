@@ -497,15 +497,14 @@ run "boundary_denies_writes_to_the_policy_bucket" {
     error_message = "A deny wildcard matches a read-only call it was never meant to cover."
   }
 
-  # CreateHostedZone is denied only when it names a VPC: a developer whose
-  # bundle declares route53 can still create a public zone.
+  # Unconditionally: a deny conditioned on a key the request never carries
+  # is a no-op, and route53:VPCs on CreateHostedZone has not been verified.
   assert {
     condition = anytrue([
       for st in jsondecode(aws_iam_policy.identity_boundary["vm"].policy).Statement :
-      st.Effect == "Deny" && contains(flatten([st.Action]), "route53:CreateHostedZone") &&
-      try(st.Condition.Null["route53:VPCs"], "") == "false"
+      st.Effect == "Deny" && contains(flatten([st.Action]), "route53:CreateHostedZone") && try(st.Condition, null) == null
     ])
-    error_message = "CreateHostedZone must be denied for private zones only (Null route53:VPCs = false)."
+    error_message = "CreateHostedZone must be denied with no condition attached."
   }
 
   assert {

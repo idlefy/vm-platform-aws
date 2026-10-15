@@ -176,6 +176,49 @@ run "minimal_valid_parameter_names_plan" {
   }
 }
 
+# --- infrastructure namespaces need an explicit flag --------------------------
+# In these namespaces the boundary's deny list is the only control, and four
+# security-review passes kept finding routes it did not cover. A bundle that
+# declares one is a reviewed decision, made visible by infrastructure_access.
+
+run "s3_without_the_flag_is_rejected" {
+  command = plan
+  variables {
+    access_bundles = { "b" = { description = "media", allowed_actions = ["s3:*"] } }
+  }
+  expect_failures = [var.access_bundles]
+}
+
+run "a_single_ec2_action_without_the_flag_is_rejected" {
+  command = plan
+  variables {
+    access_bundles = { "b" = { description = "ip", allowed_actions = ["logs:*", "ec2:AssociateAddress"] } }
+  }
+  expect_failures = [var.access_bundles]
+}
+
+run "route53_family_without_the_flag_is_rejected" {
+  command = plan
+  variables {
+    access_bundles = { "b" = { description = "dns", allowed_actions = ["route53profiles:*"] } }
+  }
+  expect_failures = [var.access_bundles]
+}
+
+run "s3_with_the_flag_plans" {
+  command = plan
+  variables {
+    access_bundles = { "b" = { description = "media", allowed_actions = ["s3:*"], infrastructure_access = true } }
+  }
+}
+
+run "an_application_namespace_needs_no_flag" {
+  command = plan
+  variables {
+    access_bundles = { "b" = { description = "logs", allowed_actions = ["logs:*", "sqs:SendMessage"] } }
+  }
+}
+
 # --- policy delivery ----------------------------------------------------------
 # Each of these lands in an S3 key, an IAM resource ARN, policy.conf or the
 # signers file a VM trusts. A wrong shape is refused here rather than at first

@@ -87,9 +87,10 @@ variable "instances" {
 variable "access_bundles" {
   description = "Named permission bundles, keyed by bundle name."
   type = map(object({
-    description     = string
-    policy_arns     = optional(list(string), [])
-    allowed_actions = list(string)
+    description           = string
+    policy_arns           = optional(list(string), [])
+    allowed_actions       = list(string)
+    infrastructure_access = optional(bool, false)
   }))
   default = {}
 
@@ -132,6 +133,27 @@ variable "access_bundles" {
       ])
     ])
     error_message = "allowed_actions must not name the iam, sts, organizations or ec2-instance-connect namespaces. Each is a path from developer credentials to role manipulation or root on the VM. If a bundle genuinely needs one, that is a design discussion, not a tfvars edit."
+  }
+
+  # In these namespaces the boundary's Allow list stops nothing — the bundle
+  # declared the namespace — and the deny list in iam.tf is the only control.
+  # Four security-review passes over that list (2026-10-15) each found routes
+  # it did not cover: a peer's IMDS switched off, the VPC's DNS overridden, the
+  # policy bucket made unreadable, a region cut off. An enumeration cannot be
+  # finished, so a bundle that declares one of these is made a decision a
+  # reviewer sees: infrastructure_access = true. The deny list stays as the
+  # second layer.
+  validation {
+    condition = alltrue([
+      for _, b in var.access_bundles : b.infrastructure_access || alltrue([
+        for a in b.allowed_actions : !contains([
+          "ec2", "ebs", "s3", "s3-object-lambda", "kms", "ssm", "account",
+          "route53", "route53resolver", "route53profiles", "servicediscovery",
+          "network-firewall", "autoscaling", "batch", "imagebuilder",
+        ], split(":", a)[0])
+      ])
+    ])
+    error_message = "A bundle whose allowed_actions names ec2, ebs, s3, s3-object-lambda, kms, ssm, account, route53, route53resolver, route53profiles, servicediscovery, network-firewall, autoscaling, batch or imagebuilder must set infrastructure_access = true. In those namespaces only the boundary's deny list stands between the developer and the fleet's DNS, IMDS, network and policy bucket, and that list cannot be complete — so declaring one is a security review, not a tfvars edit."
   }
 }
 
