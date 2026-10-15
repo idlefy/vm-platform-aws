@@ -22,9 +22,10 @@ policy_bucket_region = "eu-central-1"
 # policy_kms_key_arn = "arn:aws:kms:eu-central-1:123456789012:key/..."
 
 # The keys new VMs trust, one allowed_signers line per operator. Twin of
-# `default['base']['policy']['signers']` in cinc/policyfiles/dev-vm.rb —
-# `cd cinc && make preflight` fails if they disagree. Give CI only the staging
-# namespace, so it can never publish to production.
+# `default['base']['policy']['signers']` in cinc/policyfiles/dev-vm.rb, which
+# is what converged VMs trust. `cd cinc && make preflight` warns while this
+# differs from the set production installs: a VM created then fails closed.
+# Give CI only the staging namespace, so it can never publish to production.
 policy_signers = [
   "you@example.com namespaces=\"dev-vm-policy-staging,dev-vm-policy-production\" ssh-ed25519 AAAA...",
 ]
