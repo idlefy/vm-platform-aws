@@ -21,7 +21,7 @@ current_signers = ::File.exist?(DevVm::PolicySigners::SIGNERS) ? ::File.read(Dev
 DevVm::PolicySigners.validate!(
   signers,
   current: current_signers,
-  signed_by: ENV['DEV_VM_POLICY_SIGNED_BY'].to_s,
+  signed_key: ENV['DEV_VM_POLICY_SIGNED_KEY'].to_s,
   group: ENV['DEV_VM_POLICY_GROUP'].to_s
 )
 

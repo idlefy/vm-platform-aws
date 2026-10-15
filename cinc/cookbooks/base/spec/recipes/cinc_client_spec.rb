@@ -21,6 +21,7 @@ describe 'base::cinc_client' do
   let(:signers) { [OPS_LINE] }
   let(:current_signers) { "#{OPS_LINE}\n" }
   let(:signed_by) { 'ops' }
+  let(:signed_key) { OPS_KEY }
   let(:group) { 'production' }
   let(:conf_present) { true }
 
@@ -38,6 +39,7 @@ describe 'base::cinc_client' do
     allow(::File).to receive(:read).with(SIGNERS_F).and_return(current_signers.to_s)
     allow(ENV).to receive(:[]).and_call_original
     allow(ENV).to receive(:[]).with('DEV_VM_POLICY_SIGNED_BY').and_return(signed_by)
+    allow(ENV).to receive(:[]).with('DEV_VM_POLICY_SIGNED_KEY').and_return(signed_key)
     allow(ENV).to receive(:[]).with('DEV_VM_POLICY_GROUP').and_return(group)
     stub_command(/cmp -s/).and_return(false)
   end
@@ -119,6 +121,17 @@ describe 'base::cinc_client' do
       end
     end
 
+    # A principal can hold several keys. Keeping the principal is not keeping
+    # the key that signed, and only that key is known to be in use.
+    context 'when the set keeps the principal but drops the key that signed' do
+      let(:current_signers) { "#{OPS_LINE}\n#{OPS_LINE.sub(OPS_KEY, NEW_KEY)}\n" }
+      let(:signers) { [OPS_LINE.sub(OPS_KEY, NEW_KEY)] }
+
+      it 'refuses to converge' do
+        expect { chef_run }.to raise_error(RuntimeError, /drop the key that signed/)
+      end
+    end
+
     context 'when the signer keeps its key but loses the group namespace' do
       let(:signers) { [%(ops namespaces="dev-vm-policy-staging" #{OPS_KEY})] }
 
@@ -143,6 +156,25 @@ describe 'base::cinc_client' do
       end
     end
 
+    # Fields are separated by single spaces, exactly what the Terraform
+    # validation accepts. Any other whitespace is where a Ruby regex and
+    # ssh-keygen's own tokenizer could read one line two ways.
+    context 'with a field separated by something other than one space' do
+      let(:signers) { [OPS_LINE, NEW_LINE.sub(' ssh-ed25519', "\tssh-ed25519")] }
+
+      it 'refuses it' do
+        expect { chef_run }.to raise_error(RuntimeError, /malformed signers line/)
+      end
+    end
+
+    context 'with a vertical tab between fields' do
+      let(:signers) { [OPS_LINE, NEW_LINE.sub(' namespaces', "\vnamespaces")] }
+
+      it 'refuses it' do
+        expect { chef_run }.to raise_error(RuntimeError, /malformed signers line/)
+      end
+    end
+
     context 'with a line that does not restrict namespaces' do
       let(:signers) { [OPS_LINE, "new #{NEW_KEY}"] }
 
@@ -161,6 +193,7 @@ describe 'base::cinc_client' do
 
     context 'when converging the last good revision, nothing verified this run' do
       let(:signed_by) { '' }
+      let(:signed_key) { '' }
 
       it 'keeps the set it has' do
         expect { chef_run }.to_not raise_error

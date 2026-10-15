@@ -38,7 +38,7 @@ describe 'base::default' do
     allow(::File).to receive(:read).and_call_original
     allow(::File).to receive(:read).with('/etc/dev-vm/policy-signers').and_return("#{SIGNER}\n")
     allow(ENV).to receive(:[]).and_call_original
-    allow(ENV).to receive(:[]).with('DEV_VM_POLICY_SIGNED_BY').and_return('ops')
+    allow(ENV).to receive(:[]).with('DEV_VM_POLICY_SIGNED_KEY').and_return(SIGNER.split(' ', 3).last)
     allow(ENV).to receive(:[]).with('DEV_VM_POLICY_GROUP').and_return('production')
     # base::aws_access resolves the ubuntu uid/gid via shell_out('id -u ubuntu')
     # / shell_out('id -g ubuntu') at compile time and returns early — leaving

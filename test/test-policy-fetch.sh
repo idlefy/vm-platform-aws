@@ -76,6 +76,7 @@ EOF
 printf 'ARGS %s\n' "$*" >> "$CINC_LOG"
 printf 'SIGNED_BY %s\n' "${DEV_VM_POLICY_SIGNED_BY-<unset>}" >> "$CINC_LOG"
 printf 'GROUP %s\n' "${DEV_VM_POLICY_GROUP-<unset>}" >> "$CINC_LOG"
+printf 'SIGNED_KEY %s\n' "${DEV_VM_POLICY_SIGNED_KEY-<unset>}" >> "$CINC_LOG"
 conf=
 while [ $# -gt 0 ]; do [ "$1" = "-c" ] && conf=$2; shift; done
 [ -n "$conf" ] && sed 's/^/CONF /' "$conf" >> "$CINC_LOG"
@@ -231,6 +232,9 @@ check "status says ok" "$(ok grep -q ' ok ' "$WORK/state/status")"
 # revision it is converging; this is how it learns which key that was.
 check "tells the converge who signed" "$(ok grep -qx 'SIGNED_BY ops' "$CINC_LOG")"
 check "tells the converge the group" "$(ok grep -qx 'GROUP production' "$CINC_LOG")"
+# The key, not just the principal: a principal can hold several keys, and the
+# recipe must refuse a set that drops the one that actually signed.
+check "tells the converge which key signed" "$(ok grep -qxF "SIGNED_KEY $(cut -d' ' -f1,2 "$KEYS/ops.pub")" "$CINC_LOG")"
 check "state tree is 0700" "$(ok [ "$(stat -c %a "$WORK/state")" = 700 ])"
 check "run dir is 0700" "$(ok [ "$(stat -c %a "$WORK/run")" = 700 ])"
 teardown
@@ -272,6 +276,7 @@ check "unknown signer: says why" "$(ok grep -qi 'signature' "$WORK/err")"
 # Nothing was verified on this run, so the converge must not be told a signer:
 # the recipe then keeps the signers set it already has.
 check "fallback: no signer passed to the converge" "$(ok grep -qx 'SIGNED_BY ' "$CINC_LOG")"
+check "fallback: no signing key passed to the converge" "$(ok grep -qx 'SIGNED_KEY ' "$CINC_LOG")"
 : > "$CINC_LOG"
 ENVELOPE_AS=production publish ci dev-vm-policy-staging policy_group=production serial=$((NOW + 60))
 expect_rejected "$(fetch)" "staging signature presented as production"

@@ -228,11 +228,11 @@ EOF
   mv "$tmp" "$STATE/revisions/$rev"
 }
 
-# converge REV SIGNED_BY → cinc-client's exit status.
-# SIGNED_BY is the principal whose signature this run verified, or empty when
-# converging the last good revision with nothing verified this run.
-# base::cinc_client reads it (and the group) to refuse a signers set that would
-# drop the key that just signed: without that, one typo locks the fleet out.
+# converge REV SIGNED_BY SIGNED_KEY → cinc-client's exit status.
+# The principal and the public key whose signature this run verified, both
+# empty when converging the last good revision with nothing verified this run.
+# base::cinc_client reads the key (and the group) to refuse a signers set that
+# would drop the key that just signed: without that, one typo locks the fleet out.
 converge() {
   local tree="$STATE/revisions/$1"
   # node_name must equal the Name tag: alloy.rb and aws_access.rb pass
@@ -251,7 +251,8 @@ policy_name "$POLICY_NAME"
 policy_group "local"
 node_name "$NODE_NAME"
 EOF
-  DEV_VM_POLICY_SIGNED_BY="$2" DEV_VM_POLICY_GROUP="$POLICY_GROUP" cinc-client -z -c "$W/client.rb"
+  DEV_VM_POLICY_SIGNED_BY="$2" DEV_VM_POLICY_SIGNED_KEY="$3" DEV_VM_POLICY_GROUP="$POLICY_GROUP" \
+    cinc-client -z -c "$W/client.rb"
 }
 
 # fall_back CODE: converge the last good revision, then exit with CODE.
@@ -269,7 +270,7 @@ fall_back() {
     *) log "the last good revision is not available"; [ "$code" = 12 ] && exit 12; exit 14 ;;
   esac
   extract "$LAST_REV" || { [ "$code" = 12 ] && exit 12; exit 14; }
-  converge "$LAST_REV" "" || { log "converge of the last good revision failed"; exit 13; }
+  converge "$LAST_REV" "" "" || { log "converge of the last good revision failed"; exit 13; }
   exit "$code"
 }
 
@@ -325,6 +326,22 @@ while IFS= read -r principal; do
   fi
 done < <(ssh-keygen -Y find-principals -s "$W/manifest.sig" -f "$SIGNERS" 2>/dev/null)
 [ -n "$verified" ] || reject "signature does not verify against a trusted signer for $NAMESPACE"
+
+# The public key embedded in the signature — the key ssh-keygen just checked
+# against the signers file — as "<type> <base64>". A principal can hold several
+# keys, so this, not the principal, is what base::cinc_client must keep.
+verified_key=$(python3 -I - "$W/manifest.sig" <<'EOF'
+import base64, struct, sys
+lines = open(sys.argv[1]).read().splitlines()
+body = base64.b64decode("".join(l.strip() for l in lines if l.strip() and not l.startswith("-----")))
+if body[:6] != b"SSHSIG":
+    sys.exit(1)
+n = struct.unpack(">I", body[10:14])[0]
+blob = body[14:14 + n]
+t = struct.unpack(">I", blob[:4])[0]
+print(blob[4:4 + t].decode("ascii"), base64.b64encode(blob).decode("ascii"))
+EOF
+) || reject "cannot read the signing key out of the signature"
 
 # ---- 3. the manifest ---------------------------------------------------------
 
@@ -391,7 +408,7 @@ extract "$REV" || { status rejected "unsafe archive"; fall_back 12; }
 # ---- 5. converge -------------------------------------------------------------
 
 log "converging $POLICY_NAME@$POLICY_GROUP revision $REV (serial $SERIAL, signed by $verified)"
-if ! converge "$REV" "$verified"; then
+if ! converge "$REV" "$verified" "$verified_key"; then
   status converge-failed "$REV"
   exit 13
 fi
