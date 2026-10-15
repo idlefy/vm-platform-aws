@@ -8,24 +8,20 @@
 # Per-tenant overrides (real values, never commit — use the .example files)
 tenant.auto.tfvars
 backend.hcl
-infra/ansible/group_vars/all/tenant.yml
-
-# Ansible
-*.retry
-infra/ansible/inventory.yml
-
-# Ansible-vault secrets and the password that opens them (NEVER commit)
-# vault.yml is encrypted, but the entry stays: an accidental `ansible-vault
-# decrypt` in place would otherwise make the cleartext committable.
-infra/ansible/group_vars/all/vault.yml
-.vault_pass
 
 # OS
 .DS_Store
 
-# Knife admin key — fetch from the CINC server, never commit
-cinc/.chef/admin.pem
-cinc/.chef/syntaxcache/
+# The retired CINC server (base-1.x): its config, its Ansible inventory and
+# vault, its admin key. Nothing creates these any more. The entries stay so
+# that a leftover from an older checkout never becomes committable.
+infra/ansible/group_vars/all/tenant.yml
+infra/ansible/group_vars/all/vault.yml
+infra/ansible/inventory.yml
+infra/backend.hcl
+infra/tenant.auto.tfvars
+.vault_pass
+cinc/.chef/
 
 # Agent scratch and worktrees (never part of the tree)
 .superpowers/

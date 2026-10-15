@@ -1,11 +1,10 @@
 POLICYFILES_DIR := policyfiles
 COOKBOOKS_DIR   := cookbooks
-KNIFE_CONFIG    := ./.chef/knife.rb
 
 POLICYFILES := $(wildcard $(POLICYFILES_DIR)/*.rb)
 LOCKFILES   := $(POLICYFILES:.rb=.lock.json)
 
-.PHONY: help lint test test-broker test-loki-token test-policy-fetch preflight add-region install push promote clean node-delete ssh
+.PHONY: help lint test test-broker test-loki-token test-policy-fetch preflight add-region install push promote clean ssh
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -72,15 +71,14 @@ install: ## Re-resolve policyfiles and rewrite lockfiles
 #
 # These deployed a fleet from this repository, which is what the fork model
 # did. This repository publishes artifacts: there is no `vms/` root here (only
-# `vms/modules/`), no `.chef/knife.rb`, and no CINC organisation, so preflight,
-# add-region and ssh fail on a path that is not here. `promote` was worse than
-# broken — it carries none of the gates the tenant Makefile grew (no pin-check,
-# no preflight, no refusal when staging does not already carry the revision),
-# so with a knife.rb present it would push straight to production ungated.
+# `vms/modules/`) and no policy bucket, so preflight, add-region and ssh fail
+# on a path that is not here. `promote` was worse than broken when it existed:
+# it carried none of the gates the tenant Makefile grew (no pin-check, no
+# preflight, no refusal when staging does not already carry the revision).
 #
 # The gated versions live in tenant-skeleton/cinc/Makefile and reach a tenant
 # through `make prepare`. Run them from the tenant repository.
-DEPLOY_TARGETS := preflight add-region push promote node-delete ssh
+DEPLOY_TARGETS := preflight add-region push promote ssh
 
 $(DEPLOY_TARGETS):
 	@echo "'make $@' is a tenant operation and does not live in the platform repository."
