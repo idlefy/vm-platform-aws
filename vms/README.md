@@ -1,6 +1,6 @@
 # Developer VMs
 
-Terraform module for managing developer EC2 instances across multiple AWS regions with CINC (Chef) configuration management.
+Terraform module for managing developer EC2 instances across multiple AWS regions with CINC (Chef) configuration management, converged in local mode from signed policy in the tenant's bucket.
 
 > Repo overview: [`../README.md`](../README.md) • Runbook: [`../docs/runbook.md`](../docs/runbook.md)
 
@@ -9,7 +9,7 @@ Terraform module for managing developer EC2 instances across multiple AWS region
 - Multi-region: us-east-1 (4 AZs), eu-north-1 (2 AZs) — change in `config.tf`
 - Each region gets: VPC, public subnets per AZ, IGW, security group, EC2 instances
 - Instances bootstrap with CINC agent on first boot
-- CINC validation key stored in AWS SSM Parameter Store (SecureString)
+- Policy delivered as signed archives in a tenant-owned S3 bucket — no CINC server
 - State: S3, configured via `backend.hcl` (per-tenant, gitignored)
 
 ## Configuration files
@@ -21,28 +21,22 @@ Terraform module for managing developer EC2 instances across multiple AWS region
 | `main.tf` / `outputs.tf`      | yes     | Provider, module wiring, outputs                                          |
 | `instances.auto.tfvars`       | yes     | Per-developer VM definitions + SSH public keys (team's running ledger)    |
 | `access_bundles.auto.tfvars`  | yes     | Named AWS permission bundles — the only place external policy ARNs appear |
-| `tenant.auto.tfvars`          | **no**  | AWS profile, Route53 zone, CINC URL, SSM paths (copy from `.example`)     |
+| `tenant.auto.tfvars`          | **no**  | AWS profile, Route53 zone, policy bucket and signers, SSM path (copy from `.example`) |
 | `backend.hcl`                 | **no**  | S3 backend config (copy from `.example`)                                  |
 
 ## Prerequisites
 
-### CINC validation key in SSM
+### The policy bucket
 
-Each region must have the CINC validation key in SSM Parameter Store. One-time per region:
-
-```bash
-# Replace <param-name> with cinc_ssm_parameter_name from your tenant.auto.tfvars.
-# The key goes through a 0600 file, never through --value "$(cat …)": an argument
-# is readable in `ps` for as long as the call runs.
-aws ssm put-parameter \
-  --name "<param-name>" \
-  --type SecureString \
-  --value "file://<path to your-org-validator.pem>" \
-  --region <region> \
-  --profile <your-aws-profile>
-```
-
-Get `<your-org>-validator.pem` from the CINC server at `/etc/cinc-project/<your-org>-validator.pem` (created by `infra/ansible/roles/cinc-server`).
+Every VM converges from a signed envelope in an S3 bucket the tenant owns —
+`policy_bucket`, `policy_bucket_owner`, `policy_bucket_region` and, for
+SSE-KMS, `policy_kms_key_arn` in `vms/tenant.auto.tfvars`. Terraform grants
+each VM's bootstrap role `s3:GetObject` on its own policy's prefix and, with a
+key, `kms:Decrypt`; it does not create the bucket. The runbook §1 creates it
+and gives the bucket-policy and key-policy statements a cross-account or
+SSE-KMS bucket needs. `policy_signers` is the set of keys a new VM trusts at
+first boot. The protocol is in
+[`../docs/design/serverless-policy-delivery.md`](../docs/design/serverless-policy-delivery.md).
 
 ### Grafana Cloud Loki token in SSM
 
@@ -50,8 +44,7 @@ This section applies when `log_shipping` is true in `vms/tenant.auto.tfvars`;
 with it false the bootstrap role gets no grant and no parameter is needed.
 
 Each region must also have a Grafana Cloud Loki push token in SSM Parameter
-Store, hand-created the same way as the CINC validation key above — as a
-SecureString, encrypted with the default `alias/aws/ssm` key, named to match
+Store, hand-created — as a SecureString, encrypted with the default `alias/aws/ssm` key, named to match
 `loki_ssm_parameter_name` in `vms/tenant.auto.tfvars`. Terraform grants the
 VM's bootstrap role read access to that parameter *name*; it does not create
 the parameter or set its value, and a missing or misnamed one fails silently
@@ -266,7 +259,7 @@ gone.
 | `ExpiredToken` in a long-running process only | See the refresh note above. Restart it. |
 | Nothing in `/dev/shm/dev-vm-aws` and the journal says `cannot read /developer-vms/access/<vm>` | `terraform apply` has not run for this VM yet. Not an error on the VM's side. |
 | Journal says `refusing to publish` about the output directory | Something else owns `/dev/shm/dev-vm-aws` or made it group-writable. `/dev/shm` is world-writable, so the broker verifies the directory rather than trusting it. Remove the directory as root and let tmpfiles recreate it: `sudo rm -rf /dev/shm/dev-vm-aws && sudo systemd-tmpfiles --create /etc/tmpfiles.d/aws-vm.conf`. |
-| A new VM never registers with the CINC server, and `ssh` as `ubuntu` has no `sudo` | The bootstrap failed and failed closed. Read `aws ec2 get-console-output --latest` for the log, fix the cause, and `terraform apply -replace=` the instance. |
+| A new VM never converges, and `ssh` as `ubuntu` has no `sudo` | The bootstrap failed and failed closed — commonly no envelope for the VM's group yet, a bucket or key policy that does not let the bootstrap role read, or `policy_signers` that do not verify what is published. Read `aws ec2 get-console-output --latest` for the log, fix the cause, and `terraform apply -replace=` the instance. |
 
 ### Tests
 
@@ -341,10 +334,10 @@ the provider aliases went.
 Then, by hand, because Terraform manages the IAM grant that *names* each secret
 and never its value:
 
-2. Put the **CINC validation key** and the **Grafana Loki token** in SSM in the
-   new region, as `SecureString` on the default `alias/aws/ssm` key — see
+2. If `log_shipping` is on, put the **Grafana Loki token** in SSM in the new
+   region, as `SecureString` on the default `alias/aws/ssm` key — see
    *Prerequisites* above and the runbook §7. A CMK would need a `kms:Decrypt`
-   grant that does not exist.
+   grant that does not exist. Policy delivery needs nothing per region.
 3. `cd cinc && make preflight`. It reads the region list from `local.regions`, so
    the new region is checked automatically, including that the Loki token
    actually authenticates there. Do this before `apply`: a missing parameter
@@ -375,12 +368,22 @@ associations, and the security group with its three rules.
 
 ## CINC Bootstrap
 
-On first boot, each VM:
-1. Sets hostname from EC2 metadata
-2. Installs CINC agent via omnitruck.cinc.sh (pinned version + SHA256 check)
-3. Fetches validation key from SSM Parameter Store
-4. Writes `/etc/cinc/client.rb` pointing to `var.cinc_server_url`
-5. Runs `cinc-client --once` in background
-6. Deletes the validation key (no longer needed after registration)
+On first boot, each VM (`user_data.tf`):
+1. Removes the cloud image's `NOPASSWD` grant and blocks IMDS for everything
+   but root — before anything else, and for good: a failed bootstrap fails
+   closed
+2. Reads its `Name`, `PolicyName` and `PolicyGroup` tags from IMDS, once, and
+   refuses any value outside the shapes it accepts
+3. Installs the AWS CLI and the CINC client (pinned version + SHA256 check)
+4. Writes `/etc/dev-vm/policy.conf` (bucket, prefix, policy, group, serial
+   floor) and `/etc/dev-vm/policy-signers` (`var.policy_signers`), and installs
+   `dev-vm-policy-fetch` and its launcher
+5. Runs the first converge: fetch the group's envelope, verify it, download the
+   archive it names, check its hash, and run `cinc-client -z`; retried only
+   while nothing could be fetched yet (IAM propagation)
 
-Bootstrap log: `/var/log/cinc-first-run.log`
+From then on `cinc-client.timer` repeats step 5 every 30 minutes, and the
+cookbook keeps the script and the signers file current.
+
+Bootstrap log: `/var/log/user-data.log`, copied to the serial console on failure;
+first converge: `/var/log/cinc-first-run.log`

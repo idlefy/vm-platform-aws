@@ -15,15 +15,15 @@ nothing itself:
 
 A **tenant** is a private repository generated from `tenant-skeleton/`. It
 holds configuration and nothing else: which regions, which VMs, whose SSH
-keys, where the CINC server is. Every VM it creates is tagged
+keys, which bucket its signed policy is published to. Every VM it creates is tagged
 `idlefy = "enabled"` by default, which is how Idlefy finds it and starts and
 stops it on the developer's schedule.
 
 ## Where to go
 
 - **[Runbook](runbook.md)** — from a fresh tenant repository to a running
-  fleet: state bucket, the tenant files, the policyfile, CINC server, first VMs,
-  the Grafana Cloud token.
+  fleet: the state and policy buckets, the tenant files, the policyfile, the
+  first push and promote, first VMs, the Grafana Cloud token.
 - **[Versioning](versioning.md)** — the two tag streams, what a tenant pins
   where, and how `pin-check` keeps the two honest.
 - **Design records** — the reasoning behind the parts that were measured
@@ -36,6 +36,9 @@ stops it on the developer's schedule.
       `log_shipping` switch and what "off" has to mean.
     - [Per-VM AWS access](design/per-vm-aws-access.md) — one IAM identity
       per VM, a boundary derived from bundles, a credential broker in tmpfs.
+    - [Serverless policy delivery](design/serverless-policy-delivery.md) —
+      signed archives in the tenant's bucket instead of a CINC server, and
+      what a bucket writer can and cannot do.
 - **[Changelog](changelog.md)**
 
 ## Get started
@@ -48,8 +51,8 @@ claude          # the get-started skill creates your tenant repository
 
 Without Claude Code: create a private repository, copy the contents of
 `tenant-skeleton/` into its root, run `make prepare PLATFORM_TAG=vX.Y.Z` at the
-current release tag, fill in the six tenant files plus the policyfile and the
-two Ansible vault files, and `terraform plan`. The
+current release tag, fill in the two tenant files plus the policyfile, and
+`terraform plan`. The
 [README](https://github.com/idlefy/vm-platform-aws/blob/main/README.md)
 has the full list; the [runbook](runbook.md) takes it from there.
 

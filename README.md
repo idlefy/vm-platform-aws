@@ -19,7 +19,7 @@ A developer gets an EC2 instance that is hardened on first boot and kept that wa
 flowchart LR
     P["<b>vm-platform-aws</b><br/>this repository — a template<br/>publishes base-X.Y.Z and vX.Y.Z tags<br/>deploys nothing"]
     T["<b>your tenant repository</b><br/>generated from tenant-skeleton/<br/>holds configuration only<br/>pins both tags"]
-    A["<b>your AWS account</b><br/>CINC server + developer VMs<br/>one VPC per region"]
+    A["<b>your AWS account</b><br/>developer VMs, one VPC per region<br/>a bucket of signed policy"]
     I["<b>Idlefy</b><br/>finds VMs by the idlefy tag<br/>starts / stops on schedule"]
     G["<b>Grafana Cloud</b><br/>journal → Loki<br/>dashboard + 6 alerts"]
     P -- "make prepare PLATFORM_TAG=vX.Y.Z" --> T
@@ -28,7 +28,7 @@ flowchart LR
     A -- "Alloy" --> G
 ```
 
-This repository deploys nothing. It publishes a CINC cookbook (`cinc/cookbooks/base/`) as `base-X.Y.Z` tags and two Terraform modules plus a tenant skeleton (`vms/modules/`, `tenant-skeleton/`) as `vX.Y.Z` tags. A **tenant** is a private repository generated from the skeleton; it pins both and holds the values that are yours — regions, VMs, SSH keys, the CINC server, the Grafana stack.
+This repository deploys nothing. It publishes a CINC cookbook (`cinc/cookbooks/base/`) as `base-X.Y.Z` tags and two Terraform modules plus a tenant skeleton (`vms/modules/`, `tenant-skeleton/`) as `vX.Y.Z` tags. A **tenant** is a private repository generated from the skeleton; it pins both and holds the values that are yours — regions, VMs, SSH keys, the policy bucket and the keys that sign for it, the Grafana stack. There is no server to run: `make push` signs each policy and writes it to an S3 bucket you own, and every VM verifies the signature before it converges.
 
 ## Get started
 
@@ -44,11 +44,10 @@ Without Claude Code:
 
 1. Create a private repository and copy the **contents** of `tenant-skeleton/` into its root — the `Makefile` has to land at the top level (`cp -r vm-platform-aws/tenant-skeleton/. <your-tenant>/`).
 2. `make prepare PLATFORM_TAG=vX.Y.Z` — materialises the config files and pins the modules to that release. The current tag is the one on the release badge above, or `git tag --list 'v*' --sort=-v:refname | head -1`.
-3. Fill in the six tenant files the command lists (`vms/tenant.auto.tfvars`, `vms/backend.hcl`, `infra/tenant.auto.tfvars`, `infra/backend.hcl`, `infra/ansible/group_vars/all/tenant.yml`, `cinc/.chef/knife.rb`), then edit the four remaining `REPLACE_ME` attributes in `cinc/policyfiles/dev-vm.rb` — the two `loki` ones and the two `traefik` ones — and only then `make bump-cookbook TAG=base-X.Y.Z`, which locks the tag and the attributes together. In the other order, `make push` refuses: the lock would not match the policyfile. `./scripts/placeholder-check.sh --all` tells you what is left; nothing catches the Traefik pair at converge.
-4. Create `infra/ansible/group_vars/all/vault.yml` from its `.example` and a `~/.vault_pass` to open it; the Ansible step needs both.
-5. `cd vms && terraform init -backend-config=backend.hcl && terraform plan`.
+3. Fill in the two tenant files the command lists (`vms/tenant.auto.tfvars`, `vms/backend.hcl`) — including the policy bucket and `policy_signers`, your ed25519 public key — then edit the remaining `REPLACE_ME` attributes in `cinc/policyfiles/dev-vm.rb` — the two `loki` ones, the two `traefik` ones and the signers set — and only then `make bump-cookbook TAG=base-X.Y.Z`, which locks the tag and the attributes together. In the other order, `make push` refuses: the lock would not match the policyfile. `./scripts/placeholder-check.sh --all` tells you what is left; nothing catches the Traefik pair at converge.
+4. `cd vms && terraform init -backend-config=backend.hcl && terraform plan`.
 
-The [runbook](https://idlefy.github.io/vm-platform-aws/runbook/) takes it from there: state bucket, CINC server, first VMs, the Loki token.
+The [runbook](https://idlefy.github.io/vm-platform-aws/runbook/) takes it from there: the two buckets, the first push, a staging VM, promote, the Loki token.
 
 ## What a VM gets
 
@@ -85,7 +84,7 @@ Two tag streams: `base-X.Y.Z` publishes the cookbook and `vX.Y.Z` publishes the 
 
 ```bash
 make boundary-check                                    # modules stay inside themselves
-( cd vms/modules/ec2          && terraform test )      # 50 runs
+( cd vms/modules/ec2          && terraform test )      # 53 runs
 ( cd vms/modules/fleet-guards && terraform test )      # 5 runs
 make smoke                                             # the skeleton against this tree
 for t in test/test-release-gate.sh test/test-resolve-pin.sh test/test-boundary-check.sh \

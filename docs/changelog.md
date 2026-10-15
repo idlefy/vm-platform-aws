@@ -1,5 +1,41 @@
 # Changelog
 
+## 2.0.0
+
+There is no CINC server any more. Policy reaches VMs as signed archives in an
+S3 bucket the tenant owns. Design and threat model:
+`docs/design/serverless-policy-delivery.md`. 1.x is frozen: a VM built for a
+server stays on `base-1.x`, and moving a tenant means recreating its VMs.
+
+**`base-2.0.0`**
+
+- `base::cinc_client` keeps `dev-vm-policy-fetch` current, self-testing each
+  new version against a shipped fixture before it replaces the old one. It
+  writes `/etc/dev-vm/policy-signers` from `base.policy.signers` and refuses a
+  set that drops the key that signed the running revision.
+- `cinc-client.service` runs the launcher, which fetches the group's signed
+  envelope, verifies it, checks the archive hash, and runs `cinc-client -z`.
+  It refuses to converge a VM without `/etc/dev-vm/policy.conf`, so a 1.x VM
+  is never half-migrated.
+
+**`v2.0.0`**
+
+- Breaking: `cinc_server_url` and `cinc_ssm_parameter_name` are removed;
+  `policy_bucket`, `policy_bucket_owner`, `policy_bucket_region`,
+  `policy_prefix`, `policy_kms_key_arn`, `policy_signers` and
+  `policy_min_serial` are new. A bundle that names an infrastructure namespace
+  needs `infrastructure_access = true`.
+- The bootstrap writes the policy settings and the trusted signers and runs
+  the first converge from the bucket. It fails closed on any `PolicyGroup`
+  other than `staging` or `production`.
+- The permissions boundary denies writes to the policy prefix, changes to the
+  bucket and its key, and the routes that redirect where S3's name resolves or
+  where traffic leaves the VPC.
+- `make push` / `make promote` sign and publish through
+  `scripts/policy-publish.sh`. It never signs an archive whose contents differ
+  from a fresh export of the lock. `make preflight` checks the bucket and both
+  envelopes. `make node-delete` and both `infra/` trees are gone.
+
 ## 1.2.1
 
 **`base-1.2.1`**

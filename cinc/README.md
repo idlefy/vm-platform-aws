@@ -23,7 +23,7 @@ cinc/
         unattended_upgrades.rb  # Automatic security updates
         chrony.rb               # NTP time sync
         sysctl.rb               # Kernel tuning (network, memory, security)
-        cinc_client.rb          # Systemd timer for periodic runs (30min)
+        cinc_client.rb          # 30-min timer; keeps dev-vm-policy-fetch and the signers set current
         aws_access.rb           # Credential broker: assumes the VM's access role into tmpfs
         docker.rb               # Rootless Docker CE + Compose
         traefik.rb              # Traefik reverse proxy + per-VM basic auth (publishing)
@@ -412,24 +412,14 @@ sudo dpkg -i /tmp/cinc-workstation.deb
 rm -f /tmp/cinc-workstation.deb
 ```
 
-A tenant configures knife at its own `cinc/.chef/knife.rb` — `make prepare`
-copies it from the `.example`; substitute the CINC server FQDN and org name:
+There is no knife configuration and no server to point one at. `make push` and
+`make promote` read the policy bucket, its owner and region, and the signers
+from the tenant's `vms/` root through `terraform console`, and sign with an
+ed25519 SSH key — `~/.ssh/id_ed25519` unless `SIGNING_KEY` names another (a
+`.pub` path signs through `ssh-agent`). OpenSSH ≥ 8.1 is needed for
+`ssh-keygen -Y sign`.
 
-```ruby
-node_name        "admin"
-client_key       File.expand_path("../admin.pem", __FILE__)
-chef_server_url  "https://<cinc-server-fqdn>/organizations/<org-name>"
-```
-
-Place the admin key at `cinc/.chef/admin.pem` (get it from the CINC server:
-`/etc/cinc-project/admin.pem`). The key is gitignored — never commit it.
-
-The tenant Makefile defaults `KNIFE_CONFIG` to `./.chef/knife.rb` so `make push`
-and `make promote` always talk to *that tenant's* CINC server, even if the
-workstation also carries another tenant's `~/.chef/knife.rb`. Override with
-`make push KNIFE_CONFIG=<path>` if you need a different config.
-
-Generate an SSH key for EC2 Instance Connect:
+Generate a key, for signing and for EC2 Instance Connect alike:
 
 ```bash
 ssh-keygen -t ed25519 -C "admin@<your-org>"
@@ -451,9 +441,12 @@ Edit cookbook  →  make release TAG=base-X.Y.Z   (here)
 ```
 
 Both tenant steps are manual — there is no CI/CD pushing policies
-automatically — and both are gated: `push` runs `pin-check` and installs from
-the committed lock, `promote` runs `preflight` and refuses unless the staging
-policy group already carries that revision.
+automatically — and both are gated: `push` runs `pin-check`, installs from the
+committed lock, and refuses to sign an archive that does not hold what the lock
+exports; `promote` runs `preflight` and refuses unless the signed
+`staging.json` already carries that revision. What each writes, and what a VM
+checks before it converges, is in
+[the design record](../docs/design/serverless-policy-delivery.md).
 
 `PREFLIGHT=skip` bypasses only the preflight half of that. The revision check
 and `pin-check` still run and still refuse, but nothing then verifies that the
@@ -473,12 +466,11 @@ make install    # Re-resolve policyfiles and rewrite lockfiles (local developmen
 make clean      # Remove lockfiles
 ```
 
-Tenant operations — `preflight`, `add-region`, `push`, `promote`, `node-delete`
-and `ssh` — live in `tenant-skeleton/cinc/Makefile` and reach a tenant through
+Tenant operations — `preflight`, `add-region`, `push`, `promote` and `ssh` —
+live in `tenant-skeleton/cinc/Makefile` and reach a tenant through
 `make prepare`. They used to be here as well, back when a fleet was operated
 from a copy of this repository; here they could not work at all (no `vms/` root,
-no `.chef/knife.rb`, no CINC organisation), so each one now prints where it went
-and exits non-zero.
+no policy bucket), so each one now prints where it went and exits non-zero.
 
 `make preflight`, in a tenant repository, is the odd one out: the `test-*`
 targets stub `aws` and assert against artefacts, while preflight talks to the
@@ -497,8 +489,8 @@ rather than recommending you close it.
 ## VM lifecycle
 
 Creating, recreating and deleting a VM are tenant operations and none of them
-runs from here. The canonical steps — including the two that Terraform does not
-know about, `make node-delete` and removing the node from the tailnet — are in
+runs from here. The canonical steps — including the one Terraform does not
+know about, removing the node from the tailnet — are in
 `tenant-skeleton/CLAUDE.md` (*Create a VM* / *Delete a VM*), which ships with
 every tenant. The rest of this section is the model behind them.
 
@@ -543,13 +535,15 @@ Published with this cookbook:
 
 ## Policy assignment
 
-VMs read their `PolicyName` EC2 tag at boot (via IMDSv2) and set it in `/etc/cinc/client.rb`.
-To change a VM's role, update `policy_name` in `vms/instances.auto.tfvars`, apply Terraform, and re-bootstrap (or edit `client.rb` directly and run `cinc-client`).
+VMs read their `PolicyName` EC2 tag once, at first boot (via IMDSv2), into
+`/etc/dev-vm/policy.conf`, and nothing reads the tag again — re-reading would let
+anyone with `ec2:CreateTags` move a VM between policies. To change a VM's policy,
+update `policy_name` in `vms/instances.auto.tfvars` and recreate the VM.
 
 The policy **group** travels the same way, via the `PolicyGroup` tag. It
 defaults to `production`, so an ordinary VM needs nothing set. The staging VM
-that `make push` is pushed *for* is made by setting `policy_group = "staging"`
-on that VM's entry before it is created — the tag is read once, at first boot,
-so switching an existing VM between groups means recreating it. An unknown
-value falls back to `production` rather than producing a VM that silently never
-converges; `terraform test` covers the plausible typo.
+that `make push` is published *for* is made by setting
+`policy_group = "staging"` on that VM's entry before it is created; switching
+an existing VM between groups means recreating it. Any value other than
+`staging` or `production` is refused twice: by the module's validation at
+`plan`, and by the bootstrap, which fails closed rather than guessing.
