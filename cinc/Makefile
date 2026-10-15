@@ -5,7 +5,7 @@ KNIFE_CONFIG    := ./.chef/knife.rb
 POLICYFILES := $(wildcard $(POLICYFILES_DIR)/*.rb)
 LOCKFILES   := $(POLICYFILES:.rb=.lock.json)
 
-.PHONY: help lint test test-broker test-loki-token preflight add-region install push promote clean node-delete ssh
+.PHONY: help lint test test-broker test-loki-token test-policy-fetch preflight add-region install push promote clean node-delete ssh
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -42,6 +42,16 @@ test-loki-token: ## Run the Loki token script test (stubs aws, no AWS account ne
 	@echo "==> Testing dev-vm-loki-token..."
 	@test/test-loki-token.sh
 	@echo "✓ Token script tests passed"
+
+# The script under test lives in vms/modules/ec2/files/ — user_data installs it
+# at first boot, before any converge exists to deliver it — and the cookbook
+# carries a byte-identical copy that test-fetch-sync.sh holds equal. It gates
+# the cookbook stream because a revision that ships a broken copy breaks every
+# converge after it.
+test-policy-fetch: ## Run the policy delivery script test (stubs aws and cinc-client; needs ssh-keygen >= 8.1)
+	@echo "==> Testing dev-vm-policy-fetch..."
+	@../test/test-policy-fetch.sh
+	@echo "✓ Policy delivery tests passed"
 
 # `chef update`, NOT `chef install`. The base cookbook is a local path
 # (policyfiles/dev-vm.rb uses `path: '../cookbooks/base'`), so its content changes

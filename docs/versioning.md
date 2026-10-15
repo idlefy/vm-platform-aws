@@ -5,7 +5,7 @@ public history starts at `1.0.0` for both.
 
 | Stream | Publishes | Gated by | A tenant pins it in |
 |---|---|---|---|
-| `base-X.Y.Z` | `cinc/cookbooks/base/**` | `cookstyle`, ChefSpec, the credential-broker and Loki-token tests; `metadata.rb` must say `X.Y.Z` byte for byte | `cinc/policyfiles/dev-vm.rb` — `cookbook 'base', git: …, tag: 'base-X.Y.Z'` |
+| `base-X.Y.Z` | `cinc/cookbooks/base/**` | `cookstyle`, ChefSpec, the credential-broker, Loki-token and policy-delivery tests; `metadata.rb` must say `X.Y.Z` byte for byte | `cinc/policyfiles/dev-vm.rb` — `cookbook 'base', git: …, tag: 'base-X.Y.Z'` |
 | `vX.Y.Z` | `vms/modules/**` and `tenant-skeleton/**` | `boundary-check`, `test-skeleton-sync`, the skeleton smoke test | `vms/main.tf` — `?ref=<full sha>` on both module sources, with the tag in a trailing comment |
 
 The two move independently: a cookbook fix is a `base-` tag with no `v` tag,

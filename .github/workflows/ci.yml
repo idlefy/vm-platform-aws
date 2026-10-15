@@ -104,5 +104,9 @@ jobs:
         working-directory: cinc
         run: make test-loki-token
 
+      - name: test-policy-fetch
+        working-directory: cinc
+        run: make test-policy-fetch
+
       - name: test-pin-check
         run: ./test/test-pin-check.sh

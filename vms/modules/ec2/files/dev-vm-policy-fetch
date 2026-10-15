@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+# dev-vm-policy-fetch — fetch, verify and converge this VM's policy revision.
+#
+# There is no CINC server. The operator publishes `chef export --archive`
+# tarballs to the tenant's S3 bucket, and for each policy group a signed
+# envelope naming the revision that group runs. This script is the only thing
+# between that bucket and a root converge, so it trusts nothing it downloads
+# until a key in the signers file has vouched for it. The design record is
+# docs/design/serverless-policy-delivery.md.
+#
+# Two copies, byte-identical: vms/modules/ec2/files/ (installed by user_data
+# at first boot, before any converge can deliver anything) and
+# cinc/cookbooks/base/files/default/ (so a fix reaches running VMs).
+# test/test-fetch-sync.sh holds them equal; edit both or neither.
+#
+# Exit codes. The launcher, dev-vm-policy-run, treats any other code as a
+# broken script and runs the previous version instead.
+#    0  converged; or delivery failed below the threshold and the last good
+#       revision converged
+#   11  delivery failed on THRESHOLD runs in a row; the last good revision
+#       converged
+#   12  envelope or archive rejected; the last good revision converged, if
+#       there is one
+#   13  the converge itself failed
+#   14  nothing to converge: delivery failed and there is no last good revision
+#   70  internal error: bad configuration or a missing tool
+#
+# Every path below can be overridden by the environment for the test suite
+# only (test/test-policy-fetch.sh). The unit sets none of them.
+
+set -uo pipefail
+umask 077
+
+CONF=${DEV_VM_POLICY_CONF:-/etc/dev-vm/policy.conf}
+SIGNERS=${DEV_VM_POLICY_SIGNERS:-/etc/dev-vm/policy-signers}
+STATE=${DEV_VM_POLICY_STATE:-/var/lib/dev-vm/policy}
+RUN=${DEV_VM_POLICY_RUN:-/run/dev-vm}
+RETRY_SLEEP=${DEV_VM_POLICY_RETRY_SLEEP:-5}
+NOW=${DEV_VM_POLICY_NOW:-$(date +%s)}
+
+# A delivery failure fails the unit only on the third run in a row (about
+# 1.5 h at the timer's 30 min). The converge-failed alert is `for: 0s`, and
+# one S3 5xx must not page anyone.
+THRESHOLD=3
+# An envelope from further in the future than this is refused. Without a
+# bound, one signer with a fast clock (or a stolen key) publishes a far-future
+# serial, every VM records it, and every legitimate envelope after it is a
+# "regression" until the fleet is recreated.
+MAX_AHEAD=86400
+
+log() { echo "dev-vm-policy-fetch: $*" >&2; }
+internal() { log "internal error: $*"; exit 70; }
+
+# ---- configuration -----------------------------------------------------------
+# policy.conf is written once, by user_data, from module inputs and the EC2
+# tags read at first boot. It is parsed, never sourced, and every value is held
+# to a shape that is safe in an S3 key, a path, and a double-quoted Ruby string
+# in the client config below.
+
+[ -r "$CONF" ] || internal "cannot read $CONF"
+declare -A C=()
+while IFS= read -r line || [ -n "$line" ]; do
+  case "$line" in ''|'#'*) continue ;; esac
+  [[ $line =~ ^([A-Z_]+)=(.*)$ ]] || internal "malformed line in $CONF"
+  C[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}
+done < "$CONF"
+
+want() {  # want KEY REGEX
+  local v=${C[$1]:-}
+  [[ $v =~ $2 ]] || internal "$1 in $CONF is missing or malformed"
+  printf -v "$1" '%s' "$v"
+}
+want POLICY_BUCKET        '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+want POLICY_BUCKET_OWNER  '^[0-9]{12}$'
+want POLICY_BUCKET_REGION '^[a-z]{2}(-[a-z]+)+-[0-9]+$'
+want POLICY_PREFIX        '^[A-Za-z0-9_-][A-Za-z0-9._-]*(/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$'
+want FLEET_ID             '^[A-Za-z0-9._/-]+$'
+want POLICY_NAME          '^[a-z0-9][a-z0-9-]{0,62}$'
+want POLICY_GROUP         '^(staging|production)$'
+want NODE_NAME            '^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$'
+[ -r "$SIGNERS" ] || internal "cannot read $SIGNERS"
+
+for tool in aws ssh-keygen tar python3 sha256sum cinc-client; do
+  command -v "$tool" >/dev/null || internal "$tool is not on PATH"
+done
+
+KEY_BASE="$POLICY_PREFIX/$POLICY_NAME"
+NAMESPACE="dev-vm-policy-$POLICY_GROUP"
+
+# ---- state -------------------------------------------------------------------
+# Root-only, because trap 8 in CLAUDE.md is a rule and not a case-by-case
+# judgement: nothing here is secret, but node state carries ohai data and no
+# developer-reachable path belongs inside a root converge.
+
+mkdir -p "$STATE/archives" "$STATE/revisions" "$RUN" || internal "cannot create state directories"
+chmod 0700 "$STATE" "$STATE/archives" "$STATE/revisions" "$RUN" || internal "cannot set state modes"
+rm -rf "$STATE"/revisions/.tmp.*
+W=$(mktemp -d "$RUN/fetch.XXXXXX") || internal "cannot create a work directory in $RUN"
+trap 'rm -rf "$W"' EXIT
+
+LAST_SERIAL='' LAST_REV='' LAST_SHA=''
+if [ -s "$STATE/last-serial" ]; then
+  read -r LAST_SERIAL LAST_REV LAST_SHA < "$STATE/last-serial"
+  [[ $LAST_SERIAL =~ ^[0-9]+$ && $LAST_REV =~ ^[0-9a-f]{64}$ && $LAST_SHA =~ ^[0-9a-f]{64}$ ]] \
+    || internal "$STATE/last-serial is malformed; see the runbook's break-glass procedure"
+fi
+
+status() {  # status RESULT DETAIL
+  printf '%s %s %s\n' "$(date -u -d "@$NOW" +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2" > "$STATE/status.tmp" \
+    && mv "$STATE/status.tmp" "$STATE/status"
+}
+
+# ---- S3 ----------------------------------------------------------------------
+# Exact-key GETs with the bootstrap role. The role has no s3:ListBucket, so a
+# missing object comes back as AccessDenied, indistinguishable from a denied
+# one. --expected-bucket-owner on every call: a bucket deleted and re-created
+# under the same name in another account is refused by S3 itself.
+
+s3_get() {  # s3_get KEY OUTFILE
+  aws s3api get-object --bucket "$POLICY_BUCKET" --key "$1" \
+    --expected-bucket-owner "$POLICY_BUCKET_OWNER" --region "$POLICY_BUCKET_REGION" \
+    "$2" >/dev/null 2>"$W/aws.err"
+}
+
+s3_get_retrying() {  # s3_get_retrying KEY OUTFILE
+  local attempt
+  for attempt in 1 2 3; do
+    s3_get "$1" "$2" && return 0
+    [ "$attempt" -lt 3 ] && sleep $((RETRY_SLEEP * attempt))
+  done
+  if grep -qE 'AccessDenied|NoSuchKey|\(403\)|\(404\)' "$W/aws.err"; then
+    log "s3://$POLICY_BUCKET/$1 is missing or denied"
+  else
+    log "s3://$POLICY_BUCKET/$1 is unreachable: $(head -c 300 "$W/aws.err")"
+  fi
+  return 1
+}
+
+# ---- archives ----------------------------------------------------------------
+
+sha_of() { sha256sum "$1" | cut -d' ' -f1; }
+
+# ensure_archive REV SHA → 0 cached and verified, 1 delivery failed, 2 sha mismatch.
+# The sha is rechecked on every use, cached or not: the cache is a convenience,
+# never a source of trust. An archive is downloaded once per revision.
+ensure_archive() {
+  local rev=$1 sha=$2 cache="$STATE/archives/$1.tgz"
+  if [ -f "$cache" ]; then
+    [ "$(sha_of "$cache")" = "$sha" ] && return 0
+    log "cached archive for $rev does not match its manifest; fetching it again"
+    rm -f "$cache"
+  fi
+  s3_get_retrying "$KEY_BASE/archives/$rev.tgz" "$W/$rev.tgz" || return 1
+  if [ "$(sha_of "$W/$rev.tgz")" != "$sha" ]; then
+    log "rejected: archive $rev does not match archive_sha256 in the signed manifest"
+    return 2
+  fi
+  mv "$W/$rev.tgz" "$cache"
+}
+
+# extract REV → 0, or 2 if the archive is unsafe or is not the revision it claims.
+# Members are vetted before tar sees the file: only regular files and
+# directories, no absolute paths, no `..`. Ownership never comes from the
+# archive — the workstation's uid is often 1000, which is the developer's.
+extract() {
+  local rev=$1 tmp
+  if ! python3 -I - "$STATE/archives/$rev.tgz" <<'EOF'
+import os, sys, tarfile
+with tarfile.open(sys.argv[1], "r:gz") as t:
+    for m in t.getmembers():
+        parts = [p for p in m.name.split("/") if p not in ("", ".")]
+        if os.path.isabs(m.name) or ".." in parts or not (m.isfile() or m.isdir()):
+            print(f"unsafe member: {m.name!r}", file=sys.stderr)
+            sys.exit(1)
+EOF
+  then
+    log "rejected: archive $rev contains an unsafe member"
+    return 2
+  fi
+  tmp=$(mktemp -d "$STATE/revisions/.tmp.XXXXXX") || internal "cannot create an extraction directory"
+  if ! tar --no-same-owner --no-same-permissions -xzf "$STATE/archives/$rev.tgz" -C "$tmp"; then
+    rm -rf "$tmp"; log "rejected: archive $rev does not extract"; return 2
+  fi
+  if [ "$(python3 -I -c 'import json,sys;print(json.load(open(sys.argv[1])).get("revision_id",""))' \
+          "$tmp/Policyfile.lock.json" 2>/dev/null)" != "$rev" ]; then
+    rm -rf "$tmp"; log "rejected: archive $rev does not carry that revision in Policyfile.lock.json"; return 2
+  fi
+  # Extracted afresh on every run, so node state never carries over between
+  # runs; nothing in `base` relies on persisted node attributes.
+  rm -rf "${STATE:?}/revisions/$rev"
+  mv "$tmp" "$STATE/revisions/$rev"
+}
+
+# converge REV → cinc-client's exit status.
+converge() {
+  local tree="$STATE/revisions/$1"
+  # node_name must equal the Name tag: alloy.rb and aws_access.rb pass
+  # node.name on as the Loki `instance` label and as the per-VM SSM key, and
+  # local mode would otherwise default it to the hostname.
+  # chef_zero.listen: local mode must not open a port any local uid could
+  # reach mid-converge. Measured, not assumed: see the design record.
+  cat > "$W/client.rb" <<EOF
+local_mode true
+chef_zero.listen false
+chef_repo_path "$tree"
+cache_path "$tree/.cache"
+use_policyfile true
+policy_document_native_api true
+policy_name "$POLICY_NAME"
+policy_group "local"
+node_name "$NODE_NAME"
+EOF
+  cinc-client -z -c "$W/client.rb"
+}
+
+# fall_back CODE: converge the last good revision, then exit with CODE.
+# Drift correction keeps running while the bucket is down or under attack.
+fall_back() {
+  local code=$1
+  if [ -z "$LAST_REV" ]; then
+    log "no last good revision to converge"
+    [ "$code" = 12 ] && exit 12
+    exit 14
+  fi
+  log "converging the last good revision $LAST_REV"
+  case "$(ensure_archive "$LAST_REV" "$LAST_SHA"; echo $?)" in
+    0) ;;
+    *) log "the last good revision is not available"; [ "$code" = 12 ] && exit 12; exit 14 ;;
+  esac
+  extract "$LAST_REV" || { [ "$code" = 12 ] && exit 12; exit 14; }
+  converge "$LAST_REV" || { log "converge of the last good revision failed"; exit 13; }
+  exit "$code"
+}
+
+reject() {  # reject REASON
+  log "rejected: $1"
+  status rejected "$1"
+  fall_back 12
+}
+
+delivery_failed() {
+  local n=0
+  [ -s "$STATE/delivery-failures" ] && n=$(cat "$STATE/delivery-failures")
+  [[ $n =~ ^[0-9]+$ ]] || n=0
+  n=$((n + 1))
+  echo "$n" > "$STATE/delivery-failures"
+  status delivery-failed "run $n of $THRESHOLD"
+  if [ "$n" -ge "$THRESHOLD" ]; then fall_back 11; else fall_back 0; fi
+}
+
+# ---- 1. the envelope ---------------------------------------------------------
+
+s3_get_retrying "$KEY_BASE/$POLICY_GROUP.json" "$W/envelope.json" || delivery_failed
+rm -f "$STATE/delivery-failures"
+
+# One object holding both the manifest and its signature: S3 replaces a single
+# object atomically, two objects can be read either side of a write.
+if ! python3 -I - "$W/envelope.json" "$W/manifest" "$W/manifest.sig" <<'EOF'
+import base64, json, sys
+env, m_out, s_out = sys.argv[1:]
+e = json.load(open(env))
+if not isinstance(e, dict) or set(e) != {"manifest", "signature"} \
+        or not all(isinstance(v, str) for v in e.values()):
+    sys.exit(1)
+open(m_out, "wb").write(base64.b64decode(e["manifest"], validate=True))
+open(s_out, "w").write(e["signature"])
+EOF
+then
+  reject "malformed envelope"
+fi
+
+# ---- 2. the signature --------------------------------------------------------
+# Over the decoded manifest bytes, before anything parses them. The namespace
+# carries the group: a staging signature never verifies as production, and a
+# key whose signers line allows only the staging namespace cannot sign
+# production at all.
+
+verified=
+while IFS= read -r principal; do
+  [ -n "$principal" ] || continue
+  if ssh-keygen -Y verify -f "$SIGNERS" -I "$principal" -n "$NAMESPACE" \
+       -s "$W/manifest.sig" < "$W/manifest" >/dev/null 2>&1; then
+    verified=$principal; break
+  fi
+done < <(ssh-keygen -Y find-principals -s "$W/manifest.sig" -f "$SIGNERS" 2>/dev/null)
+[ -n "$verified" ] || reject "signature does not verify against a trusted signer for $NAMESPACE"
+
+# ---- 3. the manifest ---------------------------------------------------------
+
+declare -A M=()
+while IFS='=' read -r k v; do M[$k]=$v; done < <(python3 -I - "$W/manifest" <<'EOF'
+import json, re, sys
+m = json.loads(open(sys.argv[1], "rb").read())
+hex64 = re.compile(r"[0-9a-f]{64}")
+fields = {
+    "format": lambda v: type(v) is int and v == 1,
+    "fleet_id": lambda v: isinstance(v, str) and re.fullmatch(r"[A-Za-z0-9._/-]+", v),
+    "policy_name": lambda v: isinstance(v, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", v),
+    "policy_group": lambda v: v in ("staging", "production"),
+    "revision_id": lambda v: isinstance(v, str) and hex64.fullmatch(v),
+    "archive_sha256": lambda v: isinstance(v, str) and hex64.fullmatch(v),
+    "cookbook_tag": lambda v: isinstance(v, str) and re.fullmatch(r"base-\d+\.\d+\.\d+", v),
+    "signers_sha256": lambda v: isinstance(v, str) and hex64.fullmatch(v),
+    "serial": lambda v: type(v) is int and v > 0,
+}
+if not isinstance(m, dict) or set(m) != set(fields):
+    sys.exit(1)
+for k, ok in fields.items():
+    if not ok(m[k]):
+        print(f"bad={k}")
+        sys.exit(1)
+for k in fields:
+    print(f"{k}={m[k]}")
+EOF
+)
+[ -n "${M[serial]:-}" ] || reject "manifest is malformed${M[bad]:+ (field ${M[bad]})}"
+
+[ "${M[fleet_id]}" = "$FLEET_ID" ]         || reject "manifest is for fleet ${M[fleet_id]}, this VM is $FLEET_ID"
+[ "${M[policy_name]}" = "$POLICY_NAME" ]   || reject "manifest is for policy ${M[policy_name]}, this VM runs $POLICY_NAME"
+[ "${M[policy_group]}" = "$POLICY_GROUP" ] || reject "manifest is for group ${M[policy_group]}, this VM is $POLICY_GROUP"
+
+REV=${M[revision_id]} SHA=${M[archive_sha256]} SERIAL=${M[serial]}
+
+[ "$SERIAL" -le $((NOW + MAX_AHEAD)) ] || reject "serial $SERIAL is more than ${MAX_AHEAD}s ahead of this VM's clock"
+if [ -z "$LAST_SERIAL" ]; then
+  # No history to compare a serial with, so a validly signed old envelope
+  # would pass. The signers set this VM was built with must be the one the
+  # revision installs: an envelope from before the latest rotation is refused.
+  want_signers=$(sed 's/^[[:space:]]*//; s/[[:space:]]*$//' "$SIGNERS" | grep -v '^$' \
+                 | LC_ALL=C sort -u | sha256sum | cut -d' ' -f1)
+  [ "${M[signers_sha256]}" = "$want_signers" ] \
+    || reject "signers_sha256 does not match this VM's signers file (an envelope from before a signer rotation?)"
+elif [ "$SERIAL" -lt "$LAST_SERIAL" ]; then
+  reject "serial $SERIAL is older than the last applied $LAST_SERIAL"
+elif [ "$SERIAL" -eq "$LAST_SERIAL" ] && { [ "$REV" != "$LAST_REV" ] || [ "$SHA" != "$LAST_SHA" ]; }; then
+  reject "serial $SERIAL was already applied to a different revision"
+fi
+
+# ---- 4. the archive ----------------------------------------------------------
+
+ensure_archive "$REV" "$SHA"
+case $? in
+  0) ;;
+  1) delivery_failed ;;
+  *) status rejected "archive sha mismatch"; fall_back 12 ;;
+esac
+extract "$REV" || { status rejected "unsafe archive"; fall_back 12; }
+
+# ---- 5. converge -------------------------------------------------------------
+
+log "converging $POLICY_NAME@$POLICY_GROUP revision $REV (serial $SERIAL, signed by $verified)"
+if ! converge "$REV"; then
+  status converge-failed "$REV"
+  exit 13
+fi
+
+printf '%s %s %s\n' "$SERIAL" "$REV" "$SHA" > "$STATE/last-serial.tmp" \
+  && mv "$STATE/last-serial.tmp" "$STATE/last-serial"
+if [ -n "$LAST_REV" ] && [ "$LAST_REV" != "$REV" ]; then
+  echo "$LAST_REV" > "$STATE/previous-revision"
+fi
+status ok "$REV"
+
+# Keep the current revision and the one before it; nothing else.
+keep_prev=$(cat "$STATE/previous-revision" 2>/dev/null || true)
+for f in "$STATE"/archives/*.tgz; do
+  [ -e "$f" ] || continue
+  r=$(basename "$f" .tgz)
+  [ "$r" = "$REV" ] || [ "$r" = "$keep_prev" ] || rm -f "$f"
+done
+for d in "$STATE"/revisions/*; do
+  [ -e "$d" ] || continue
+  r=$(basename "$d")
+  [ "$r" = "$REV" ] || [ "$r" = "$keep_prev" ] || rm -rf "$d"
+done
+exit 0

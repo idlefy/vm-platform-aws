@@ -60,6 +60,8 @@ test-broker:
 	@true
 test-loki-token:
 	@true
+test-policy-fetch:
+	@true
 STUB
   git init -q --bare "$ORIGIN"
   ( cd "$WORK" && git init -q -b main && git add -A \
