@@ -7,6 +7,8 @@ require 'chefspec'
 require_relative '../../libraries/imds'
 require_relative '../support/home_boundary'
 
+SIGNER = 'ops namespaces="dev-vm-policy-production" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMkEu+CUWYGvccB0PoBw6SX1d6kJOSy2vALB7cAntO+E'.freeze
+
 describe 'base::default' do
   let(:chef_run) do
     ChefSpec::SoloRunner.new(platform: 'ubuntu', version: '24.04') do |node|
@@ -15,6 +17,7 @@ describe 'base::default' do
       node.override['base']['loki']['url']      = 'https://logs.example.grafana.net/loki/api/v1/push'
       node.override['base']['loki']['username'] = '12345'
       node.override['base']['loki']['ssm_parameter_name'] = '/test/loki-token'
+      node.override['base']['policy']['signers'] = [SIGNER]
       node.automatic['ec2']['public_ipv4'] = '203.0.113.5'
       node.automatic['hostname'] = 'devbox'
     end.converge(described_recipe)
@@ -27,6 +30,16 @@ describe 'base::default' do
     # the boundary would not be checked there. Pretend the device exists.
     allow(::File).to receive(:exist?).and_call_original
     allow(::File).to receive(:exist?).with('/dev/nvidia0').and_return(true)
+    # base::cinc_client refuses, at compile time, a VM without the v2
+    # policy.conf and a converge not started by dev-vm-policy-run. Present both,
+    # as a v2 VM would, so the whole run list reaches the boundary check.
+    allow(::File).to receive(:exist?).with('/etc/dev-vm/policy.conf').and_return(true)
+    allow(::File).to receive(:exist?).with('/etc/dev-vm/policy-signers').and_return(true)
+    allow(::File).to receive(:read).and_call_original
+    allow(::File).to receive(:read).with('/etc/dev-vm/policy-signers').and_return("#{SIGNER}\n")
+    allow(ENV).to receive(:[]).and_call_original
+    allow(ENV).to receive(:[]).with('DEV_VM_POLICY_SIGNED_BY').and_return('ops')
+    allow(ENV).to receive(:[]).with('DEV_VM_POLICY_GROUP').and_return('production')
     # base::aws_access resolves the ubuntu uid/gid via shell_out('id -u ubuntu')
     # / shell_out('id -g ubuntu') at compile time and returns early — leaving
     # only a `log` resource in the collection — when either is empty. On a

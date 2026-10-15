@@ -1,5 +1,79 @@
-# Ensure cinc-client runs on schedule and at boot
-# Re-reads EC2 tags (including PolicyName) each run
+# Keep this VM converging, with no CINC server: cinc-client.timer runs
+# dev-vm-policy-run, which fetches and verifies a signed envelope from the
+# tenant's bucket and runs cinc-client in local mode. The EC2 tags (Name,
+# PolicyName, PolicyGroup) are read once, by user_data at first boot, into
+# /etc/dev-vm/policy.conf; nothing here reads them again, since re-reading
+# would let anyone with ec2:CreateTags move a VM between policy groups.
+# Design: docs/design/serverless-policy-delivery.md.
+
+# A 1.x VM was built for a CINC server: it has a server-mode client.rb and no
+# policy.conf, and converging this recipe there would point its unit at a
+# launcher it does not have. Refuse before any resource runs.
+unless ::File.exist?(DevVm::PolicySigners::CONF)
+  raise "#{DevVm::PolicySigners::CONF} is missing: base 2.x converges only VMs built by the v2 module, " \
+        'which deliver policy from S3. A VM built for a CINC server stays on base-1.x.'
+end
+
+# Refuse a signers set that would lock the fleet out, at compile time, before
+# anything is written. See libraries/policy_signers.rb.
+signers = node['base']['policy']['signers'].to_a
+current_signers = ::File.exist?(DevVm::PolicySigners::SIGNERS) ? ::File.read(DevVm::PolicySigners::SIGNERS) : ''
+DevVm::PolicySigners.validate!(
+  signers,
+  current: current_signers,
+  signed_by: ENV['DEV_VM_POLICY_SIGNED_BY'].to_s,
+  group: ENV['DEV_VM_POLICY_GROUP'].to_s
+)
+
+file DevVm::PolicySigners::SIGNERS do
+  content DevVm::PolicySigners.canonical(signers)
+  owner 'root'
+  group 'root'
+  mode '0644'
+end
+
+# ---- the delivery script ------------------------------------------------------
+# user_data installs dev-vm-policy-fetch at first boot; this keeps it current.
+# The new version is staged beside the one in use, must pass --self-test
+# against the shipped fixture, and only then replaces it — by mv, never an
+# in-place write, because the running converge is a child of the old script
+# and bash keeps reading the inode it opened. The old version stays as .prev
+# for the launcher, which only user_data writes.
+fetch    = '/usr/local/sbin/dev-vm-policy-fetch'
+selftest = '/usr/share/dev-vm/policy-fetch-selftest'
+
+directory '/usr/share/dev-vm' do
+  owner 'root'
+  group 'root'
+  mode '0755'
+end
+
+remote_directory selftest do
+  source 'policy-fetch-selftest'
+  owner 'root'
+  group 'root'
+  mode '0700'
+  files_owner 'root'
+  files_group 'root'
+  files_mode '0700'
+  purge true
+end
+
+cookbook_file "#{fetch}.new" do
+  source 'dev-vm-policy-fetch'
+  owner 'root'
+  group 'root'
+  mode '0700'
+end
+
+execute 'install dev-vm-policy-fetch' do
+  command "#{fetch}.new --self-test #{selftest} && " \
+          "{ [ ! -e #{fetch} ] || cp -p #{fetch} #{fetch}.prev; } && " \
+          "mv #{fetch}.new #{fetch}"
+  not_if "cmp -s #{fetch}.new #{fetch}"
+end
+
+# ---- the CINC client ------------------------------------------------------------
 
 # Pinned CINC client version for the whole fleet.
 #
