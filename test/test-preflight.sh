@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# scripts/preflight.sh against shimmed terraform/aws/curl/knife. Nothing here
+# scripts/preflight.sh against shimmed terraform/aws/curl. Nothing here
 # touches AWS. Each scenario builds a throwaway tenant tree (vms/ + the
 # policyfile), points PATH at the shims, runs preflight, and greps its output.
 #
 # The terraform shim answers `console` with a canned jsonencode() result — a
 # JSON string, double-encoded exactly as the real console prints it.
+#
+# policy-publish.sh is a shim too: its `show` mode is tested against real
+# envelopes in test-policy-publish.sh, and what is tested here is what
+# preflight makes of each answer.
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -36,7 +40,8 @@ cat > "$T/bin/aws" <<'SH'
 #!/usr/bin/env bash
 echo "$*" >> "$AWS_LOG"
 case "$1 $2" in
-  "sts get-caller-identity")  exit 0 ;;
+  "sts get-caller-identity")  echo 111122223333 ;;
+  "s3api head-bucket")        [ -z "${HEAD_BUCKET_ERR:-}" ] || { echo "$HEAD_BUCKET_ERR" >&2; exit 254; } ;;
   "ssm describe-parameters")  echo SecureString ;;
   "ssm get-parameter")        echo not-a-real-token ;;
   "iam get-policy")           exit 0 ;;
@@ -47,20 +52,37 @@ cat > "$T/bin/curl"  <<'SH'
 #!/usr/bin/env bash
 echo 400
 SH
-cat > "$T/bin/knife" <<'SH'
+cat > "$T/scripts/policy-publish.sh" <<'SH'
 #!/usr/bin/env bash
-exit 1
+[ "$1" = show ] || exit 9
+env | grep -E '^(POLICY_|AWS_PROFILE=)' | sort > "$SHOW_ENV"
+cp "$POLICY_SIGNERS_FILE" "$SHOW_ENV.signers"
+printf '%s\n%s\n' "$SHOW_STAGING" "$SHOW_PRODUCTION"
+exit "${SHOW_RC:-0}"
 SH
-chmod +x "$T/bin/"*
+chmod +x "$T/bin/"* "$T/scripts/policy-publish.sh"
 
-# fixture <shipping:true|false> <loki:name|null>  → writes the console answer
+SIGNER='ops namespaces="dev-vm-policy-staging,dev-vm-policy-production" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOps'
+SIGNERS_SHA=$(printf '%s\n' "$SIGNER" | sha256sum | cut -d' ' -f1)
+LOCKREV=$(printf 'lock' | sha256sum | cut -d' ' -f1)
+OTHERREV=$(printf 'other' | sha256sum | cut -d' ' -f1)
+printf '{"name": "dev-vm", "revision_id": "%s"}' "$LOCKREV" > "$T/cinc/policyfiles/dev-vm.lock.json"
+# show_answers <staging line> <production line> — what the shim prints
+show_answers() { SHOW_STAGING=$1 SHOW_PRODUCTION=$2; }
+agreeing() { show_answers "staging ok 1 $LOCKREV $SIGNERS_SHA" "production ok 1 $LOCKREV $SIGNERS_SHA"; }
+agreeing
+
+# fixture <shipping:true|false> <loki:name|null> [owner] [kms]  → writes the console answer
 fixture() {
-  python3 - "$1" "$2" > "$T/fixture.json" <<'PY'
+  python3 - "$1" "$2" "${3:-111122223333}" "${4:-}" "$SIGNER" > "$T/fixture.json" <<'PY'
 import json, sys
 shipping = sys.argv[1] == "true"
 loki = None if sys.argv[2] == "null" else sys.argv[2]
 inner = json.dumps({"regions": ["eu-central-1"], "loki": loki, "shipping": shipping,
-                    "cinc": "/t/cinc", "profile": "p", "bundles": {}})
+                    "profile": "p", "bundles": {},
+                    "bucket": "t-policies", "owner": sys.argv[3], "bucket_region": "eu-west-1",
+                    "prefix": "dev-vm-policies", "kms": sys.argv[4] or None,
+                    "signers": [sys.argv[5]]})
 print(json.dumps(inner))
 PY
 }
@@ -68,6 +90,7 @@ PY
 run_preflight() {
   : > "$T/aws.log"
   PATH="$T/bin:$PATH" PREFLIGHT_FIXTURE="$T/fixture.json" AWS_LOG="$T/aws.log" \
+    SHOW_ENV="$T/show.env" SHOW_STAGING="$SHOW_STAGING" SHOW_PRODUCTION="$SHOW_PRODUCTION" \
     "$T/scripts/preflight.sh" > "$T/out" 2>&1
   echo $?
 }
@@ -139,14 +162,14 @@ rc=$(run_preflight)
 check "exit 1" "$([ "$rc" = 1 ]; echo $?)"
 check "names both values" "$(grep -q 'log_shipping=true.*enabled=false' "$T/out"; echo $?)"
 
-echo "== both off: loki checks are skipped, cinc still checked =="
+echo "== both off: loki checks are skipped, and no SSM call is left =="
 fixture false null
 rc=$(run_preflight)
 check "exit 0" "$([ "$rc" = 0 ]; echo $?)"
 check "three skipped lines" "$([ "$(grep -c 'log shipping disabled — skipped' "$T/out")" = 3 ]; echo $?)"
 check "no loki parameter lookup" "$(! grep -q 'Values=/t/loki' "$T/aws.log"; echo $?)"
 check "no token fetch" "$(! grep -q 'ssm get-parameter' "$T/aws.log"; echo $?)"
-check "cinc parameter still checked" "$(grep -q 'Values=/t/cinc' "$T/aws.log"; echo $?)"
+check "no SSM call at all (there is no validator key)" "$(! grep -q '^ssm ' "$T/aws.log"; echo $?)"
 
 echo "== both off but the policyfile still carries loki lines: warn, not fail =="
 cat > "$PF" <<'RB'
@@ -231,6 +254,73 @@ printf '#!/usr/bin/env bash\necho 400\n' > "$T/bin/curl"
 rc=$(run_preflight)
 check "exit 0" "$([ "$rc" = 0 ]; echo $?)"
 check "credentials accepted" "$(grep -q 'credentials accepted' "$T/out"; echo $?)"
+
+echo "== policy delivery: everything agrees =="
+fixture true /t/loki
+agreeing
+rc=$(run_preflight)
+check "exit 0" "$([ "$rc" = 0 ]; echo $?)"
+check "bucket checked in its own region, pinned to its owner" \
+  "$(grep -q 's3api head-bucket --bucket t-policies --expected-bucket-owner 111122223333 --region eu-west-1' "$T/aws.log"; echo $?)"
+check "show got the bucket from vms/" "$(grep -qx 'POLICY_BUCKET=t-policies' "$T/show.env"; echo $?)"
+check "...the region" "$(grep -qx 'POLICY_BUCKET_REGION=eu-west-1' "$T/show.env"; echo $?)"
+check "...and var.policy_signers" "$(grep -qxF "$SIGNER" "$T/show.env.signers"; echo $?)"
+check "both groups on the lock's revision" "$(grep -q "staging and production both on ${LOCKREV:0:12}" "$T/out"; echo $?)"
+check "signers agree" "$(grep -q 'var.policy_signers is the set production installs' "$T/out"; echo $?)"
+check "no warnings" "$(grep -q '0 warning' "$T/out"; echo $?)"
+
+echo "== policy delivery: promote pending =="
+show_answers "staging ok 2 $LOCKREV $SIGNERS_SHA" "production ok 1 $OTHERREV $SIGNERS_SHA"
+rc=$(run_preflight)
+check "exit 0" "$([ "$rc" = 0 ]; echo $?)"
+check "says promote is pending" "$(grep -q "make promote' pending" "$T/out"; echo $?)"
+
+echo "== policy delivery: production matches the lock, staging is stale =="
+show_answers "staging ok 2 $OTHERREV $SIGNERS_SHA" "production ok 1 $LOCKREV $SIGNERS_SHA"
+rc=$(run_preflight)
+check "says do NOT promote" "$(grep -q 'do NOT promote' "$T/out"; echo $?)"
+
+echo "== policy delivery: nothing published yet =="
+show_answers "staging missing" "production missing"
+rc=$(run_preflight)
+check "exit 0 (a first promote must get through its own preflight)" "$([ "$rc" = 0 ]; echo $?)"
+check "warns a production VM would fail closed" "$(grep -q 'production.json.*fails closed' "$T/out"; echo $?)"
+check "says to push" "$(grep -q 'staging.json.*make push' "$T/out"; echo $?)"
+
+echo "== policy delivery: an envelope that does not verify =="
+show_answers "staging invalid" "production ok 1 $LOCKREV $SIGNERS_SHA"
+rc=$(run_preflight)
+check "exit 1" "$([ "$rc" = 1 ]; echo $?)"
+check "says it does not verify" "$(grep -q 'staging.json does not verify' "$T/out"; echo $?)"
+
+echo "== policy delivery: a rotation in progress =="
+show_answers "staging ok 2 $LOCKREV $SIGNERS_SHA" "production ok 1 $LOCKREV $(printf x | sha256sum | cut -d' ' -f1)"
+rc=$(run_preflight)
+check "exit 0" "$([ "$rc" = 0 ]; echo $?)"
+check "warns that a new VM fails closed until they agree" "$(grep -q 'var.policy_signers differs.*fails closed' "$T/out"; echo $?)"
+
+echo "== policy delivery: the bucket cannot be reached =="
+agreeing
+rc=$(HEAD_BUCKET_ERR='An error occurred (403) when calling the HeadBucket operation: Forbidden' run_preflight)
+check "exit 1" "$([ "$rc" = 1 ]; echo $?)"
+check "names the bucket" "$(grep -q 't-policies.*not reachable' "$T/out"; echo $?)"
+rc=$(HEAD_BUCKET_ERR='An error occurred (AccessDenied) ... with an explicit deny in a service control policy' run_preflight)
+check "an SCP denial names the region allowlist" "$(grep -q 'SCP.*eu-west-1' "$T/out"; echo $?)"
+
+echo "== policy delivery: show itself fails =="
+rc=$(SHOW_RC=1 run_preflight)
+check "exit 1" "$([ "$rc" = 1 ]; echo $?)"
+check "says it could not read the envelopes" "$(grep -q 'could not read the envelopes' "$T/out"; echo $?)"
+
+echo "== policy delivery: a cross-account bucket or a KMS key =="
+fixture true /t/loki 444455556666
+rc=$(run_preflight)
+check "cross-account: exit 0" "$([ "$rc" = 0 ]; echo $?)"
+check "cross-account: points at the runbook's bucket policy" "$(grep -q 'bucket policy.*runbook' "$T/out"; echo $?)"
+fixture true /t/loki 111122223333 arn:aws:kms:eu-west-1:111122223333:key/k
+rc=$(run_preflight)
+check "kms: points at the runbook's key policy" "$(grep -q 'key policy.*runbook' "$T/out"; echo $?)"
+fixture true /t/loki
 
 echo
 echo "passed: $PASS  failed: $FAIL"

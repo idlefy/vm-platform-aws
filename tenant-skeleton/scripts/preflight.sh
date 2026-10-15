@@ -39,26 +39,43 @@ head_ "Reading tenant configuration"
 # pretty-printed expression fails with "Expected the start of an expression, but
 # found the end of the file" — which reads like a syntax error in the HCL rather
 # than in this script.
-CONSOLE_EXPR='jsonencode({regions = keys(local.regions), loki = var.loki_ssm_parameter_name, shipping = var.log_shipping, cinc = var.cinc_ssm_parameter_name, profile = var.aws_profile, bundles = {for k, v in var.access_bundles : k => v.policy_arns}})'
+CONSOLE_EXPR='jsonencode({regions = keys(local.regions), loki = var.loki_ssm_parameter_name, shipping = var.log_shipping, profile = var.aws_profile, bucket = var.policy_bucket, owner = var.policy_bucket_owner, bucket_region = var.policy_bucket_region, prefix = var.policy_prefix, kms = var.policy_kms_key_arn, signers = var.policy_signers, bundles = {for k, v in var.access_bundles : k => v.policy_arns}})'
 
 # console prints the jsonencode() result as a quoted JSON *string*, hence the
 # double decode below.
+#
+# var.policy_signers goes to a file, for `policy-publish.sh show`; cleanup()
+# is every trap's handler from here on, the Loki section's included.
+SIGNERS_FILE="$(mktemp)" TMPC=""
+# shellcheck disable=SC2317  # reached only through the traps below
+cleanup() { rm -f "$SIGNERS_FILE"; [ -z "$TMPC" ] || rm -f "$TMPC"; }
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 RAW="$(cd "$VMS" && echo "$CONSOLE_EXPR" | terraform console 2>/dev/null | tail -1)"
 # All-or-nothing. The old version printed line by line and shlex.quote() raised
 # TypeError on a null loki name (and on the bool) — after REGIONS= was already
 # on stdout. VARS was then non-empty, the guard below did not fire, and the
 # script died later at "$PROFILE: unbound variable" with no diagnostic. Now any
 # failure prints nothing and the guard names the cause.
-VARS="$(python3 - "$RAW" 2>/dev/null <<'PY'
-import sys, json, shlex
+VARS="$(python3 - "$RAW" "$SIGNERS_FILE" 2>/dev/null <<'PY'
+import hashlib, sys, json, shlex
 try:
     c = json.loads(json.loads(sys.argv[1]))
+    kept = sorted({l.strip() for l in c["signers"] if l.strip()})
+    canonical = "".join(l + "\n" for l in kept)
+    open(sys.argv[2], "w").write(canonical)
     out = [
         "REGIONS=%s" % shlex.quote(" ".join(c["regions"])),
         "LOKI_PARAM=%s" % shlex.quote(c["loki"] or ""),
         "LOG_SHIPPING=%s" % shlex.quote(str(c["shipping"]).lower()),
-        "CINC_PARAM=%s" % shlex.quote(c["cinc"]),
         "PROFILE=%s" % shlex.quote(c["profile"]),
+        "POLICY_BUCKET=%s" % shlex.quote(c["bucket"]),
+        "POLICY_BUCKET_OWNER=%s" % shlex.quote(c["owner"]),
+        "POLICY_BUCKET_REGION=%s" % shlex.quote(c["bucket_region"]),
+        "POLICY_PREFIX=%s" % shlex.quote(c["prefix"]),
+        "POLICY_KMS_KEY=%s" % shlex.quote(c["kms"] or ""),
+        "VAR_SIGNERS_SHA=%s" % hashlib.sha256(canonical.encode()).hexdigest(),
     ]
     arns = sorted({a for v in c["bundles"].values() for a in v})
     out.append("BUNDLE_ARNS=%s" % shlex.quote(" ".join(arns)))
@@ -114,7 +131,7 @@ awk '
 export AWS_PROFILE="$PROFILE"
 ok "profile=$PROFILE regions=$(echo "$REGIONS" | wc -w | tr -d ' ') bundles=$BUNDLE_COUNT"
 
-aws sts get-caller-identity >/dev/null 2>&1 \
+ACCOUNT="$(aws sts get-caller-identity --query Account --output text 2>/dev/null)" \
   && ok "AWS credentials for profile '$PROFILE' work" \
   || { bad "AWS credentials for profile '$PROFILE' do not work"; echo; echo "Nothing else can be checked."; exit 1; }
 
@@ -186,9 +203,9 @@ fi
 # fails to fetch. Metadata only; no --with-decryption, so no value is read.
 # ---------------------------------------------------------------------------
 head_ "Per-region SSM parameters exist"
-[ "$SHIPPING" = false ] && ok "log shipping disabled — skipped (loki)"
-pairs="cinc:$CINC_PARAM"
-[ "$SHIPPING" = false ] || pairs="loki:$LOKI_PARAM $pairs"
+pairs=""
+if [ "$SHIPPING" = false ]; then ok "log shipping disabled — skipped (loki)"
+else pairs="loki:$LOKI_PARAM"; fi
 for R in $REGIONS; do
   # unquoted on purpose: SSM parameter names cannot contain whitespace, so
   # word-splitting is the iteration
@@ -237,15 +254,12 @@ else
   # curl config file; the two rm calls on the normal path do nothing for a ^C or
   # a killed curl, and the plaintext token then stays in TMPDIR. Set once, before
   # the loop, and cleared after it.
-  TMPC=""
-  # Separate traps, because one combined trap does not stop the script. With a
-  # handler installed for INT, bash runs it and then carries on from the next
-  # command instead of dying — so a ^C in the middle of this loop removed the
-  # token file and then kept querying Loki. The signal handlers exit; the EXIT
+  # Separate traps (installed at the top, with cleanup() as the handler),
+  # because one combined trap does not stop the script. With a handler
+  # installed for INT, bash runs it and then carries on from the next command
+  # instead of dying — so a ^C in the middle of this loop removed the token
+  # file and then kept querying Loki. The signal handlers exit; the EXIT
   # handler only cleans up.
-  trap 'rm -f "$TMPC"' EXIT
-  trap 'rm -f "$TMPC"; exit 130' INT
-  trap 'rm -f "$TMPC"; exit 143' TERM
   for R in $REGIONS; do
     umask 077
     TMPC="$(mktemp)"
@@ -288,7 +302,12 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Informational: where are the two policy groups relative to this working tree?
+# Policy delivery. The bucket is the one thing every VM needs from outside its
+# own account boundary at every converge, and nothing in a plan touches it:
+# Terraform names it, never reads it.
+#
+# The envelope lines come from `policy-publish.sh show`, the same code that
+# signs them, so this verifies exactly what a VM would.
 #
 # A revision_id is a content hash, so two of them carry no order — "differs"
 # is all a comparison of the two groups can honestly say. An earlier version of
@@ -298,34 +317,77 @@ fi
 # advice would have moved the fleet backwards. The lockfile is the third point
 # that gives the other two a direction, which is why it is read here.
 # ---------------------------------------------------------------------------
-head_ "Policy groups"
-grp_rev() {
-  ( cd "$ROOT/cinc" && knife raw "/policy_groups/$1" -c ./.chef/knife.rb 2>/dev/null ) \
-    | python3 -c 'import sys,json
-try: print(json.load(sys.stdin).get("policies",{}).get("dev-vm",{}).get("revision_id","")[:12])
-except Exception: print("")' 2>/dev/null
-}
-if command -v knife >/dev/null; then
-  S="$(grp_rev staging)"; P="$(grp_rev production)"
-  # The lockfile is rewritten by `make push`, so it names the revision the last
-  # push published — the only one of the three whose provenance is knowable here.
-  L="$(python3 -c 'import json;print(json.load(open("'"$ROOT"'/cinc/policyfiles/dev-vm.lock.json"))["revision_id"][:12])' 2>/dev/null)"
-  if [ -z "$S$P" ]; then
-    warn "could not reach the CINC server"
-  elif [ "$S" = "$P" ]; then
-    ok "staging and production both on $S"
-    [ -n "$L" ] && [ "$L" != "$S" ] &&
-      warn "...but the lockfile names $L — the working tree has not been pushed"
-  elif [ -n "$L" ] && [ "$S" = "$L" ]; then
-    warn "staging ($S) matches the lockfile, production ($P) does not — 'make promote' pending"
-  elif [ -n "$L" ] && [ "$P" = "$L" ]; then
-    warn "production ($P) matches the lockfile, staging ($S) is a stale build — 'make push' refreshes it; do NOT promote"
-  else
-    warn "staging ($S) and production ($P) differ and neither matches the lockfile (${L:-unreadable}) — 'make push' before promoting anything"
-  fi
+head_ "Policy delivery"
+if ERR="$(aws s3api head-bucket --bucket "$POLICY_BUCKET" --expected-bucket-owner "$POLICY_BUCKET_OWNER" \
+            --region "$POLICY_BUCKET_REGION" 2>&1 >/dev/null)"; then
+  ok "bucket $POLICY_BUCKET reachable in $POLICY_BUCKET_REGION, owned by $POLICY_BUCKET_OWNER"
+elif grep -qi 'service control policy' <<<"$ERR"; then
+  # The VMs' own fetches go to the same regional endpoint, so they meet the
+  # same deny — and opt-in status does not reveal an allowlist.
+  bad "bucket $POLICY_BUCKET is not reachable: an SCP denies $POLICY_BUCKET_REGION. The bucket's region must be in the organisation's region allowlist, or no VM can fetch policy"
 else
-  warn "knife not on PATH — skipped"
+  bad "bucket $POLICY_BUCKET is not reachable in $POLICY_BUCKET_REGION as owned by $POLICY_BUCKET_OWNER: ${ERR##*: }"
 fi
+# What the operator's credentials cannot see. A cross-account bucket policy and
+# a KMS key policy are read by AWS on the VM's request, not on this one, and
+# simulate-principal-policy evaluates neither — a green answer from it would
+# prove nothing. So these are reminders, not checks.
+[ "$POLICY_BUCKET_OWNER" = "$ACCOUNT" ] \
+  || warn "the bucket is in account $POLICY_BUCKET_OWNER: the VMs' bootstrap roles read it only if its bucket policy allows them, and this account cannot see that policy — compare it with the statement in the runbook"
+[ -z "$POLICY_KMS_KEY" ] \
+  || warn "objects are encrypted with $POLICY_KMS_KEY: the bootstrap roles decrypt only if its key policy allows them — compare it with the statement in the runbook"
+
+shopt -s nullglob
+for pf in "$ROOT"/cinc/policyfiles/*.rb; do
+  name="$(basename "$pf" .rb)"
+  L="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["revision_id"])' "${pf%.rb}.lock.json" 2>/dev/null)"
+  [ -n "$L" ] || { bad "$name: no readable lock next to $pf"; continue; }
+  if ! OUT="$(POLICY_BUCKET="$POLICY_BUCKET" POLICY_BUCKET_OWNER="$POLICY_BUCKET_OWNER" \
+              POLICY_BUCKET_REGION="$POLICY_BUCKET_REGION" POLICY_PREFIX="$POLICY_PREFIX" \
+              POLICY_SIGNERS_FILE="$SIGNERS_FILE" "$ROOT/scripts/policy-publish.sh" show "$pf" 2>&1)"; then
+    bad "$name: could not read the envelopes: $(tail -1 <<<"$OUT")"
+    continue
+  fi
+  S='' P='' PSIGNERS=''
+  while read -r group state _ rev signers; do
+    case "$group $state" in
+      "staging ok")         S="$rev" ;;
+      "production ok")      P="$rev" PSIGNERS="$signers" ;;
+      "staging missing")    warn "$name: there is no staging.json yet — 'make push' publishes one" ;;
+      # Not a failure: the first promote runs this preflight before it writes one.
+      "production missing") warn "$name: there is no production.json yet — a production VM created now fails closed; promote before creating one" ;;
+      *" invalid")          bad "$name: $group.json does not verify against var.policy_signers — a VM created now fails closed, and whoever wrote it should not have been able to" ;;
+    esac
+  done <<<"$OUT"
+
+  s="${S:0:12}" p="${P:0:12}" l="${L:0:12}"
+  if [ -n "$S" ] && [ -n "$P" ]; then
+    if [ "$S" = "$P" ]; then
+      ok "$name: staging and production both on $s"
+      [ "$L" = "$S" ] || warn "$name: ...but the lock names $l — the working tree has not been pushed"
+    elif [ "$S" = "$L" ]; then
+      warn "$name: staging ($s) matches the lock, production ($p) does not — 'make promote' pending"
+    elif [ "$P" = "$L" ]; then
+      warn "$name: production ($p) matches the lock, staging ($s) is a stale build — 'make push' refreshes it; do NOT promote"
+    else
+      warn "$name: staging ($s) and production ($p) differ and neither matches the lock ($l) — 'make push' before promoting anything"
+    fi
+  elif [ -n "$S" ] && [ "$S" != "$L" ]; then
+    warn "$name: staging ($s) is not the lock ($l) — 'make push' before promoting"
+  fi
+
+  # The set a new VM gets at first boot is var.policy_signers; the set every
+  # converged production VM holds is what production installed. A new VM with
+  # no history checks one against the other (signers_sha256) and refuses on a
+  # difference — the safe outcome while a rotation is half done.
+  if [ -n "$PSIGNERS" ]; then
+    if [ "$PSIGNERS" = "$VAR_SIGNERS_SHA" ]; then
+      ok "$name: var.policy_signers is the set production installs"
+    else
+      warn "$name: var.policy_signers differs from the set production installs — expected mid-rotation, but until they agree a VM created now fails closed"
+    fi
+  fi
+done
 
 # ---------------------------------------------------------------------------
 printf '\n\033[1m%d passed, %d failed, %d warning(s)\033[0m\n' "$PASS" "$FAIL" "$WARN"
