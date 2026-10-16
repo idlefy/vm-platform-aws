@@ -136,6 +136,30 @@ run "boundary_denies_every_launch_path" {
   }
 }
 
+run "bootstrap_user_data_output_is_the_rendered_script" {
+  command = plan
+  assert {
+    condition     = output.bootstrap_user_data == local.user_data_script
+    error_message = "bootstrap_user_data must be exactly what instances boot with; make ami appends to it."
+  }
+  assert {
+    condition     = startswith(output.bootstrap_user_data, "#!/bin/bash\n")
+    error_message = "bootstrap_user_data must be the plain script, not the gzipped form."
+  }
+}
+
+run "bootstrap_is_idempotent_on_a_prebuilt_image" {
+  command = plan
+  assert {
+    condition     = strcontains(local.user_data_script, "dpkg-query -W -f='$${db:Status-Abbrev} $${Version}' cinc")
+    error_message = "the CINC download must be skipped when the pinned version is installed (prebuilt image)."
+  }
+  assert {
+    condition     = strcontains(local.user_data_script, "iptables -C OUTPUT \"$@\" 2>/dev/null || iptables -A OUTPUT \"$@\"") && !strcontains(local.user_data_script, "iptables -A OUTPUT -d 169.254.169.254")
+    error_message = "every IMDS iptables -A needs an iptables -C guard: a prebuilt image restores rules.v4 before the bootstrap runs."
+  }
+}
+
 run "boundary_denies_asset_routes_found_in_review" {
   command = plan
 
@@ -188,6 +212,46 @@ run "boundary_denies_asset_routes_found_in_review" {
       )
     ])
     error_message = "The identity boundary's Deny statement must cover the EBS direct-read, fleet-network, termination and console-output routes (first external review, H1/H2)."
+  }
+
+  # Glob-matched, like the sibling-route test below: the image routes are
+  # partly wildcard families, so contains() on the literal list would miss them.
+  assert {
+    condition = alltrue([
+      for action in [
+        "ec2:RegisterImage", "ec2:CopyImage", "ec2:CreateImage", "ec2:ImportImage",
+        "ec2:CreateRestoreImageTask", "ec2:CreateStoreImageTask", "ec2:ExportImage",
+        "ec2:ModifyImageAttribute", "ec2:DeregisterImage", "ec2:EnableImage",
+        "ec2:ImportSnapshot", "ec2:CopySnapshot", "ec2:ModifySnapshotAttribute", "ec2:DeleteSnapshot",
+        "ec2:DisableImage", "ec2:EnableImageDeprecation", "ec2:DisableImageDeprecation",
+        "ec2:DisableImageBlockPublicAccess", "ec2:DisableImageDeregistrationProtection",
+        "ec2:RestoreImageFromRecycleBin", "ec2:RestoreSnapshotFromRecycleBin",
+        # Image Builder registers AMIs in this account through its own role, so
+        # these need no iam:PassRole once an infrastructure configuration exists.
+        "imagebuilder:CreateImage", "imagebuilder:CreateImageRecipe", "imagebuilder:CreateImagePipeline",
+        "imagebuilder:StartImagePipelineExecution", "imagebuilder:CreateDistributionConfiguration",
+        "imagebuilder:UpdateDistributionConfiguration", "imagebuilder:ImportVmImage",
+        "imagebuilder:ImportDiskImage", "imagebuilder:CreateLifecyclePolicy",
+        "imagebuilder:StartResourceStateUpdate", "imagebuilder:PutImagePolicy",
+        ] : anytrue([
+          for st in jsondecode(aws_iam_policy.identity_boundary["vm"].policy).Statement :
+          st.Effect == "Deny" && anytrue([
+            for p in flatten([st.Action]) : can(regex("^${replace(p, "*", ".*")}$", action))
+          ])
+      ])
+    ])
+    error_message = "With ami_owners = [\"self\"], anyone who can register or copy an image under the name pattern chooses what the next VM boots, anyone who can store, export or share one reads it, and anyone who can disable, deprecate or hide one rolls the fleet back. Every image route must be denied (AGENTS.md trap 1)."
+  }
+
+  # Resolving the newest image is a read the data source needs.
+  assert {
+    condition = !anytrue([
+      for st in jsondecode(aws_iam_policy.identity_boundary["vm"].policy).Statement :
+      st.Effect == "Deny" && anytrue([
+        for p in flatten([st.Action]) : can(regex("^${replace(p, "*", ".*")}$", "ec2:DescribeImages"))
+      ])
+    ])
+    error_message = "A deny wildcard matches ec2:DescribeImages, which the AMI lookup needs."
   }
 
   assert {

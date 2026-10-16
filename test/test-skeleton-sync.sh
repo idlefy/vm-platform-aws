@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The skeleton ships copies of four scripts. This proves the copies have not
+# The skeleton ships copies of several scripts. This proves the copies have not
 # drifted from the originals.
 #
 # It exists because they had. tenant-skeleton/scripts/resolve-pin.sh was copied
@@ -24,7 +24,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PASS=0
 FAIL=0
 
-SHIPPED="resolve-pin.sh pin-check.sh preflight.sh add-region.sh placeholder-check.sh policy-publish.sh"
+SHIPPED="resolve-pin.sh pin-check.sh preflight.sh add-region.sh placeholder-check.sh policy-publish.sh ami-build.sh"
 
 check() {
   if [ "$2" = "0" ]; then PASS=$((PASS+1)); echo "  ok   $1"
@@ -58,6 +58,12 @@ done
 check "tenant-skeleton/SETUP.md exists" "$([ -f "$ROOT/tenant-skeleton/SETUP.md" ]; echo $?)"
 check "the skeleton's AGENTS.md points at SETUP.md" \
   "$(grep -q 'SETUP.md' "$ROOT/tenant-skeleton/AGENTS.md" 2>/dev/null; echo $?)"
+check "tenant-skeleton/IMAGE.md exists" "$([ -f "$ROOT/tenant-skeleton/IMAGE.md" ]; echo $?)"
+check "the skeleton's AGENTS.md points at IMAGE.md" \
+  "$(grep -q 'IMAGE.md' "$ROOT/tenant-skeleton/AGENTS.md" 2>/dev/null; echo $?)"
+img_code=$(awk '/^```/{f=!f;next} f' "$ROOT/tenant-skeleton/IMAGE.md" 2>/dev/null)
+check "IMAGE.md never runs terraform apply" "$(! printf '%s\n' "$img_code" | grep -q 'terraform apply'; echo $?)"
+check "IMAGE.md builds through make ami, not raw packer" "$(! printf '%s\n' "$img_code" | grep -q '^packer build'; echo $?)"
 # Live files must not point at the old names. The design records and old
 # changelog entries describe the tree as it was, and keep their wording.
 stale=$(cd "$ROOT" && git grep -n -e 'CLAUDE\.md' -e '\.claude/skills' -e 'tenant-setup' -e 'get-started skill' -- \

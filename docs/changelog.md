@@ -1,5 +1,36 @@
 # Changelog
 
+## 2.1.0
+
+A fleet can boot from a prebuilt image: the first converge is done once, ahead
+of time. Measured on `c7a.large`, a new VM's first converge updated 19
+resources in 1m12s instead of 161 in 2m09s, and its boot finished in 2m17s
+instead of 3m19s. Nothing about what a VM trusts
+changes; it still verifies and converges its group's signed envelope. Design:
+`docs/design/ami-image.md`. No base release.
+
+**`v2.1.0`**
+
+- The ec2 module exposes the rendered first-boot script as the
+  `bootstrap_user_data` output, and that script is idempotent, so a booted
+  image can run it again.
+- The permissions boundary denies every route to the fleet's images (create,
+  register, copy, share, deregister, and the disable, deprecate and
+  recycle-bin routes) as families, not as single calls. That includes Image
+  Builder, which registers AMIs through its own role: a bundle that names
+  `imagebuilder` keeps its reads and loses `Create*`, `Update*`, `Start*`,
+  `Import*` and `Put*`.
+- `image/` holds the Packer template and the scrub, read from the pinned
+  checkout.
+- `make ami` builds the image from the promoted production revision and copies
+  it to every configured region.
+- `tenant-skeleton/IMAGE.md` is the guide an agent follows to build or refresh
+  the image.
+- `make preflight` checks the image's age when `ami_owners` names `self`: a
+  warning past 35 days, a failure for a region with no matching image.
+- To adopt it: run `terraform apply` once on `v2.1.0` (it adds an output),
+  then `make ami`.
+
 ## 2.0.1
 
 The agent guide is now `AGENTS.md`, which Claude Code and Codex both read. The

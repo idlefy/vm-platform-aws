@@ -8,7 +8,7 @@ publishes two artifacts, and nothing deploys from it.
 | Artifact | Path | Consumed as |
 |---|---|---|
 | the CINC cookbook | `cinc/cookbooks/base/**` | a Policyfile `git`+`tag`+`rel` pin |
-| the Terraform modules | `vms/modules/**`, `tenant-skeleton/**` | `?ref=<full-sha>` on each module `source` |
+| the Terraform modules | `vms/modules/**`, `tenant-skeleton/**`, `image/**` | `?ref=<full-sha>` on each module `source` |
 
 A tenant repository is generated from `tenant-skeleton/` and holds its own
 configuration and nothing else. Tenant operations — creating a VM, deleting one,
@@ -32,13 +32,14 @@ are in `docs/design/serverless-policy-delivery.md`.
 
 ```bash
 make boundary-check                                    # modules stay inside themselves
-( cd vms/modules/ec2          && terraform test )      # 53 runs
+( cd vms/modules/ec2          && terraform test )      # 55 runs
 ( cd vms/modules/fleet-guards && terraform test )      # 5 runs
 make smoke                                             # the skeleton against this tree
 for t in test/test-release-gate.sh test/test-resolve-pin.sh test/test-boundary-check.sh \
          test/test-placeholder-check.sh test/test-prepare.sh test/test-pin-to-worktree.sh \
          test/test-preflight.sh test/test-skeleton-sync.sh test/test-fetch-sync.sh \
-         test/test-policy-publish.sh test/test-get-started.sh; do "$t"; done
+         test/test-policy-publish.sh test/test-get-started.sh \
+         test/test-image-template.sh test/test-image-scrub.sh test/test-ami-build.sh; do "$t"; done
 ( cd cinc && make lint && make test && make test-broker && make test-loki-token && make test-policy-fetch )
 make test-pin-check                                    # root target; needs chef
 mkdocs build --strict
@@ -258,13 +259,16 @@ that consumers cannot reach:
 | Stream | Publishes | Gates | Lockstep |
 |---|---|---|---|
 | `base-X.Y.Z` | `cinc/cookbooks/base/**` | `cookstyle`, `chefspec`, `test-broker`, `test-loki-token`, `test-policy-fetch`, `test-fetch-sync` | `metadata.rb` must say `X.Y.Z`, byte for byte |
-| `vX.Y.Z` | `vms/modules/**` + `tenant-skeleton/**` | `boundary-check`, `test-skeleton-sync`, `test-fetch-sync`, `test-policy-publish`, `smoke` | none — the module carries no version string |
+| `vX.Y.Z` | `vms/modules/**` + `tenant-skeleton/**` + `image/**` | `boundary-check`, `test-skeleton-sync`, `test-fetch-sync`, `test-policy-publish`, `test-image-template`, `test-image-scrub`, `test-ami-build`, `smoke` | none — the module carries no version string |
 
 ```bash
 make release TAG=base-1.0.0
 make release TAG=v1.0.0
 git push origin <tag>
 ```
+
+The `v` stream's gate needs Packer (CI pins 1.11.2) on the releasing
+workstation, plus network access for `packer init`.
 
 The gates run against the working tree while a tag names a commit, which is why
 `release` prints the SHA before it starts and tags that SHA explicitly. Tags are

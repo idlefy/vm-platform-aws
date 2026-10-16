@@ -45,6 +45,8 @@ case "$1 $2" in
   "ssm describe-parameters")  echo SecureString ;;
   "ssm get-parameter")        echo not-a-real-token ;;
   "iam get-policy")           exit 0 ;;
+  "ec2 describe-images")      [ -n "${IMAGE_ERR:-}" ] && { echo "$IMAGE_ERR" >&2; exit 254; }
+                              echo "${IMAGE_DATE:-}" ;;
   *)                          exit 1 ;;
 esac
 SH
@@ -72,9 +74,10 @@ show_answers() { SHOW_STAGING=$1 SHOW_PRODUCTION=$2; }
 agreeing() { show_answers "staging ok 1 $LOCKREV $SIGNERS_SHA" "production ok 1 $LOCKREV $SIGNERS_SHA"; }
 agreeing
 
-# fixture <shipping:true|false> <loki:name|null> [owner] [kms]  → writes the console answer
+# fixture <shipping:true|false> <loki:name|null> [owner] [kms] [ami_owners JSON] [ami_pattern]
+# → writes the console answer. AMI owners default to Canonical, which skips the image check.
 fixture() {
-  python3 - "$1" "$2" "${3:-111122223333}" "${4:-}" "$SIGNER" > "$T/fixture.json" <<'PY'
+  python3 - "$1" "$2" "${3:-111122223333}" "${4:-}" "$SIGNER" "${5:-[\"099720109477\"]}" "${6:-ubuntu-*}" > "$T/fixture.json" <<'PY'
 import json, sys
 shipping = sys.argv[1] == "true"
 loki = None if sys.argv[2] == "null" else sys.argv[2]
@@ -82,7 +85,8 @@ inner = json.dumps({"regions": ["eu-central-1"], "loki": loki, "shipping": shipp
                     "profile": "p", "bundles": {},
                     "bucket": "t-policies", "owner": sys.argv[3], "bucket_region": "eu-west-1",
                     "prefix": "dev-vm-policies", "kms": sys.argv[4] or None,
-                    "signers": [sys.argv[5]]})
+                    "signers": [sys.argv[5]],
+                    "ami_owners": json.loads(sys.argv[6]), "ami_pattern": sys.argv[7]})
 print(json.dumps(inner))
 PY
 }
@@ -320,6 +324,48 @@ check "cross-account: points at the runbook's bucket policy" "$(grep -q 'bucket 
 fixture true /t/loki 111122223333 arn:aws:kms:eu-west-1:111122223333:key/k
 rc=$(run_preflight)
 check "kms: points at the runbook's key policy" "$(grep -q 'key policy.*runbook' "$T/out"; echo $?)"
+fixture true /t/loki
+
+echo "== fleet image: owners = self =="
+fixture true /t/loki 111122223333 "" '["self"]' 'dev-vm-dev-vm-*'
+agreeing
+old=$(date -u -d '40 days ago' +%Y-%m-%dT%H:%M:%S.000Z)
+new=$(date -u -d '3 days ago' +%Y-%m-%dT%H:%M:%S.000Z)
+rc=$(IMAGE_DATE=$old run_preflight)
+check "old image: exit 0 (a warning, not a failure)" "$([ "$rc" = 0 ]; echo $?)"
+check "old image: warns older than 35 days" "$(grep -q 'older than 35 days' "$T/out"; echo $?)"
+check "queried the owner self with the pattern and Terraform's HVM filter" \
+  "$(grep -q 'ec2 describe-images --region eu-central-1 --owners self --filters Name=name,Values=dev-vm-dev-vm-\* Name=virtualization-type,Values=hvm' "$T/aws.log"; echo $?)"
+rc=$(IMAGE_DATE=$new run_preflight)
+check "fresh image: exit 0" "$([ "$rc" = 0 ]; echo $?)"
+check "fresh image: no age warning" "$(! grep -q 'older than 35 days' "$T/out"; echo $?)"
+check "fresh image: says so" "$(grep -q 'eu-central-1 — image from' "$T/out"; echo $?)"
+rc=$(IMAGE_DATE=None run_preflight)
+check "no image: exit 1" "$([ "$rc" = 1 ]; echo $?)"
+check "no image: names the region and the plan failure" \
+  "$(grep -q 'eu-central-1 — no image matches dev-vm-dev-vm-\*.*terraform plan will fail' "$T/out"; echo $?)"
+rc=$(IMAGE_DATE= run_preflight)
+check "empty answer is also no image" "$([ "$rc" = 1 ]; echo $?)"
+rc=$(IMAGE_ERR="An error occurred (UnauthorizedOperation) when calling the DescribeImages operation" run_preflight)
+check "query error: exit 1" "$([ "$rc" = 1 ]; echo $?)"
+check "query error: says the query failed, with AWS's reason" \
+  "$(grep -q 'eu-central-1 — could not query images.*UnauthorizedOperation' "$T/out"; echo $?)"
+check "query error: does not claim there is no image" "$(! grep -q 'no image matches' "$T/out"; echo $?)"
+
+echo "== fleet image: self among other owners queries the whole owner set =="
+fixture true /t/loki 111122223333 "" '["self", "123456789012"]' 'dev-vm-dev-vm-*'
+agreeing
+: > "$T/aws.log"
+rc=$(IMAGE_DATE=$new run_preflight)
+check "exit 0" "$([ "$rc" = 0 ]; echo $?)"
+check "queried the same owners Terraform searches" \
+  "$(grep -q 'ec2 describe-images --region eu-central-1 --owners self 123456789012 ' "$T/aws.log"; echo $?)"
+
+echo "== fleet image: Canonical owner makes no describe-images call =="
+fixture true /t/loki 111122223333 "" '["099720109477"]' 'dev-vm-dev-vm-*'
+rc=$(IMAGE_DATE=$old run_preflight)
+check "exit 0" "$([ "$rc" = 0 ]; echo $?)"
+check "no describe-images call" "$(! grep -q 'describe-images' "$T/aws.log"; echo $?)"
 fixture true /t/loki
 
 echo

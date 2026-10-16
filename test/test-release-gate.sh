@@ -47,6 +47,10 @@ STUB
 #!/bin/sh
 echo "skeleton-sync stub"
 STUB
+  for n in image-template image-scrub ami-build; do
+    printf '#!/bin/sh\necho "%s stub"\n' "$n" > "$WORK/test/test-$n.sh"
+    chmod +x "$WORK/test/test-$n.sh"
+  done
   cat > "$WORK/test/test-fetch-sync.sh" <<'STUB'
 #!/bin/sh
 echo "fetch-sync stub"
@@ -156,6 +160,17 @@ OUT=$( cd "$WORK" && make release TAG=base-0.11.0 2>&1 )
 check "SHA appears in output" "$(echo "$OUT" | grep -qF "$(git -C "$WORK" rev-parse HEAD)" && echo 0 || echo 1)"
 teardown
 
+echo "== a failing image-template gate refuses the v tag =="
+setup 0.11.0
+printf '#!/bin/sh\necho "image-template stub failing"\nexit 1\n' > "$WORK/test/test-image-template.sh"
+( cd "$WORK" && git add -A && git -c user.email=t@t -c user.name=t commit -qm failing \
+    && git push -q origin main )
+OUT=$( cd "$WORK" && make release TAG=v9.0.0 2>&1 )
+check "exit non-zero" "$([ $? -ne 0 ] && echo 0 || echo 1)"
+check "the failing gate ran" "$(echo "$OUT" | grep -q 'image-template stub failing' && echo 0 || echo 1)"
+check "no tag created" "$(git -C "$WORK" rev-parse -q --verify v9.0.0 >/dev/null && echo 1 || echo 0)"
+teardown
+
 echo "== a v tag runs the Terraform gates and cuts the tag =="
 setup 0.11.0
 OUT=$( cd "$WORK" && make release TAG=v9.0.0 2>&1 )
@@ -163,6 +178,9 @@ check "exit 0" "$?"
 check "ran the boundary guard" "$(echo "$OUT" | grep -q 'boundary stub' && echo 0 || echo 1)"
 check "ran the smoke gate" "$(echo "$OUT" | grep -q 'smoke stub' && echo 0 || echo 1)"
 check "ran the skeleton-sync guard" "$(echo "$OUT" | grep -q 'skeleton-sync stub' && echo 0 || echo 1)"
+check "ran the image-template gate" "$(echo "$OUT" | grep -q 'image-template stub' && echo 0 || echo 1)"
+check "ran the image-scrub gate" "$(echo "$OUT" | grep -q 'image-scrub stub' && echo 0 || echo 1)"
+check "ran the ami-build gate" "$(echo "$OUT" | grep -q 'ami-build stub' && echo 0 || echo 1)"
 check "ran the fetch-sync guard" "$(echo "$OUT" | grep -q 'fetch-sync stub' && echo 0 || echo 1)"
 check "no chefspec on the v path" "$(echo "$OUT" | grep -q 'chefspec stub' && echo 1 || echo 0)"
 check "tag exists on HEAD" "$([ "$(git -C "$WORK" rev-parse v9.0.0 2>/dev/null)" = "$(git -C "$WORK" rev-parse HEAD)" ] && echo 0 || echo 1)"
@@ -187,6 +205,9 @@ check "no skeleton-sync guard on the cookbook path" "$(echo "$OUT" | grep -q 'sk
 check "ran the cookstyle gate" "$(echo "$OUT" | grep -q 'lint stub' && echo 0 || echo 1)"
 check "ran the chefspec gate" "$(echo "$OUT" | grep -q 'chefspec stub' && echo 0 || echo 1)"
 # Both streams ship a copy of dev-vm-policy-fetch, so both refuse a drifted one.
+check "no image-template gate on the cookbook path" "$(echo "$OUT" | grep -q 'image-template stub' && echo 1 || echo 0)"
+check "no image-scrub gate on the cookbook path" "$(echo "$OUT" | grep -q 'image-scrub stub' && echo 1 || echo 0)"
+check "no ami-build gate on the cookbook path" "$(echo "$OUT" | grep -q 'ami-build stub' && echo 1 || echo 0)"
 check "ran the fetch-sync guard on the cookbook path" "$(echo "$OUT" | grep -q 'fetch-sync stub' && echo 0 || echo 1)"
 teardown
 

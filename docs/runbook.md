@@ -590,6 +590,39 @@ Fix the cause in the bucket first — publish a correct envelope with
 signers file itself is wrong, recreating the VM with corrected
 `policy_signers` is the clean path.
 
+## Prebuilt image
+
+By default a new VM boots a stock Ubuntu image and does its whole first
+converge on the spot. A fleet can instead boot an image of its own, built from
+the promoted production revision, so that first converge has almost nothing to
+do. Nothing a VM trusts changes: it still fetches and verifies its group's
+signed envelope. The agent guide is `IMAGE.md` in the tenant; the design,
+measurements and threat model are in [Prebuilt image](design/ami-image.md).
+
+```bash
+cd cinc && make ami                 # 15-30 minutes; production only
+```
+
+Then set `ami_owners = ["self"]` and `ami_name_pattern = "dev-vm-<policy>-2*"`
+in `vms/tenant.auto.tfvars` and read `terraform plan`: it must replace no
+running VM, because the module ignores AMI changes on existing instances.
+
+- **Prerequisites.** Packer 1.11 or newer; a promoted production revision equal
+  to the lock; `terraform apply` run once on `v2.1.0` or later, because the
+  baked first-boot script is read from state; operator credentials that can run
+  and image instances and create Packer's temporary role and instance profile.
+  A VM's own role cannot, on purpose.
+- **After a platform pin bump,** apply before `make ami`, or the image carries
+  the previous pin's bootstrap under the new pin's tag.
+- **Rebuild** after each promoted `base-` release and at least monthly;
+  `make preflight` warns at 35 days and fails for a region with no matching
+  image.
+- **Trust.** With `ami_owners = ["self"]`, whoever can register a matching
+  image chooses what new VMs boot. Treat image rights like signing rights.
+- **Clean up** by keeping the newest two images, and deregister older ones
+  with their snapshots in every region. Never deregister one a pinned `ami_id`
+  names.
+
 ## Defaults you may want to change
 
 These are the template's starting values, not leftovers. Each is a deliberate

@@ -44,3 +44,10 @@ output "configured_regions" {
   description = "Names of the AWS regions this tenant configures, from config.tf."
   value       = keys(local.regions)
 }
+
+# Read by `make ami` (scripts/ami-build.sh). Keyed by region because the
+# script is rendered per module instance; the build uses the bucket region's.
+output "bootstrap_user_data" {
+  description = "First-boot script per region, for building an image."
+  value       = { for region, m in module.ec2 : region => m.bootstrap_user_data }
+}

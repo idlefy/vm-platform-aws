@@ -1,0 +1,180 @@
+#!/bin/bash
+# The last stage of an image build (docs/design/ami-image.md). Runs as root,
+# appended to the module's own bootstrap script, so it is reached only after a
+# green first converge — and it checks that itself before touching anything.
+# Removes what belongs to this one instance, disables the units that would act
+# on a new VM's first boot before cloud-init has configured it, and powers off;
+# Packer snapshots the stopped instance.
+#
+# The lists are the measured diff in test/fixtures/image-scrub-paths; a path
+# added here without a line there fails test/test-image-scrub.sh, and so does
+# the reverse.
+set -euo pipefail
+
+REV=${1:-}
+R=${DEV_VM_IMAGE_ROOT:-}
+STATE=${DEV_VM_POLICY_STATE:-$R/var/lib/dev-vm/policy}
+# A failed build is terminated by Packer with its disk; the serial console is
+# the only place its operator can read why, and make ami says so.
+CONSOLE=${DEV_VM_IMAGE_CONSOLE:-/dev/console}
+log() {
+  echo "dev-vm-image-scrub: $*" >&2
+  { echo "dev-vm-image-scrub: $*" > "$CONSOLE"; } 2>/dev/null || true
+}
+# Under set -e any other failure would end the script with nothing on the
+# console and the bootstrap's own ERR trap already cleared.
+trap 'log "internal error at line $LINENO; no image will be taken"' ERR
+
+[[ $REV =~ ^[0-9a-f]{64}$ ]] || { log "internal error: expected a revision id, got '$REV'"; exit 70; }
+
+# With no DEV_VM_IMAGE_ROOT the globs below run against the real /tmp, /var/log
+# and /home. That is the point on a build instance and a disaster anywhere else.
+if [ -z "$R" ] && [ "$(id -u)" != 0 ]; then
+  log "internal error: not root and DEV_VM_IMAGE_ROOT unset; this runs only on a build instance"
+  exit 70
+fi
+
+# The status file is read before anything else: the fixture removes it below.
+read -r _ result got < "$STATE/status" 2>/dev/null || true
+if [ "${result:-}" != ok ] || [ "${got:-}" != "$REV" ]; then
+  log "refusing: status is '${result:-none} ${got:-}', expected 'ok $REV'; no image will be taken"
+  exit 65
+fi
+
+echo "$REV" > "$R/etc/dev-vm/image-revision"
+chmod 0644 "$R/etc/dev-vm/image-revision"
+
+# Re-enabled by the first converge on every VM ([:enable, :start] in their recipes).
+# The bootstrap's converge starts cinc-client.timer, which is past its
+# OnBootSec by then and queues a second converge behind the lock; that one
+# starts the moment the lock frees and re-enabled both timers 13 s into the
+# first live build's scrub. So: timers, then the services they start, then
+# disable. The check before poweroff below is what makes this load-bearing.
+# A unit the policy never installed is not an error: log_shipping = false
+# purges alloy, and a run_list may leave out aws_access.
+TIMERS=(cinc-client.timer aws-vm-credentials.timer)
+present() { systemctl cat "$1" >/dev/null 2>&1; }
+for u in "${TIMERS[@]}" cinc-client.service aws-vm-credentials.service; do
+  if present "$u"; then systemctl stop "$u"; fi
+done
+for u in "${TIMERS[@]}" alloy; do
+  if present "$u"; then systemctl disable --now "$u"; fi
+done
+# That converge verifies whatever production.json says when it starts, and
+# downloads and extracts that revision before converging it; status and
+# last-serial move only when it finishes. So another revision here means a
+# promote landed during the build, and part of it may be on this disk under
+# this revision's tag — whether or not its converge got to finish.
+for p in "$STATE"/archives/* "$STATE"/revisions/*; do
+  [ -e "$p" ] || continue
+  case "${p##*/}" in
+    "$REV" | "$REV.tgz") ;;
+    *) log "refusing: a converge queued behind the bootstrap fetched another revision (${p##*/}); no image will be taken"
+       exit 65 ;;
+  esac
+done
+# Stop what writes state before its state is removed. Rootless docker and
+# traefik live under user@1000.
+# One unit at a time: one that is missing or will not stop must not abort the
+# image build.
+# syslog.socket goes before rsyslog, or journald's next forwarded line
+# re-activates it. systemd-update-utmp and systemd-random-seed write on stop
+# (a shutdown record in wtmp, a fresh seed), so they are stopped here, before
+# the lists below remove what they wrote, rather than at poweroff, after.
+for u in user@1000.service falco-modern-bpf tailscaled \
+         snap.amazon-ssm-agent.amazon-ssm-agent.service containerd fail2ban \
+         syslog.socket rsyslog systemd-update-utmp systemd-random-seed; do
+  systemctl stop "$u" || log "note: $u not stopped"
+done
+# journald keeps writing /var/log/journal until poweroff; send it to /run so
+# the files removed below stay removed.
+journalctl --rotate || true
+journalctl --relinquish-var || true
+
+# Entries are quoted so a glob is expanded below, under $R, not here.
+REMOVE=(
+  "/etc/ssh/ssh_host_*" # host keys; regenerated on first boot
+  "/var/lib/amazon/ssm/Vault" # SSM agent's EC2RegistrationKey and its manifest for the build instance; the agent re-registers
+  "/var/lib/amazon/ssm/runtimeconfig/identity_config.json" # SSM agent's cached identity
+  "/home/ubuntu/.local/share/docker/engine-id" # rootless dockerd's engine id
+  "/home/ubuntu/.claude.json" # Claude Code's userID/machineID, created by its installer
+  "/home/ubuntu/.claude/backups" # backups of that file
+  "/var/lib/alloy/data/alloy_seed.json" # Alloy's instance seed
+  "/var/lib/systemd/random-seed" # an RNG seed clones must not share
+  "/var/cache/pollinate/seeded" # so pollinate seeds each VM on first boot
+  "/var/lib/dhcpcd/*" # the DHCP DUID and the build's lease
+  "/home/ubuntu/.local/share/docker/containerd/daemon/io.containerd.grpc.v1.introspection/uuid" # rootless containerd's instance uuid
+  "/home/ubuntu/.local/share/docker/buildkit/containerd-overlayfs/workerid" # rootless buildkit's worker id
+  "/var/lib/docker/engine-id" # dockerd's engine id
+  "/var/lib/docker/buildkit/containerd-overlayfs/workerid" # buildkit's worker id
+  "/var/lib/containerd/io.containerd.grpc.v1.introspection/uuid" # containerd's instance uuid
+  "/var/lib/fail2ban/fail2ban.sqlite3" # the build's ban database
+  "/home/ubuntu/.local/share/docker/containers/*" # traefik's --rm container metadata, carries the build hostname; ExecStartPre docker rm -f copes with its absence
+  "/var/lib/systemd/timers/stamp-*" # stale stamps would fire apt-daily-upgrade during the first converge
+  "/home/ubuntu/.ssh/authorized_keys" # Packer's temporary key pair, written by cloud-init
+  "/root/.ssh/authorized_keys" # the same key, behind cloud-init's "login as ubuntu" prefix
+  "/home/ubuntu/.config/traefik/password" # base::traefik basic-auth password; regenerated when users is absent
+  "/home/ubuntu/.config/traefik/users" # its htpasswd line
+  "/home/ubuntu/.local/share/traefik/acme.json" # ACME account and any certificate for the build's name
+  "/etc/alloy/loki-token" # never written (no SSM grant at build); removed in case that ever changes
+  "/root/.aws/cli/cache" # AWS CLI session cache from the build role
+  "/root/.gnupg" # gpg-agent state from apt key imports
+  "/var/lib/tailscale/*" # tailscaled node state and logs
+  "/var/cache/tailscale" # tailscaled cache
+  "/etc/dev-vm/policy.conf" # the bootstrap writes it from the VM's own tags
+  "/etc/dev-vm/policy-signers" # the bootstrap writes it from var.policy_signers
+  "/etc/dev-vm/aws-access.env" # carries the build's vm_name
+  "/var/lib/dev-vm/policy/lock" # flock file
+  "/var/lib/dev-vm/policy/last-serial" # anti-replay checkpoint; a VM must not inherit the build's
+  "/var/lib/dev-vm/policy/previous-revision" # the build's history
+  "/var/lib/dev-vm/policy/delivery-failures" # the build's counter
+  "/var/lib/dev-vm/policy/status" # the build's result (the scrub reads it first)
+  "/var/lib/alloy/data/loki.source.journal.journal" # journal positions of the build's journal
+  "/var/log/journal/*" # the build's journal
+  "/var/log/user-data.log" # the build's bootstrap log
+  "/var/log/cinc-first-run.log" # the build's first converge
+  "/var/log/*.gz" # rotated logs
+  "/var/log/*.1" # rotated logs
+  "/var/log/amazon/ssm/*" # SSM agent logs of the build
+  "/var/log/sysstat/*" # the build's sysstat data
+  "/var/log/apt/*" # the build's apt history
+  "/var/log/unattended-upgrades/*" # the build's unattended-upgrades logs
+  "/var/log/landscape/*" # the build's landscape logs
+  "/home/ubuntu/.npm/_logs" # npm debug logs from the installs
+  "/home/ubuntu/.bash_history" # none expected; defensive
+  "/root/.bash_history" # none expected; defensive
+  "/tmp/*" # install leftovers (uv tarball, node compile cache, sockets)
+  "/var/tmp/*" # systemd private dirs
+)
+EMPTY=(
+  "/etc/machine-id" # systemd/journald identity; /var/lib/dbus/machine-id links here
+  "/var/log/syslog" # the build's syslog
+  "/var/log/auth.log" # the build's auth log
+  "/var/log/kern.log" # the build's kernel log
+  "/var/log/wtmp" # login records
+  "/var/log/btmp" # failed logins
+  "/var/log/lastlog" # last logins
+  "/var/log/dpkg.log" # the build's package log
+  "/var/log/fail2ban.log" # the build's fail2ban log
+  "/var/log/dmesg" # the build's boot messages
+)
+
+shopt -s nullglob dotglob
+for g in "${REMOVE[@]}"; do
+  # shellcheck disable=SC2086 # the glob is the point; no entry holds whitespace
+  for p in $R$g; do rm -rf -- "$p"; done
+done
+for p in "${EMPTY[@]}"; do
+  if [ -e "$R$p" ]; then : > "$R$p"; fi
+done
+
+for u in "${TIMERS[@]}" alloy; do
+  if systemctl is-enabled --quiet "$u"; then
+    log "internal error: $u was re-enabled behind the scrub; no image will be taken"
+    exit 70
+  fi
+done
+
+cloud-init clean --logs --machine-id
+fstrim -av || true
+poweroff

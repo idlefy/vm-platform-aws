@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# image/files/dev-vm-image-scrub against a fake root built from the measured
+# list in test/fixtures/image-scrub-paths. systemctl, cloud-init, fstrim and
+# poweroff are shims that log; nothing here needs root or a VM.
+set -uo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SCRUB="$ROOT/image/files/dev-vm-image-scrub"
+LIST="$ROOT/test/fixtures/image-scrub-paths"
+PASS=0; FAIL=0
+rc() { "$@"; echo $?; }   # status of a command as a word, for check
+emptied() { [ -e "$1" ] && [ ! -s "$1" ]; }
+untouched() { [ ! -s "$T/log" ] && [ ! -e "$R/etc/dev-vm/image-revision" ]; }
+between() { [ "$1" -gt "$2" ] && [ "$1" -lt "$3" ]; }   # between N LOW HIGH
+check() { if [ "$2" = "0" ]; then PASS=$((PASS+1)); echo "  ok   $1"; else FAIL=$((FAIL+1)); echo "  FAIL $1"; fi; }
+
+T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+REV=$(printf 'a%.0s' {1..64})
+mkdir -p "$T/bin"
+# shellcheck disable=SC2016 # $* and $SHIM_LOG expand in the shim, not here
+for c in systemctl journalctl cloud-init fstrim poweroff; do
+  printf '#!/usr/bin/env bash\necho "%s $*" >> "$SHIM_LOG"\n' "$c" > "$T/bin/$c"; chmod +x "$T/bin/$c"
+done
+# `systemctl is-enabled` answers "nothing enabled" unless SHIM_ENABLED=0. A
+# unit named in SHIM_MISSING does not exist: every verb naming it fails, as
+# real systemctl does ("Unit … does not exist", "not loaded").
+# shellcheck disable=SC2016
+cat >> "$T/bin/systemctl" <<'SHIM'
+[ "$1" = is-enabled ] && exit "${SHIM_ENABLED:-1}"
+# SHIM_FETCHED: the queued converge had fetched (and extracted) this other
+# revision when it was stopped — mid-converge, so status and last-serial are
+# still the bootstrap's.
+[ "$*" = "stop cinc-client.service" ] && [ -n "${SHIM_FETCHED:-}" ] \
+  && echo data > "$DEV_VM_IMAGE_ROOT/var/lib/dev-vm/policy/archives/$SHIM_FETCHED.tgz"
+for a in "${@:2}"; do
+  for m in ${SHIM_MISSING:-}; do [ "$a" = "$m" ] && exit 5; done
+done
+exit 0
+SHIM
+# shellcheck disable=SC2016
+printf '[ -n "${SHIM_FAIL_CLOUDINIT:-}" ] && exit 1\nexit 0\n' >> "$T/bin/cloud-init"
+
+build_root() {  # build_root DIR STATUS_LINE
+  local r=$1 verb path
+  rm -rf "$r"; mkdir -p "$r"
+  while read -r verb path _; do
+    case "$verb" in remove|empty|keep) ;; *) continue ;; esac
+    path=${path//<rev>/$REV}
+    p="$r${path//\*/x}"            # a glob becomes one concrete match
+    mkdir -p "$(dirname "$p")"; echo data > "$p"
+  done < <(grep -v '^\s*#' "$LIST")
+  mkdir -p "$r/var/lib/dev-vm/policy" "$r/etc/dev-vm"
+  echo "$2" > "$r/var/lib/dev-vm/policy/status"
+}
+
+run_scrub() {  # run_scrub DIR → exit status
+  : > "$T/console"
+  SHIM_LOG="$T/log" PATH="$T/bin:$PATH" DEV_VM_IMAGE_ROOT="$1" DEV_VM_IMAGE_CONSOLE="$T/console" \
+    "$SCRUB" "$REV" >"$T/out" 2>&1
+}
+
+echo "== a green build is scrubbed and powered off =="
+R="$T/root"; : > "$T/log"
+build_root "$R" "2026-10-16T00:00:00Z ok $REV"
+run_scrub "$R"; check "exits 0" "$?"
+while read -r verb path _; do
+  path=${path//<rev>/$REV}
+  p="$R${path//\*/x}"
+  case "$verb" in
+    remove) check "removed: $path" "$(rc [ ! -e "$p" ])" ;;
+    empty)  check "emptied: $path" "$(rc emptied "$p")" ;;
+    keep)   check "kept: $path"    "$(rc [ -s "$p" ])" ;;
+  esac
+done < <(grep -v '^\s*#' "$LIST" | grep -E '^(remove|empty|keep) ')
+check "records the revision" "$(grep -qx "$REV" "$R/etc/dev-vm/image-revision"; echo $?)"
+for u in cinc-client.timer aws-vm-credentials.timer alloy; do
+  check "disables $u" "$(grep -q "systemctl disable .*$u" "$T/log"; echo $?)"
+done
+lineno() { grep -n "$1" "$T/log" | head -1 | cut -d: -f1; }
+dis=$(lineno 'systemctl disable'); cln=$(lineno 'cloud-init clean')
+for u in user@1000.service snap.amazon-ssm-agent.amazon-ssm-agent.service containerd fail2ban rsyslog falco-modern-bpf tailscaled \
+         syslog.socket systemd-update-utmp systemd-random-seed; do
+  stp=$(lineno "systemctl stop $u"); [ -n "$stp" ] || stp=0
+  check "stops $u after disable and before cloud-init clean" "$(rc between "$stp" "${dis:-0}" "${cln:-0}")"
+done
+# A converge the timer queued behind the bootstrap's own runs the moment the
+# lock frees, and re-enables the timers (measured on the first live build).
+tst=$(lineno 'systemctl stop cinc-client.timer'); svc=$(lineno 'systemctl stop .*cinc-client.service')
+check "stops cinc-client.timer, then cinc-client.service, then disables" \
+  "$(rc between "${svc:-0}" "${tst:-0}" "${dis:-0}")"
+sock=$(lineno 'systemctl stop syslog.socket'); rsl=$(lineno 'systemctl stop rsyslog')
+check "stops syslog.socket before rsyslog, so nothing re-activates it" "$(rc between "${sock:-0}" 0 "${rsl:-0}")"
+rlq=$(lineno 'journalctl --relinquish-var')
+check "moves journald off /var before cloud-init clean" "$(rc between "${rlq:-0}" "${dis:-0}" "${cln:-0}")"
+check "checks the timers are off before powering off" "$(grep -q 'systemctl is-enabled' "$T/log"; echo $?)"
+check "cleans cloud-init with the machine id" "$(grep -q 'cloud-init clean --logs --machine-id' "$T/log"; echo $?)"
+check "powers off last" "$(tail -1 "$T/log" | grep -q '^poweroff'; echo $?)"
+
+echo "== a unit still enabled at the end means no image =="
+: > "$T/log"; build_root "$R" "2026-10-16T00:00:00Z ok $REV"
+SHIM_ENABLED=0 run_scrub "$R"; got=$?
+check "a timer re-enabled behind the scrub → exit 70" "$(rc [ "$got" = 70 ])"
+check "  …and says why on the console" "$(grep -q 're-enabled behind the scrub' "$T/console"; echo $?)"
+check "  …and does not power off" "$(rc [ -z "$(grep '^poweroff' "$T/log")" ])"
+
+echo "== a unit the policy never installed is not an error =="
+# log_shipping = false purges alloy; a run_list may omit aws_access or cinc_client.
+: > "$T/log"; build_root "$R" "2026-10-16T00:00:00Z ok $REV"
+SHIM_MISSING="alloy aws-vm-credentials.timer aws-vm-credentials.service" run_scrub "$R"; got=$?
+check "alloy and the credential units absent → exit 0" "$(rc [ "$got" = 0 ])"
+check "  …and powers off" "$(tail -1 "$T/log" | grep -q '^poweroff'; echo $?)"
+check "  …and still disables cinc-client.timer" "$(grep -q 'systemctl disable .*cinc-client.timer' "$T/log"; echo $?)"
+
+echo "== a converge that fetched another revision behind the bootstrap means no image =="
+: > "$T/log"; build_root "$R" "2026-10-16T00:00:00Z ok $REV"
+SHIM_FETCHED=$(printf 'c%.0s' {1..64}) run_scrub "$R"; got=$?
+check "another revision's archive on disk after the stops → exit 65" "$(rc [ "$got" = 65 ])"
+check "  …says why on the console" "$(grep -q 'fetched another revision' "$T/console"; echo $?)"
+check "  …and does not power off" "$(rc [ -z "$(grep '^poweroff' "$T/log")" ])"
+
+echo "== any other failure says so on the console and powers nothing off =="
+: > "$T/log"; build_root "$R" "2026-10-16T00:00:00Z ok $REV"
+SHIM_FAIL_CLOUDINIT=1 run_scrub "$R"; got=$?
+check "a failing step → non-zero exit" "$(rc [ "$got" != 0 ])"
+check "  …names the line on the console" "$(grep -q 'internal error at line' "$T/console"; echo $?)"
+check "  …and does not power off" "$(rc [ -z "$(grep '^poweroff' "$T/log")" ])"
+
+echo "== it refuses anything but ok for the expected revision =="
+for st in "2026-10-16T00:00:00Z converge-failed $REV" \
+          "2026-10-16T00:00:00Z ok $(printf 'b%.0s' {1..64})" \
+          ""; do
+  : > "$T/log"; build_root "$R" "$st"
+  run_scrub "$R"; rc=$?
+  check "status '${st:-<empty>}' → exit 65" "$(rc [ "$rc" = 65 ])"
+  # make ami's failure message sends the operator to the serial console.
+  check "  …and says why on the console" "$(grep -q 'refusing: status is' "$T/console"; echo $?)"
+  check "  …and touches nothing" "$(rc untouched)"
+  check "  …and leaves a removable path alone" "$(rc [ -e "$R/etc/ssh/ssh_host_x" ])"
+done
+rm -f "$R/var/lib/dev-vm/policy/status"; : > "$T/log"
+run_scrub "$R"; got=$?
+check "no status file → exit 65" "$(rc [ "$got" = 65 ])"
+
+echo "== a malformed argument is an internal error =="
+SHIM_LOG="$T/log" PATH="$T/bin:$PATH" DEV_VM_IMAGE_ROOT="$R" "$SCRUB" "not-a-rev" >/dev/null 2>&1
+got=$?
+check "bad revision id → exit 70" "$(rc [ "$got" = 70 ])"
+
+echo "== without DEV_VM_IMAGE_ROOT it refuses to run unless root =="
+if [ "$(id -u)" != 0 ]; then
+  : > "$T/log"
+  env -u DEV_VM_IMAGE_ROOT SHIM_LOG="$T/log" PATH="$T/bin:$PATH" "$SCRUB" "$REV" >/dev/null 2>&1
+  got=$?
+  check "non-root, real root → exit 70" "$(rc [ "$got" = 70 ])"
+  check "  …and ran nothing" "$(rc [ ! -s "$T/log" ])"
+fi
+
+echo "== the script's lists are the fixture's =="
+fx=$(grep -E '^(remove|empty) ' "$LIST" | awk '{print $1" "$2}' | sort)
+sc=$(awk '/^REMOVE=\(/{v="remove";next} /^EMPTY=\(/{v="empty";next} /^\)/{v="";next} v && $1 !~ /^#/ && NF {gsub(/"/,"",$1); print v" "$1}' "$SCRUB" 2>/dev/null | sort)
+check "REMOVE/EMPTY equal the fixture's remove/empty lines" "$([ -n "$fx" ] && [ "$fx" = "$sc" ]; echo $?)"
+
+echo; echo "passed: $PASS  failed: $FAIL"
+[ "$FAIL" -eq 0 ]

@@ -1,0 +1,92 @@
+# What an image build must not carry from its build instance into every VM.
+#
+# Measured 2026-10-16 (docs/design/ami-image.md, decision 6): `find / -xdev`
+# on a stock noble instance, then on a VM after one green converge of
+# base-2.0.x, diffed. 34,670 paths differed. Package payload (/opt/cinc,
+# /usr, apt and dpkg state, the codex/claude/trdl installs, rootless docker
+# images) is what the image exists to cache. What is listed here is the rest:
+# per-instance identity, credentials valid only on the build instance, state a
+# new VM must start without, and logs.
+#
+# One rule per line: `remove <path or glob>`, `empty <path>` or `keep <path>`,
+# then `#` and the reason. image/files/dev-vm-image-scrub carries the remove
+# and empty lines verbatim; test/test-image-scrub.sh fails if the two drift,
+# and checks every keep line survives.
+
+# --- identity ------------------------------------------------------------------
+remove /etc/ssh/ssh_host_*                                   # host keys; regenerated on first boot
+empty  /etc/machine-id                                       # systemd/journald identity; /var/lib/dbus/machine-id links here
+remove /var/lib/amazon/ssm/Vault  # SSM agent's EC2RegistrationKey and its manifest for the build instance; the agent re-registers
+remove /var/lib/amazon/ssm/runtimeconfig/identity_config.json # SSM agent's cached identity
+remove /home/ubuntu/.local/share/docker/engine-id            # rootless dockerd's engine id
+remove /home/ubuntu/.claude.json                             # Claude Code's userID/machineID, created by its installer
+remove /home/ubuntu/.claude/backups                          # backups of that file
+remove /var/lib/alloy/data/alloy_seed.json                   # Alloy's instance seed
+remove /var/lib/systemd/random-seed  # an RNG seed clones must not share
+remove /var/cache/pollinate/seeded  # so pollinate seeds each VM on first boot
+remove /var/lib/dhcpcd/*  # the DHCP DUID and the build's lease
+remove /home/ubuntu/.local/share/docker/containerd/daemon/io.containerd.grpc.v1.introspection/uuid  # rootless containerd's instance uuid
+remove /home/ubuntu/.local/share/docker/buildkit/containerd-overlayfs/workerid  # rootless buildkit's worker id
+remove /var/lib/docker/engine-id  # dockerd's engine id
+remove /var/lib/docker/buildkit/containerd-overlayfs/workerid  # buildkit's worker id
+remove /var/lib/containerd/io.containerd.grpc.v1.introspection/uuid  # containerd's instance uuid
+remove /var/lib/fail2ban/fail2ban.sqlite3  # the build's ban database
+remove /home/ubuntu/.local/share/docker/containers/*  # traefik's --rm container metadata, carries the build hostname; ExecStartPre docker rm -f copes with its absence
+remove /var/lib/systemd/timers/stamp-*  # stale stamps would fire apt-daily-upgrade during the first converge
+
+# --- the build's keys and secrets (valid only on the build instance) -------------
+remove /home/ubuntu/.ssh/authorized_keys                     # Packer's temporary key pair, written by cloud-init
+remove /root/.ssh/authorized_keys                            # the same key, behind cloud-init's "login as ubuntu" prefix
+remove /home/ubuntu/.config/traefik/password                 # base::traefik basic-auth password; regenerated when users is absent
+remove /home/ubuntu/.config/traefik/users                    # its htpasswd line
+remove /home/ubuntu/.local/share/traefik/acme.json           # ACME account and any certificate for the build's name
+remove /etc/alloy/loki-token                                 # never written (no SSM grant at build); removed in case that ever changes
+remove /root/.aws/cli/cache                                  # AWS CLI session cache from the build role
+remove /root/.gnupg                                          # gpg-agent state from apt key imports
+remove /var/lib/tailscale/*                                  # tailscaled node state and logs
+remove /var/cache/tailscale                                  # tailscaled cache
+
+# --- policy delivery: a new VM starts its own history ----------------------------
+remove /etc/dev-vm/policy.conf                               # the bootstrap writes it from the VM's own tags
+remove /etc/dev-vm/policy-signers                            # the bootstrap writes it from var.policy_signers
+remove /etc/dev-vm/aws-access.env                            # carries the build's vm_name
+remove /var/lib/dev-vm/policy/lock                           # flock file
+remove /var/lib/dev-vm/policy/last-serial                    # anti-replay checkpoint; a VM must not inherit the build's
+remove /var/lib/dev-vm/policy/previous-revision              # the build's history
+remove /var/lib/dev-vm/policy/delivery-failures              # the build's counter
+remove /var/lib/dev-vm/policy/status                         # the build's result (the scrub reads it first)
+remove /var/lib/alloy/data/loki.source.journal.journal       # journal positions of the build's journal
+
+# --- logs and scratch ------------------------------------------------------------
+remove /var/log/journal/*                                    # the build's journal
+remove /var/log/user-data.log                                # the build's bootstrap log
+remove /var/log/cinc-first-run.log                           # the build's first converge
+remove /var/log/*.gz                                         # rotated logs
+remove /var/log/*.1                                          # rotated logs
+remove /var/log/amazon/ssm/*  # SSM agent logs of the build
+remove /var/log/sysstat/*  # the build's sysstat data
+remove /var/log/apt/*  # the build's apt history
+remove /var/log/unattended-upgrades/*  # the build's unattended-upgrades logs
+remove /var/log/landscape/*  # the build's landscape logs
+empty  /var/log/syslog                                       # the build's syslog
+empty  /var/log/auth.log                                     # the build's auth log
+empty  /var/log/kern.log                                     # the build's kernel log
+empty  /var/log/wtmp                                         # login records
+empty  /var/log/btmp                                         # failed logins
+empty  /var/log/lastlog                                      # last logins
+empty  /var/log/dpkg.log  # the build's package log
+empty  /var/log/fail2ban.log  # the build's fail2ban log
+empty  /var/log/dmesg  # the build's boot messages
+remove /home/ubuntu/.npm/_logs                               # npm debug logs from the installs
+remove /home/ubuntu/.bash_history                            # none expected; defensive
+remove /root/.bash_history                                   # none expected; defensive
+remove /tmp/*                                                # install leftovers (uv tarball, node compile cache, sockets)
+remove /var/tmp/*                                            # systemd private dirs
+
+# --- what the image is for ---------------------------------------------------------
+keep   /var/lib/dev-vm/policy/archives/<rev>.tgz              # the revision's archive; every fetch re-verifies its hash
+keep   /var/lib/dev-vm/policy/revisions/<rev>/Policyfile.lock.json # the extracted revision
+keep   /usr/share/dev-vm/home/.zshrc                         # base's staged home files
+keep   /etc/iptables/rules.v4                                # IMDS rules, restored before the bootstrap (decision 10)
+keep   /home/ubuntu/.config/traefik/traefik.yml              # static config; the converge rewrites it
+keep   /etc/alloy/config.alloy                               # rewritten by the first converge with the VM's own name

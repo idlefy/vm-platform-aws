@@ -349,6 +349,40 @@ resource "aws_iam_policy" "identity_boundary" {
           "ec2:ReplaceIamInstanceProfileAssociation",
           "ec2:CreateImage",
           "ec2:ModifyImageAttribute",
+          # A tenant-built image (docs/design/ami-image.md) makes AMIs in this
+          # account an input to every new VM: with ami_owners = ["self"] the
+          # newest image matching the name pattern is what boots. Registering,
+          # copying, importing or restoring one is choosing the fleet's next
+          # root disk; storing, exporting or sharing one reads it; deregistering
+          # or deleting its snapshot rolls the fleet back to an older image.
+          # So does anything that hides the newest one from the data source:
+          # a disabled image drops out of DescribeImages, a deprecated one is
+          # excluded (include_deprecated defaults to false), and restoring a
+          # deregistered image from the recycle bin brings back an old one
+          # under its original creation date.
+          "ec2:RegisterImage",
+          "ec2:CopyImage",
+          "ec2:DeregisterImage",
+          "ec2:ExportImage",
+          "ec2:DeleteSnapshot",
+          # Families (see below): a VM imports nothing; the restore and store
+          # image tasks; enable/disable of an image, its deprecation, block
+          # public access and deregistration protection; and the recycle bin.
+          "ec2:Import*",
+          "ec2:Create*ImageTask",
+          "ec2:Enable*Image*",
+          "ec2:Disable*Image*",
+          "ec2:Restore*FromRecycleBin",
+          # Image Builder reaches the same AMIs through its service-linked
+          # role: a recipe and a distribution named under the pattern, run
+          # against any existing infrastructure configuration, register one,
+          # and lifecycle policies or state updates deprecate or disable one.
+          # None of it needs iam:PassRole. Reads stay open.
+          "imagebuilder:Create*",
+          "imagebuilder:Update*",
+          "imagebuilder:Start*",
+          "imagebuilder:Import*",
+          "imagebuilder:Put*",
           "ec2:CreateSnapshot",
           "ec2:CreateSnapshots",
           "ec2:CopySnapshot",

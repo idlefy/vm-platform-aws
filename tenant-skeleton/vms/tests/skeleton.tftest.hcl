@@ -52,6 +52,11 @@ run "an_empty_fleet_plans" {
     condition     = length(output.configured_regions) > 0
     error_message = "config.tf configures no regions. Every module-scoped validation then evaluates over an empty instances map and checks nothing — measured: an access_bundles entry containing a literal \"*\" plans clean in that state."
   }
+
+  assert {
+    condition     = alltrue([for r, s in output.bootstrap_user_data : startswith(s, "#!/bin/bash\n")])
+    error_message = "the root must pass every region's bootstrap script through for make ami."
+  }
 }
 
 # --- both guards can fire ----------------------------------------------------
