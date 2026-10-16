@@ -30,7 +30,9 @@ policy_bucket_region = "eu-central-1"
 policy_signers = [
   "you@example.com namespaces=\"dev-vm-policy-staging,dev-vm-policy-production\" ssh-ed25519 AAAA...",
 ]
-# Raise to a security fix's serial so no VM, new or running, accepts anything older.
+# Raise to a security fix's serial so no VM created from then on accepts anything
+# older. Read at first boot only; running VMs refuse older envelopes once they
+# have converged the fix (see the runbook).
 # policy_min_serial = 0
 
 # Log shipping to Grafana Cloud Loki. This flag and

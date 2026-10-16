@@ -340,8 +340,17 @@ and `signers_sha256` only refuses envelopes from before the latest signer
 rotation. Without the floor, anyone who can write the bucket could serve a new
 VM any older envelope signed since that rotation, including a revision whose
 vulnerability was fixed later, and keep serving it. After a security fix, the
-operator raises `policy_min_serial` to the fix's serial. From then on, nothing
-older converges anywhere.
+operator raises `policy_min_serial` to the fix's serial, and a VM created from
+then on accepts nothing older.
+
+The floor reaches only VMs created after it is raised. `policy.conf` is written
+once, by `user_data`, which Terraform does not re-run. A running VM gets the
+same protection from `last-serial` as soon as it converges the fix's envelope.
+Until then, a bucket writer could serve it an older envelope that is still
+newer than its own `last-serial`. That is the window *withholding* already
+leaves open, and the floor would not close it: nothing but the bucket can
+reach a running VM, and the bucket is the party not trusted here. Found by a
+Codex review of PR #7; the earlier text claimed the floor reached every VM.
 
 A **running** VM can still be held on its current revision by withholding new
 envelopes. Nothing on the VM can detect that, and the design accepts it: see

@@ -268,7 +268,7 @@ variable "policy_signers" {
 }
 
 variable "policy_min_serial" {
-  description = "The lowest envelope serial any VM accepts, first boot included. A new VM has no history to compare against; raise this to a security fix's serial so nothing older converges anywhere."
+  description = "The lowest envelope serial a VM accepts, written into policy.conf at its first boot, so it binds VMs created after it is raised. A new VM has no history to compare against; raise this to a security fix's serial. Running VMs refuse anything older once they converge the fix, through last-serial."
   type        = number
   default     = 0
 

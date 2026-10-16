@@ -561,8 +561,12 @@ the rotation before creating VMs.
 **After a security fix**, raise `policy_min_serial` in
 `vms/tenant.auto.tfvars` to the serial of the envelope that carries the fix
 (`make push` and `make promote` print it as they write) and `terraform apply`. From
-then on no VM — new or running — accepts anything older, even a validly signed
-envelope someone replays from the bucket's history.
+then on no VM you create accepts anything older, even a validly signed envelope
+someone replays from the bucket's history. Running VMs are not reached, because
+the floor is written at first boot. Each of them refuses anything older from
+the moment it converges the fix, through its own `last-serial`. To be sure,
+check `/var/lib/dev-vm/policy/status` on each VM, or recreate the ones that
+have not converged it.
 
 **If the bucket is unreachable**, running VMs keep converging their last good
 revision; `cinc-client.service` fails from the third consecutive run and, with
