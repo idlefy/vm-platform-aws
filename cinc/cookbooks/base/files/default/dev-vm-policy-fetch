@@ -429,8 +429,12 @@ if ! converge "$REV" "$verified" "$verified_key"; then
   exit 13
 fi
 
-printf '%s %s %s\n' "$SERIAL" "$REV" "$SHA" > "$STATE/last-serial.tmp" \
-  && mv "$STATE/last-serial.tmp" "$STATE/last-serial"
+# The anti-replay checkpoint. A run that cannot record it does not succeed:
+# the old serial would stay, and the envelope just superseded could be
+# replayed. The script has no `set -e`, so this has to say so itself.
+{ printf '%s %s %s\n' "$SERIAL" "$REV" "$SHA" > "$STATE/last-serial.tmp" \
+    && mv "$STATE/last-serial.tmp" "$STATE/last-serial"; } 2>/dev/null \
+  || internal "cannot record $STATE/last-serial after converging $REV (serial $SERIAL)"
 if [ -n "$LAST_REV" ] && [ "$LAST_REV" != "$REV" ]; then
   echo "$LAST_REV" > "$STATE/previous-revision"
 fi

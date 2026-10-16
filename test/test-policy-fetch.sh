@@ -35,6 +35,7 @@ check() {
   fi
 }
 ok() { if "$@"; then echo 0; else echo 1; fi; }
+no() { if "$@"; then echo 1; else echo 0; fi; }
 
 # --- fixtures ---------------------------------------------------------------
 
@@ -444,6 +445,20 @@ done
 rc=$(fetch)
 check "failure 3: exit 11" "$(ok [ "$rc" = 11 ])"
 check "still on the last good revision" "$(ok [ "$(converged_rev)" = "$BASE_REV" ])"
+teardown
+
+# last-serial is the anti-replay checkpoint. If it cannot be written, the run
+# must not report success: the old serial would stay, and the envelope just
+# superseded could be replayed. Found by a Codex review of PR #7.
+echo "== a checkpoint that cannot be written fails the run =="
+setup; baseline
+REV=$(newrev); SHA=$(make_archive "$REV")
+publish ops dev-vm-policy-production serial=$((NOW + 60))
+mkdir "$WORK/state/last-serial.tmp"
+rc=$(fetch)
+check "exit 70" "$(ok [ "$rc" = 70 ])"
+check "status does not say ok" "$(no grep -q " ok $REV" "$WORK/state/status")"
+check "says why" "$(ok grep -q 'cannot record' "$WORK/err")"
 teardown
 
 echo "== a failed converge =="
