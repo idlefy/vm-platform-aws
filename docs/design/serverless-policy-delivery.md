@@ -1,11 +1,12 @@
 # Serverless policy delivery — signed Policyfile archives in S3, no CINC server
 
 > Design record, written before implementation and revised after an
-> architecture review the same day. Nothing here has been measured on a VM yet;
-> every item under *To measure* is a gate on the release, not a fact.
+> architecture review the same day. Every item the design assumed was then
+> measured on live VMs on 2026-10-16; *Measured on live VMs* has the results
+> and the five defects the measurements found.
 
-**Date:** 2026-10-15
-**Status:** design, direction approved; revised after review
+**Date:** 2026-10-15, measured 2026-10-16
+**Status:** implemented and measured; ships with the PR
 **Ships as:** `v2.0.0` + `base-2.0.0`, a breaking pair, tagged together. `1.x` is frozen.
 
 ## The request
@@ -730,57 +731,48 @@ the verify lists in CLAUDE.md and the README.
     token;
   - `policy.conf` in the rendered `user_data` carries `node_name`.
 
-## To measure on a live VM before release
+## Measured on live VMs
 
-The pattern is the one trap 3 teaches: do not reason from the config. Each of
-these is something the design assumes. The docs may not claim any of them
-until it has been reproduced.
+The pattern is the one trap 3 teaches: do not reason from the config. Each item
+below was something the design assumed. All eleven were reproduced on
+2026-10-16, on a throwaway tenant in `eu-central-1`. Its modules came from a
+snapshot of this branch, its cookbook from a `git` pin on the branch, and it ran
+cinc-client 19.3.14 on Ubuntu 24.04. Six VMs were built and destroyed along the
+way. Item 2 compared against a live `1.x` VM on `base-1.2.0`.
 
-1. **chef-zero does not listen.** As far as we know, `cinc-client -z` has run
-   chef-zero without a socket by default since Chef 13. That knowledge comes
-   from memory, not from a measurement. Check with `ss -ltnp` during a
-   converge. If a listener exists, any local uid can rewrite the run list
-   mid-converge, and that means root. The fallback is designed now, on the
-   `imds.rb` pattern: an iptables rule
-   `-o lo -p tcp --dport <port range> -m owner ! --uid-owner 0 -j REJECT`,
-   installed by `user_data` before the first converge.
-2. **Same end state.** `cinc-client -z` on an exported archive converges
-   `base` to the same state as the server client. Compare a fresh `2.x` VM
-   with a `1.x` VM on the same cookbook content: Falco rules, sudoers,
-   iptables and Alloy config.
-3. **Export and the pinned client.** On a clean machine after `chef install`,
-   check that `chef export --archive` handles the git-sourced, `rel:`-pinned
-   cookbook, and record the archive's layout and the config it generates.
-   Then check that the lock format Cinc Workstation produces is accepted by
-   the pinned client, 19.3.14.
-4. **Replay is refused.** A replayed staging envelope, an older envelope and a
-   far-future serial are each rejected. The VM stays on its last good
-   revision with `cinc-client.service` failed, and with shipping on the
-   *converge failed* alert fires.
-5. **Bucket outage.** Deleting `production.json`, or blocking S3, leaves VMs
-   converging their last good revision. The unit fails on the third run and
-   not before.
-6. **First boot fails closed.** With the bucket unreachable, and separately
-   with a stale `var.policy_signers`: no sudo grant, IMDS blocked, and the log
-   on the serial console.
-7. **The boundary holds.** An identity role whose bundle declares `s3:*`
-   cannot write objects or change policy or configuration on the policy
-   bucket, and cannot create an access point. It can still write to another
-   bucket.
-8. **Logs and alerts.** Converge output and the script's own lines reach Loki
-   under `syslog_identifier="cinc-client"`, and `instance` equals the `Name`
-   tag.
-9. **Falco stays quiet.** The script running `aws`, `ssh-keygen` and `tar` as
-   root from the unit does not trip any Falco rule.
-10. **A bad script falls back.** A script that has a syntax error makes the
-    launcher run `.prev`, and the next good revision repairs it. A script that
-    exits 70 does not fall back.
-11. **Exports agree on contents.** Two `chef export --archive` runs of one
-    lock, on two machines, hold byte-identical files, so the publisher's
-    archive check passes for an honest second push and for a promote from
-    another workstation. If the exporter writes anything run-specific inside
-    the archive (a timestamp in a generated file), the check needs an
-    exclusion for exactly that path, and nothing wider.
+| # | Claim | Result |
+|---|---|---|
+| 1 | chef-zero does not listen | **Holds.** 29 samples of `ss -ltnp` across a whole converge showed no new listener. The iptables fallback is not needed. The first measurement found that the setting the script wrote was not an option at all (defect A). |
+| 2 | Same end state as the server client | **Holds.** The 2.x VM was compared with the 1.x VM after a reboot of each. Falco rules and config, sudoers, sshd, sysctl, apt and unattended-upgrades, the home staging tree, users, groups and modes are byte-identical. iptables and ip6tables differ only by Tailscale's chains, because the 1.x VM had run `tailscale login`. Before the reboot, Docker's install had also left chains behind. Three files differ, each for a known reason: the Alloy config's `public_ip`, the intended `cinc-client.service` change, and werf's `zshenv` line from `base-1.2.1`. |
+| 3 | Export and the pinned client | **Holds.** Cinc Workstation 26.1.0 exports a `git`+`rel` pin. The archive holds `.cinc/config.rb`, `Policyfile.lock.json`, `cookbook_artifacts/base-<id>/`, `policies/` and `policy_groups/local.json`, and its `policy_group 'local'` matches the client config the script writes. Client 19.3.14 accepts the lock. |
+| 4 | Replay is refused | **Holds.** An older serial, a serial three days ahead, and a staging manifest signed in the production namespace each exit 12. The VM converges its last good revision, and `last-serial` is unchanged. With shipping on, *converge failed* fired for the VM about a minute after the rejection. |
+| 5 | Bucket outage | **Holds.** With `staging.json` deleted, runs 1 and 2 exit 0 and converge the last good revision, and run 3 exits 11. With the bucket's name pointed at `127.0.0.1`, the result is the same, and the log says *unreachable* rather than *missing or denied*. |
+| 6 | First boot fails closed | **Holds.** Two cases were tested: no `production.json` (exit 14 after five retries), and a `policy_signers` with one key more than production installs (exit 12, `signers_sha256 does not match`). In both, `ubuntu` has no sudo, IMDS is blocked, and the log is on the serial console. `make preflight` warned about the second case beforehand. |
+| 7 | The boundary holds | **Holds after a fix.** A role whose bundle grants `s3:*` cannot change the policy bucket's policy, versioning or public-access block, cannot delete it, cannot create an access point, and cannot touch the envelopes. It can still use another bucket. It could write any key outside the prefix (defect E). |
+| 8 | Logs | **Holds.** The script's lines and the converge output are journaled under `SYSLOG_IDENTIFIER=cinc-client`. Alloy pushed them to Grafana Cloud: every push got 204, nothing was dropped, and `instance` equals the `Name` tag. |
+| 9 | Falco stays quiet | **Holds.** Across every unit run there were no detections. The one detection on the VM was a deliberate `sudo` as `ubuntu`, which the sudo rule caught. |
+| 10 | A bad script falls back | **Holds.** A script with a syntax error made the launcher run `.prev`, and that converge repaired it. A script exiting 70 failed the unit with 70 and did not fall back. The repair then copied the broken script over `.prev` (defect D). |
+| 11 | Exports agree on contents | **Holds.** Two exports of one lock, from different directories and umasks, hold the same 91 paths with identical contents. Only mtimes, and modes under umask 077, differ. Neither is compared, so a second honest push reuses the stored archive. |
+
+### Defects found, and fixed on the branch
+
+- **A. Every first boot failed closed.** The script wrote
+  `chef_zero.listen false`, which is not a Chef option, and the client refused
+  the whole config. It now writes the top-level `listen false`. The test loads
+  the generated config with chef-config itself, because the stub client
+  accepted anything.
+- **B. The timer's first run broke the first converge.** The converge enables
+  `cinc-client.timer`, and two minutes later the unit's run re-extracted the
+  revision tree under the converge that was still going. That converge then
+  failed with a 404 on a cookbook file. cinc-client keeps its own run lock in
+  that tree, so the two had also been converging at once. The script now holds
+  an `flock` for the whole run, and closes the descriptor for the converge.
+- **C.** The reason after *unreachable:* landed on a journal line of its own,
+  because the AWS CLI begins its error with a blank line.
+- **D.** A repair copied a script that could not run over `.prev`. Now only an
+  executable script that parses is kept there.
+- **E.** The boundary denied object writes only under `<prefix>/`. It now
+  denies them on every key in the bucket.
 
 ## Rollout
 
@@ -803,7 +795,7 @@ The PR is reviewed commit by commit:
 Rollout:
 
 1. **Measure** the eleven items on a test tenant pinned to the PR branch, before
-   merging. Pin the cookbook with the temporary path pin described in
+   merging (done 2026-10-16; see *Measured on live VMs*). Pin the cookbook with the temporary path pin described in
    `tenant-skeleton/CLAUDE.md` (*When upstream is unreachable*), and the
    modules with `?ref=<sha>`. Fix failures on the branch, so `main` never
    carries an unmeasured `2.x`.

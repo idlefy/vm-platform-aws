@@ -191,8 +191,8 @@ groups:
         annotations:
           summary: CINC converge failed on {{ $labels.instance }}
           description: >-
-            A failed converge is invisible on an OSS CINC server, so the VM
-            silently stops tracking the cookbook — including its security
+            With no CINC server, nothing central sees a failed converge, so the
+            VM silently stops tracking the cookbook — including its security
             settings — while looking healthy.
 
             The 30m window matches the converge timer. A shorter window would

@@ -22,7 +22,7 @@ and nothing would catch it. `vms/` holds `modules/` and `README.md`.
 There is no CINC server either, here or in a tenant. Policy reaches VMs as
 signed archives in a bucket the tenant owns: `scripts/policy-publish.sh` signs
 and publishes, `vms/modules/ec2/files/dev-vm-policy-fetch` verifies and
-converges. The protocol, its threat model and what is still to be measured
+converges. The protocol, its threat model and what was measured on live VMs
 are in `docs/design/serverless-policy-delivery.md`.
 
 ## Verify your own edits
