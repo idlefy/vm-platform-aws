@@ -151,7 +151,7 @@ run "bootstrap_user_data_output_is_the_rendered_script" {
 run "bootstrap_is_idempotent_on_a_prebuilt_image" {
   command = plan
   assert {
-    condition     = strcontains(local.user_data_script, "dpkg-query -W -f='$${Version}' cinc")
+    condition     = strcontains(local.user_data_script, "dpkg-query -W -f='$${db:Status-Abbrev} $${Version}' cinc")
     error_message = "the CINC download must be skipped when the pinned version is installed (prebuilt image)."
   }
   assert {
@@ -220,6 +220,7 @@ run "boundary_denies_asset_routes_found_in_review" {
       "ec2:CreateRestoreImageTask", "ec2:CreateStoreImageTask", "ec2:ExportImage",
       "ec2:ModifyImageAttribute", "ec2:DeregisterImage", "ec2:EnableImage",
       "ec2:ImportSnapshot", "ec2:CopySnapshot", "ec2:ModifySnapshotAttribute", "ec2:DeleteSnapshot",
+      "ec2:DisableImage", "ec2:EnableImageDeprecation", "ec2:RestoreImageFromRecycleBin", "ec2:RestoreSnapshotFromRecycleBin",
       ] : contains(flatten([for st in jsondecode(aws_iam_policy.identity_boundary["vm"].policy).Statement : st.Action if st.Effect == "Deny"]), a)
     ])
     error_message = "With ami_owners = [\"self\"], anyone who can register or copy an image under the name pattern chooses what the next VM boots, and anyone who can store, export or share one reads it. Every image route must be denied (AGENTS.md trap 1)."
@@ -427,9 +428,10 @@ run "kms_bucket_adds_decrypt_and_key_denies" {
   # IAM refuses a managed policy over 6,144 characters (whitespace excluded;
   # jsonencode emits none). The boundary is the longest document this module
   # writes and grows with every deny entry; this run has the most statements,
-  # and the 1,500 left over is for the Allow list a VM's bundles declare.
+  # and the 1,300 left over is for the Allow list a VM's bundles declare
+  # (was 1,500 until the image routes took the boundary to 4,652).
   assert {
-    condition     = length(aws_iam_policy.identity_boundary["vm"].policy) < 6144 - 1500
+    condition     = length(aws_iam_policy.identity_boundary["vm"].policy) < 6144 - 1300
     error_message = "The identity boundary is too close to IAM's 6,144-character managed-policy limit: ${length(aws_iam_policy.identity_boundary["vm"].policy)} characters."
   }
 

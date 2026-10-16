@@ -355,6 +355,11 @@ resource "aws_iam_policy" "identity_boundary" {
           # copying, importing or restoring one is choosing the fleet's next
           # root disk; storing, exporting or sharing one reads it; deregistering
           # or deleting its snapshot rolls the fleet back to an older image.
+          # So does anything that hides the newest one from the data source:
+          # a disabled image drops out of DescribeImages, a deprecated one is
+          # excluded (include_deprecated defaults to false), and restoring a
+          # deregistered image from the recycle bin brings back an old one
+          # under its original creation date.
           "ec2:RegisterImage",
           "ec2:CopyImage",
           "ec2:ImportImage",
@@ -365,6 +370,10 @@ resource "aws_iam_policy" "identity_boundary" {
           "ec2:EnableImage",
           "ec2:ImportSnapshot",
           "ec2:DeleteSnapshot",
+          "ec2:DisableImage",
+          "ec2:EnableImageDeprecation",
+          "ec2:RestoreImageFromRecycleBin",
+          "ec2:RestoreSnapshotFromRecycleBin",
           "ec2:CreateSnapshot",
           "ec2:CreateSnapshots",
           "ec2:CopySnapshot",

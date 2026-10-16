@@ -44,8 +44,9 @@ rm -f /etc/sudoers.d/90-cloud-init-users
 
 # 2. Block IMDS for everyone but root (and EIC when present): the same three
 #    rules base::imds installs, spelled so its iptables-save guards recognise
-#    them and do not duplicate. Appends, in order, onto the boot-empty OUTPUT
-#    chain — positional -I would fail when the EIC rule is skipped. This
+#    them and do not duplicate. Appends, in order, onto the OUTPUT chain
+#    (boot-empty on stock Ubuntu) — positional -I would fail when the EIC rule
+#    is skipped. This
 #    script's own IMDS calls run as root, which stays allowed.
 #
 #    Each append is guarded by -C: a prebuilt image carries base::imds's
@@ -135,7 +136,9 @@ CINC_SHA256="c710cc8bf953fa56b7a4b0b726d9fcb9cb5bad2dc8caec4eaa439c4626f9aebf"
 # Skipped when the pinned version is already installed: an image built from this
 # script has it baked in, and a VM launched from that image should not need the
 # download (or the network path to it) to boot.
-if [ "$(dpkg-query -W -f='$${Version}' cinc 2>/dev/null || true)" = "$${CINC_VERSION}-1" ]; then
+# Status-Abbrev is three characters ("ii "), so "ii" plus the separator is two
+# spaces: a half-installed package is not "already installed".
+if [ "$(dpkg-query -W -f='$${db:Status-Abbrev} $${Version}' cinc 2>/dev/null || true)" = "ii  $${CINC_VERSION}-1" ]; then
   echo "cinc $${CINC_VERSION} already installed (prebuilt image)"
 else
   curl -fsSL "https://downloads.cinc.sh/files/stable/cinc/$${CINC_VERSION}/ubuntu/24.04/cinc_$${CINC_VERSION}-1_amd64.deb" \
