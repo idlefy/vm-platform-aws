@@ -37,7 +37,9 @@ build_root() {  # build_root DIR STATUS_LINE
 }
 
 run_scrub() {  # run_scrub DIR → exit status
-  SHIM_LOG="$T/log" PATH="$T/bin:$PATH" DEV_VM_IMAGE_ROOT="$1" "$SCRUB" "$REV" >"$T/out" 2>&1
+  : > "$T/console"
+  SHIM_LOG="$T/log" PATH="$T/bin:$PATH" DEV_VM_IMAGE_ROOT="$1" DEV_VM_IMAGE_CONSOLE="$T/console" \
+    "$SCRUB" "$REV" >"$T/out" 2>&1
 }
 
 echo "== a green build is scrubbed and powered off =="
@@ -80,6 +82,7 @@ echo "== a unit still enabled at the end means no image =="
 : > "$T/log"; build_root "$R" "2026-10-16T00:00:00Z ok $REV"
 SHIM_ENABLED=0 run_scrub "$R"; got=$?
 check "a timer re-enabled behind the scrub → exit 70" "$(rc [ "$got" = 70 ])"
+check "  …and says why on the console" "$(grep -q 're-enabled behind the scrub' "$T/console"; echo $?)"
 check "  …and does not power off" "$(rc [ -z "$(grep '^poweroff' "$T/log")" ])"
 
 echo "== it refuses anything but ok for the expected revision =="
@@ -89,6 +92,8 @@ for st in "2026-10-16T00:00:00Z converge-failed $REV" \
   : > "$T/log"; build_root "$R" "$st"
   run_scrub "$R"; rc=$?
   check "status '${st:-<empty>}' → exit 65" "$(rc [ "$rc" = 65 ])"
+  # make ami's failure message sends the operator to the serial console.
+  check "  …and says why on the console" "$(grep -q 'refusing: status is' "$T/console"; echo $?)"
   check "  …and touches nothing" "$(rc untouched)"
   check "  …and leaves a removable path alone" "$(rc [ -e "$R/etc/ssh/ssh_host_x" ])"
 done

@@ -14,7 +14,13 @@ set -euo pipefail
 REV=${1:-}
 R=${DEV_VM_IMAGE_ROOT:-}
 STATE=${DEV_VM_POLICY_STATE:-$R/var/lib/dev-vm/policy}
-log() { echo "dev-vm-image-scrub: $*" >&2; }
+# A failed build is terminated by Packer with its disk; the serial console is
+# the only place its operator can read why, and make ami says so.
+CONSOLE=${DEV_VM_IMAGE_CONSOLE:-/dev/console}
+log() {
+  echo "dev-vm-image-scrub: $*" >&2
+  { echo "dev-vm-image-scrub: $*" > "$CONSOLE"; } 2>/dev/null || true
+}
 
 [[ $REV =~ ^[0-9a-f]{64}$ ]] || { log "internal error: expected a revision id, got '$REV'"; exit 70; }
 
