@@ -96,6 +96,35 @@ describe 'base::cinc_client' do
       expect(resource.command).to end_with("mv #{FETCH}.new #{FETCH}")
       expect(resource.not_if.first.command).to eq("cmp -s #{FETCH}.new #{FETCH}")
     end
+
+    # Measured on a live VM, 2026-10-16: a script that could not run fell back
+    # to .prev, the converge repaired it, and the repair copied the broken
+    # script over .prev, so the fallback was gone for next time. Only a version
+    # the launcher could run is kept.
+    context 'run in a sandbox' do
+      def install(current)
+        Dir.mktmpdir do |dir|
+          f = "#{dir}/fetch"
+          File.write("#{f}.prev", "#!/bin/bash\necho prev\n")
+          File.write("#{f}.new", "#!/bin/bash\necho new\n")
+          File.write(f, current)
+          [f, "#{f}.prev", "#{f}.new"].each { |p| File.chmod(0o700, p) }
+          cmd = chef_run.execute('install dev-vm-policy-fetch').command
+                        .sub("#{FETCH}.new --self-test #{SELFTEST}", 'true')
+                        .gsub(FETCH, f)
+          expect(system('bash', '-c', cmd)).to be(true)
+          [File.read(f), File.read("#{f}.prev")]
+        end
+      end
+
+      it 'keeps a runnable current version as .prev' do
+        expect(install("#!/bin/bash\necho current\n")).to eq(["#!/bin/bash\necho new\n", "#!/bin/bash\necho current\n"])
+      end
+
+      it 'never keeps a version that does not parse as .prev' do
+        expect(install("#!/bin/bash\nif then fi\n")).to eq(["#!/bin/bash\necho new\n", "#!/bin/bash\necho prev\n"])
+      end
+    end
   end
 
   describe 'the signers set' do

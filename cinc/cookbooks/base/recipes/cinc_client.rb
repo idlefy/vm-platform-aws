@@ -38,7 +38,10 @@ end
 # against the shipped fixture, and only then replaces it — by mv, never an
 # in-place write, because the running converge is a child of the old script
 # and bash keeps reading the inode it opened. The old version stays as .prev
-# for the launcher, which only user_data writes.
+# for the launcher, which only user_data writes — but only if the launcher
+# could run it. A version that is not executable or does not parse is the one
+# .prev exists to replace: copying it there on repair (measured on a live VM,
+# 2026-10-16) left the next failure with nothing to fall back to.
 fetch    = '/usr/local/sbin/dev-vm-policy-fetch'
 selftest = '/usr/share/dev-vm/policy-fetch-selftest'
 
@@ -68,7 +71,7 @@ end
 
 execute 'install dev-vm-policy-fetch' do
   command "#{fetch}.new --self-test #{selftest} && " \
-          "{ [ ! -e #{fetch} ] || cp -p #{fetch} #{fetch}.prev; } && " \
+          "{ ! { [ -x #{fetch} ] && bash -n #{fetch}; } || cp -p #{fetch} #{fetch}.prev; } && " \
           "mv #{fetch}.new #{fetch}"
   not_if "cmp -s #{fetch}.new #{fetch}"
 end
