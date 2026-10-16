@@ -1,15 +1,13 @@
----
-name: get-started
-description: Use when someone has just cloned vm-platform-aws and asks what it is, how to start, or wants their own tenant repository — orients them, checks tools, creates the tenant repository from tenant-skeleton/ and hands off to the tenant-setup skill inside it. Deploys nothing.
----
-
 # Get started with vm-platform-aws
 
+Follow this when someone has just cloned vm-platform-aws and asks what it is,
+how to start, or wants their own tenant repository. It deploys nothing.
+
 You take a newcomer from "I cloned this" to "I have my own tenant repository,
-ready for `tenant-setup`". You create that repository and **stop**. Everything
+ready for its `SETUP.md`". You create that repository and **stop**. Everything
 inside it — `make prepare`, the pin, the tenant files, the cookbook tag —
-belongs to the `tenant-setup` skill that ships in the skeleton, because that
-skill decides "already configured?" by looking at those files, and touching
+belongs to `SETUP.md`, which ships in the skeleton, because that guide
+decides "already configured?" by looking at those files, and touching
 them here would make it think the tenant is done while every value is still a
 placeholder.
 
@@ -46,7 +44,7 @@ git --version
 
 The skeleton consumes this platform over HTTPS, so no SSH key to GitHub is
 needed. A missing tool is not a blocker for creating the repository; say which
-step will need it (`terraform` and `chef` for `tenant-setup`, `aws` for the
+step will need it (`terraform` and `chef` for `SETUP.md`, `aws` for the
 first `plan`).
 
 ## 3. Collect
@@ -57,7 +55,7 @@ One question at a time:
    `<owner>/<team>-vm-tenant`).
 2. Private? Default **yes** — it will hold configuration. Only make it public
    if they say so explicitly.
-3. Show the newest platform release so they know what `tenant-setup` will pin,
+3. Show the newest platform release so they know what `SETUP.md` will pin,
    but do **not** resolve it here:
 
 ```bash
@@ -86,8 +84,9 @@ they are — never write a real value into one.
 
 ## 5. Hand off
 
-Print the tenant path and say: open it, run `claude`, and the `tenant-setup`
-skill there will resolve the platform pin, collect the AWS profile, Route53
+Print the tenant path and say: open it with Claude Code or Codex and ask it to
+set the tenant up. The agent reads `AGENTS.md`, which sends it to `SETUP.md`;
+that guide will resolve the platform pin, collect the AWS profile, Route53
 zone, regions, policy bucket and signing key, and the Loki settings, materialise the
 config, and stop before any `apply`.
 
@@ -97,12 +96,12 @@ Also say, once:
   https://idlefy.com; the VMs will carry the `idlefy = "enabled"` tag by
   default either way, and a single VM opts out with
   `tags = { idlefy = "disabled" }` in `instances.auto.tfvars`.
-- The runbook for everything after `tenant-setup` is
+- The runbook for everything after `SETUP.md` is
   https://idlefy.github.io/vm-platform-aws/runbook/.
 
 ## Hard limits
 
-These inherit the tenant's own `CLAUDE.md` rules that already apply before a
+These inherit the tenant's own `AGENTS.md` rules that already apply before a
 tenant exists.
 
 - Never run `terraform apply`, `make push`, `make promote`, `make prepare`,

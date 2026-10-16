@@ -35,12 +35,12 @@ This repository deploys nothing. It publishes a CINC cookbook (`cinc/cookbooks/b
 ```bash
 git clone https://github.com/idlefy/vm-platform-aws.git
 cd vm-platform-aws
-claude
+claude          # or codex; GET-STARTED.md creates your tenant repository
 ```
 
-The `get-started` skill checks your tools, asks where the tenant repository should live, and creates it from `tenant-skeleton/`. The `tenant-setup` skill takes over inside the new repository — open it with `claude` there; it collects the values, resolves the pin, and stops before anything is applied.
+[`GET-STARTED.md`](GET-STARTED.md) checks your tools, asks where the tenant repository should live, and creates it from `tenant-skeleton/`. Inside the new repository its `SETUP.md` takes over — open it with Claude Code or Codex there; it collects the values, resolves the pin, and stops before anything is applied.
 
-Without Claude Code:
+Manual setup, without Claude Code or Codex:
 
 1. Create a private repository and copy the **contents** of `tenant-skeleton/` into its root — the `Makefile` has to land at the top level (`cp -r vm-platform-aws/tenant-skeleton/. <your-tenant>/`).
 2. `make prepare PLATFORM_TAG=vX.Y.Z` — materialises the config files and pins the modules to that release. The current tag is the one on the release badge above, or `git tag --list 'v*' --sort=-v:refname | head -1`.
@@ -90,7 +90,7 @@ make smoke                                             # the skeleton against th
 for t in test/test-release-gate.sh test/test-resolve-pin.sh test/test-boundary-check.sh \
          test/test-placeholder-check.sh test/test-prepare.sh test/test-pin-to-worktree.sh \
          test/test-preflight.sh test/test-skeleton-sync.sh test/test-fetch-sync.sh \
-         test/test-policy-publish.sh test/test-get-started-skill.sh; do "$t"; done
+         test/test-policy-publish.sh test/test-get-started.sh; do "$t"; done
 ( cd cinc && make lint && make test && make test-broker && make test-loki-token && make test-policy-fetch )
 make test-pin-check                                    # root target; needs chef
 mkdocs build --strict
@@ -98,7 +98,7 @@ mkdocs build --strict
 
 `terraform test` needs Terraform ≥1.7 for `mock_provider` (everything else works on the declared `>= 1.5.0` floor), and `mkdocs build --strict` needs `mkdocs-material`. CI runs the same list on every pull request and on every push to `main` — the docs build in its own workflow.
 
-Working in this repository with an agent? Read [`CLAUDE.md`](CLAUDE.md) — it carries the traps, each of which has actually happened. How to open a pull request is in [`CONTRIBUTING.md`](CONTRIBUTING.md).
+Working in this repository with an agent? Read [`AGENTS.md`](AGENTS.md) — it carries the traps, each of which has actually happened. How to open a pull request is in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Contributing, security, license
 

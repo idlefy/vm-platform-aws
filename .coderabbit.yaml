@@ -81,8 +81,8 @@ knowledge_base:
   code_guidelines:
     enabled: true
     filePatterns:
-      - "CLAUDE.md"
-      - "tenant-skeleton/CLAUDE.md"
+      - "AGENTS.md"
+      - "tenant-skeleton/AGENTS.md"
   learnings:
     scope: auto
   pull_requests:

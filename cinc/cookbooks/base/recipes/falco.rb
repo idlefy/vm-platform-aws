@@ -111,7 +111,7 @@ end
 # so its CVEs are ours to track, and bumping this string is the only way it moves.
 # The Package-Blacklist entry in base::unattended_upgrades is defensive — it costs
 # one line and stops a future "let's get Falco's patches automatically" edit from
-# turning into the daily version flap CLAUDE.md records for Alloy.
+# turning into the daily version flap AGENTS.md records for Alloy.
 falco_version = '0.44.1'
 
 # Installed with `execute` rather than `package` because the deb's postinst reads

@@ -125,7 +125,7 @@ KEY_BASE="$POLICY_PREFIX/$POLICY_NAME"
 NAMESPACE="dev-vm-policy-$POLICY_GROUP"
 
 # ---- state -------------------------------------------------------------------
-# Root-only, because trap 8 in CLAUDE.md is a rule and not a case-by-case
+# Root-only, because trap 8 in AGENTS.md is a rule and not a case-by-case
 # judgement: nothing here is secret, but node state carries ohai data and no
 # developer-reachable path belongs inside a root converge.
 

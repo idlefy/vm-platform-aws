@@ -129,7 +129,7 @@ variable "ssh_key_pairs" {
 # attempt is exactly the event worth alerting on.
 #
 # The evidence is in the pinned upstream checkout, at
-# .terraform/modules/ec2/vms/modules/ec2/variables.tf and in its CLAUDE.md.
+# .terraform/modules/ec2/vms/modules/ec2/variables.tf and in its AGENTS.md.
 # If a future release has to be adopted, the gate is a live VM — check sudo
 # denial logging on an INTERACTIVE path, `stat -c '%u'` output, and whether CINC
 # ships a build. Not a changelog.

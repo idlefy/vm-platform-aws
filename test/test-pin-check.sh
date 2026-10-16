@@ -221,7 +221,7 @@ check "names source_options.git" "$(echo "$OUT" | grep -q 'source_options.git' &
 teardown
 
 echo "== an offline-recovery tree does not pass as pinned =="
-# tenant CLAUDE.md promises a tree on local module paths is unpublishable and
+# tenant AGENTS.md promises a tree on local module paths is unpublishable and
 # pin-check refuses it. Unfixed, the '# was:' comments satisfy the ref= grep,
 # seen=2, bad=0, and the gate passes with zero live git-pinned sources.
 setup

@@ -4,7 +4,7 @@
 # Everything here is a failure that applies clean, promotes clean, and then
 # surfaces days later on a VM — usually as AccessDenied, a 401, or simply no
 # logs. Each check below corresponds to one such gap already named in the docs —
-# CLAUDE.md or the log-shipping spec, and exists because nothing else covers it:
+# the agent guide or the log-shipping spec, and exists because nothing else covers it:
 # hand-placed per-region secrets are invisible to Terraform (it manages the IAM
 # grant that *names* a parameter, never the value), and external policy ARNs are
 # never resolved by any test.
@@ -284,7 +284,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# External policy ARNs. CLAUDE.md names this as a gap no test closes: a typo
+# External policy ARNs. The agent guide names this as a gap no test closes: a typo
 # plans clean, applies clean, and surfaces as AccessDenied on a VM days later,
 # because the ARN belongs to whoever owns the resource and is only referenced.
 # ---------------------------------------------------------------------------

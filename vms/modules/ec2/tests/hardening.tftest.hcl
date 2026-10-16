@@ -525,7 +525,7 @@ run "boundary_denies_writes_to_the_policy_bucket" {
         "s3:CreateAccessGrant", "s3:CreateJob",
       ] : strcontains(aws_iam_policy.identity_boundary["vm"].policy, "\"${action}\"")
     ])
-    error_message = "Every route to rewriting, deleting, locking or re-encrypting the policy bucket must be denied (CLAUDE.md trap 1)."
+    error_message = "Every route to rewriting, deleting, locking or re-encrypting the policy bucket must be denied (AGENTS.md trap 1)."
   }
 
   assert {

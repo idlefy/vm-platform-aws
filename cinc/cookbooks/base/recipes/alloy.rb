@@ -322,7 +322,7 @@ template '/etc/alloy/config.alloy' do
   #   - broken syntax    -> alloy refuses to start, dead unit, zero lines
   #   - bad component arg -> the unit comes up and the component does not load:
   #                          GREEN unit, zero lines. This is the worse of the two
-  #                          and it is the documented Alloy-pin trap in CLAUDE.md.
+  #                          and it is the documented Alloy-pin trap in AGENTS.md.
   #
   # `validate`, not `fmt`, because only one of them catches the second case.
   # Measured as root on a live VM 2026-08-12 against this very config: both

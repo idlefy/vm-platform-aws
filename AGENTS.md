@@ -12,9 +12,12 @@ publishes two artifacts, and nothing deploys from it.
 
 A tenant repository is generated from `tenant-skeleton/` and holds its own
 configuration and nothing else. Tenant operations — creating a VM, deleting one,
-pushing policies — live in `tenant-skeleton/CLAUDE.md`, which ships with the
+pushing policies — live in `tenant-skeleton/AGENTS.md`, which ships with the
 tenant. This file carries the mechanisms and the evidence behind them, which is
 what a change to the platform needs.
+
+**Agent guides.** Someone who has just cloned this repository and wants to
+start → follow [`GET-STARTED.md`](GET-STARTED.md).
 
 There is no deployable `vms/` root here on purpose: two copies of it would drift
 and nothing would catch it. `vms/` holds `modules/` and `README.md`.
@@ -35,7 +38,7 @@ make smoke                                             # the skeleton against th
 for t in test/test-release-gate.sh test/test-resolve-pin.sh test/test-boundary-check.sh \
          test/test-placeholder-check.sh test/test-prepare.sh test/test-pin-to-worktree.sh \
          test/test-preflight.sh test/test-skeleton-sync.sh test/test-fetch-sync.sh \
-         test/test-policy-publish.sh test/test-get-started-skill.sh; do "$t"; done
+         test/test-policy-publish.sh test/test-get-started.sh; do "$t"; done
 ( cd cinc && make lint && make test && make test-broker && make test-loki-token && make test-policy-fetch )
 make test-pin-check                                    # root target; needs chef
 mkdocs build --strict
@@ -209,7 +212,7 @@ long before the new ruleset is; and moving `base::falco` earlier changes nothing
 because `cookbook_file[/etc/falco/rules.d/50-dev-vm.yaml]` notifies a **`:delayed`**
 restart, which runs at the end of the converge wherever the recipe sits. Making it
 `:immediately` is not the fix either — see the Falco crash-loop trap in
-[`tenant-skeleton/CLAUDE.md`](tenant-skeleton/CLAUDE.md): a restart landing
+[`tenant-skeleton/AGENTS.md`](tenant-skeleton/AGENTS.md): a restart landing
 while the eBPF probe is still opening dies and re-dies every fifteen seconds
 while `systemctl is-active` reports `active`, and `StandardOutput=null` means
 the reason never reaches journald. So on the

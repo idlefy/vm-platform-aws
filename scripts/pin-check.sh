@@ -66,7 +66,7 @@ if [ -z "$remote_rev" ]; then
   echo "could not resolve tag $tag at $git_url"
   echo "  Either the remote is unreachable (network, SSH agent, access) or the tag was deleted."
   echo "  A deleted tag can leave the pinned commit unreachable; 'When upstream is"
-  echo "  unreachable' in CLAUDE.md is the way out."
+  echo "  unreachable' in the tenant's agent guide is the way out."
   exit 1
 fi
 

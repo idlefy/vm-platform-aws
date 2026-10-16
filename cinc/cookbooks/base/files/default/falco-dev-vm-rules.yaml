@@ -214,7 +214,7 @@
 # a symlink named `sudo` pointing at /usr/bin/logger produced an event with
 # `name=sudo` and `exepath=/usr/bin/logger`. Keying on the name would have
 # accepted that forgery; keying on exepath rejected it. Under sudo-rs (26.04,
-# which CLAUDE.md forbids) the path becomes /usr/lib/cargo/bin/sudo, so an AMI
+# which AGENTS.md forbids) the path becomes /usr/lib/cargo/bin/sudo, so an AMI
 # bump has to revisit this line or the rule silently stops matching.
 #
 # The verdict (granted vs refused) is NOT in the syscall stream, and since

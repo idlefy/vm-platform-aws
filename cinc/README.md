@@ -491,7 +491,7 @@ rather than recommending you close it.
 Creating, recreating and deleting a VM are tenant operations and none of them
 runs from here. The canonical steps — including the one Terraform does not
 know about, removing the node from the tailnet — are in
-`tenant-skeleton/CLAUDE.md` (*Create a VM* / *Delete a VM*), which ships with
+`tenant-skeleton/AGENTS.md` (*Create a VM* / *Delete a VM*), which ships with
 every tenant. The rest of this section is the model behind them.
 
 Note that Terraform commands run from a tenant's `vms/` root, which has its own

@@ -49,7 +49,7 @@ the VM's boundary does not constrain.
 
 ## Out of scope
 
-- **Known and documented gaps.** The design records and `CLAUDE.md` name several
+- **Known and documented gaps.** The design records and `AGENTS.md` name several
   deliberately: no alert fires when a VM stops shipping (Idlefy stops these VMs
   overnight, so silence is normal); no journald field authenticates a sudo event,
   which is why the journal alerts are tripwires and Falco is the detector; the
