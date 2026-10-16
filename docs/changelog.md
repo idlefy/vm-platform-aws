@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.0.1
+
+The agent guide is now `AGENTS.md`, which Claude Code and Codex both read. The
+two skills are now plain guides in the repository root: `GET-STARTED.md` in
+this repository and `SETUP.md` in a generated tenant. No behaviour changes.
+
+**`base-2.0.1`**
+
+- Comments only. The version moves anyway, because a tenant reads it out of
+  its lock.
+
+**`v2.0.1`**
+
+- `tenant-skeleton/` ships `AGENTS.md` and `SETUP.md` in place of `CLAUDE.md`
+  and `.claude/skills/tenant-setup/`.
+- An existing tenant keeps working as it is. To adopt the change, rename its
+  `CLAUDE.md` to `AGENTS.md`.
+
 ## 2.0.0
 
 There is no CINC server any more. Policy reaches VMs as signed archives in an

@@ -85,7 +85,7 @@ end
 # restart, so the new ruleset loads at the end of the run however early the
 # recipe is included, while this resource has already written the grant. Moving
 # either recipe buys nothing; :immediately risks the Falco crash loop. See the
-# ship-ordering trap in CLAUDE.md before repeating the pattern.
+# ship-ordering trap in AGENTS.md before repeating the pattern.
 file '/etc/sudoers.d/50-tailscale-login' do
   content <<~SUDOERS
     # Managed by CINC — base::sudoers. Do not edit on the VM.
