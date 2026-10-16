@@ -1,0 +1,104 @@
+#!/bin/bash
+# The last stage of an image build (docs/design/ami-image.md). Runs as root,
+# appended to the module's own bootstrap script, so it is reached only after a
+# green first converge — and it checks that itself before touching anything.
+# Removes what belongs to this one instance, disables the units that would act
+# on a new VM's first boot before cloud-init has configured it, and powers off;
+# Packer snapshots the stopped instance.
+#
+# The lists are the measured diff in test/fixtures/image-scrub-paths; a path
+# added here without a line there fails test/test-image-scrub.sh, and so does
+# the reverse.
+set -euo pipefail
+
+REV=${1:-}
+R=${DEV_VM_IMAGE_ROOT:-}
+STATE=${DEV_VM_POLICY_STATE:-$R/var/lib/dev-vm/policy}
+log() { echo "dev-vm-image-scrub: $*" >&2; }
+
+[[ $REV =~ ^[0-9a-f]{64}$ ]] || { log "internal error: expected a revision id, got '$REV'"; exit 70; }
+
+# With no DEV_VM_IMAGE_ROOT the globs below run against the real /tmp, /var/log
+# and /home. That is the point on a build instance and a disaster anywhere else.
+if [ -z "$R" ] && [ "$(id -u)" != 0 ]; then
+  log "internal error: not root and DEV_VM_IMAGE_ROOT unset; this runs only on a build instance"
+  exit 70
+fi
+
+# The status file is read before anything else: the fixture removes it below.
+read -r _ result got < "$STATE/status" 2>/dev/null || true
+if [ "${result:-}" != ok ] || [ "${got:-}" != "$REV" ]; then
+  log "refusing: status is '${result:-none} ${got:-}', expected 'ok $REV'; no image will be taken"
+  exit 65
+fi
+
+echo "$REV" > "$R/etc/dev-vm/image-revision"
+chmod 0644 "$R/etc/dev-vm/image-revision"
+
+# Re-enabled by the first converge on every VM ([:enable, :start] in their recipes).
+systemctl disable --now cinc-client.timer aws-vm-credentials.timer alloy
+# Stop what writes state before its state is removed. Rootless docker and
+# traefik live under user@1000.
+systemctl stop user@1000.service falco-modern-bpf tailscaled
+
+# Entries are quoted so a glob is expanded below, under $R, not here.
+REMOVE=(
+  "/etc/ssh/ssh_host_*" # host keys; regenerated on first boot
+  "/var/lib/amazon/ssm/Vault/Store/*" # SSM agent's EC2RegistrationKey for the build instance
+  "/var/lib/amazon/ssm/runtimeconfig/identity_config.json" # SSM agent's cached identity
+  "/home/ubuntu/.local/share/docker/engine-id" # rootless dockerd's engine id
+  "/home/ubuntu/.claude.json" # Claude Code's userID/machineID, created by its installer
+  "/home/ubuntu/.claude/backups" # backups of that file
+  "/var/lib/alloy/data/alloy_seed.json" # Alloy's instance seed
+  "/home/ubuntu/.ssh/authorized_keys" # Packer's temporary key pair, written by cloud-init
+  "/root/.ssh/authorized_keys" # the same key, behind cloud-init's "login as ubuntu" prefix
+  "/home/ubuntu/.config/traefik/password" # base::traefik basic-auth password; regenerated when users is absent
+  "/home/ubuntu/.config/traefik/users" # its htpasswd line
+  "/home/ubuntu/.local/share/traefik/acme.json" # ACME account and any certificate for the build's name
+  "/etc/alloy/loki-token" # never written (no SSM grant at build); removed in case that ever changes
+  "/root/.aws/cli/cache" # AWS CLI session cache from the build role
+  "/root/.gnupg" # gpg-agent state from apt key imports
+  "/var/lib/tailscale/*" # tailscaled node state and logs
+  "/var/cache/tailscale" # tailscaled cache
+  "/etc/dev-vm/policy.conf" # the bootstrap writes it from the VM's own tags
+  "/etc/dev-vm/policy-signers" # the bootstrap writes it from var.policy_signers
+  "/etc/dev-vm/aws-access.env" # carries the build's vm_name
+  "/var/lib/dev-vm/policy/lock" # flock file
+  "/var/lib/dev-vm/policy/last-serial" # anti-replay checkpoint; a VM must not inherit the build's
+  "/var/lib/dev-vm/policy/previous-revision" # the build's history
+  "/var/lib/dev-vm/policy/delivery-failures" # the build's counter
+  "/var/lib/dev-vm/policy/status" # the build's result (the scrub reads it first)
+  "/var/lib/alloy/data/loki.source.journal.journal" # journal positions of the build's journal
+  "/var/log/journal/*" # the build's journal
+  "/var/log/user-data.log" # the build's bootstrap log
+  "/var/log/cinc-first-run.log" # the build's first converge
+  "/var/log/*.gz" # rotated logs
+  "/var/log/*.1" # rotated logs
+  "/home/ubuntu/.npm/_logs" # npm debug logs from the installs
+  "/home/ubuntu/.bash_history" # none expected; defensive
+  "/root/.bash_history" # none expected; defensive
+  "/tmp/*" # install leftovers (uv tarball, node compile cache, sockets)
+  "/var/tmp/*" # systemd private dirs
+)
+EMPTY=(
+  "/etc/machine-id" # systemd/journald identity; /var/lib/dbus/machine-id links here
+  "/var/log/syslog" # the build's syslog
+  "/var/log/auth.log" # the build's auth log
+  "/var/log/kern.log" # the build's kernel log
+  "/var/log/wtmp" # login records
+  "/var/log/btmp" # failed logins
+  "/var/log/lastlog" # last logins
+)
+
+shopt -s nullglob dotglob
+for g in "${REMOVE[@]}"; do
+  # shellcheck disable=SC2086 # the glob is the point; no entry holds whitespace
+  for p in $R$g; do rm -rf -- "$p"; done
+done
+for p in "${EMPTY[@]}"; do
+  if [ -e "$R$p" ]; then : > "$R$p"; fi
+done
+
+cloud-init clean --logs --machine-id
+fstrim -av || true
+poweroff
