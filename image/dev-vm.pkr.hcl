@@ -89,7 +89,7 @@ source "amazon-ebs" "dev_vm" {
     instance_metadata_tags = "enabled"
   }
 
-  # Read the bucket, nothing else. No parameter store: no credential that outlives the
+  # Read the bucket, nothing else. No SSM: no credential that outlives the
   # build is ever written to its disk (spec, decision 5).
   temporary_iam_instance_profile_policy_document {
     Version = "2012-10-17"

@@ -267,6 +267,9 @@ make release TAG=v1.0.0
 git push origin <tag>
 ```
 
+The `v` stream's gate needs Packer (CI pins 1.11.2) on the releasing
+workstation, plus network access for `packer init`.
+
 The gates run against the working tree while a tag names a commit, which is why
 `release` prints the SHA before it starts and tags that SHA explicitly. Tags are
 immutable by convention, and a repository may enforce nothing: check

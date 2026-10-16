@@ -5,7 +5,7 @@ METADATA := cinc/cookbooks/base/metadata.rb
 POLICYFILE  := cinc/policyfiles/dev-vm.rb
 LOCKFILE    := cinc/policyfiles/dev-vm.lock.json
 
-.PHONY: help release test-release-gate boundary-check test-boundary-check smoke pin-check test-pin-check test-skeleton-sync test-fetch-sync test-policy-publish test-image-template
+.PHONY: help release test-release-gate boundary-check test-boundary-check smoke pin-check test-pin-check test-skeleton-sync test-fetch-sync test-policy-publish test-image-template test-image-scrub
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -31,6 +31,9 @@ test-pin-check: ## Test the pin gate (needs a local git remote only)
 
 test-image-template: ## packer fmt + validate on image/, no AWS
 	@./test/test-image-template.sh
+
+test-image-scrub: ## Test the image scrub script against a fixture root
+	@./test/test-image-scrub.sh
 
 test-skeleton-sync: ## Prove tenant-skeleton's script copies have not drifted
 	@./test/test-skeleton-sync.sh

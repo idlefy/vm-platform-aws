@@ -29,7 +29,8 @@ mkdocs build --strict
 None of it touches AWS: every `terraform test` uses `mock_provider`, the broker
 and Loki-token tests stub `aws` on `PATH`, and the pin tests build their own
 bare repository in a temp directory. You need Terraform (≥1.7 for the tests,
-which use `mock_provider`), CINC Workstation for the `cinc` targets and
+which use `mock_provider`), Packer (1.11.2 in CI; `packer init` downloads
+its plugin, so the image-template test needs network), CINC Workstation for the `cinc` targets and
 `test-pin-check`, and `mkdocs-material` for the docs build.
 
 `.github/workflows/ci.yml` runs the same list on every pull request, split by
