@@ -215,6 +215,17 @@ run "boundary_denies_asset_routes_found_in_review" {
   }
 
   assert {
+    condition = alltrue([for a in [
+      "ec2:RegisterImage", "ec2:CopyImage", "ec2:CreateImage", "ec2:ImportImage",
+      "ec2:CreateRestoreImageTask", "ec2:CreateStoreImageTask", "ec2:ExportImage",
+      "ec2:ModifyImageAttribute", "ec2:DeregisterImage", "ec2:EnableImage",
+      "ec2:ImportSnapshot", "ec2:CopySnapshot", "ec2:ModifySnapshotAttribute", "ec2:DeleteSnapshot",
+      ] : contains(flatten([for st in jsondecode(aws_iam_policy.identity_boundary["vm"].policy).Statement : st.Action if st.Effect == "Deny"]), a)
+    ])
+    error_message = "With ami_owners = [\"self\"], anyone who can register or copy an image under the name pattern chooses what the next VM boots, and anyone who can store, export or share one reads it. Every image route must be denied (AGENTS.md trap 1)."
+  }
+
+  assert {
     condition = !contains(
       [
         for statement in jsondecode(aws_iam_policy.identity_boundary["vm"].policy).Statement :

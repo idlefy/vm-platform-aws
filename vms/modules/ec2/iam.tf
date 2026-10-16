@@ -349,6 +349,22 @@ resource "aws_iam_policy" "identity_boundary" {
           "ec2:ReplaceIamInstanceProfileAssociation",
           "ec2:CreateImage",
           "ec2:ModifyImageAttribute",
+          # A tenant-built image (docs/design/ami-image.md) makes AMIs in this
+          # account an input to every new VM: with ami_owners = ["self"] the
+          # newest image matching the name pattern is what boots. Registering,
+          # copying, importing or restoring one is choosing the fleet's next
+          # root disk; storing, exporting or sharing one reads it; deregistering
+          # or deleting its snapshot rolls the fleet back to an older image.
+          "ec2:RegisterImage",
+          "ec2:CopyImage",
+          "ec2:ImportImage",
+          "ec2:CreateRestoreImageTask",
+          "ec2:CreateStoreImageTask",
+          "ec2:ExportImage",
+          "ec2:DeregisterImage",
+          "ec2:EnableImage",
+          "ec2:ImportSnapshot",
+          "ec2:DeleteSnapshot",
           "ec2:CreateSnapshot",
           "ec2:CreateSnapshots",
           "ec2:CopySnapshot",
