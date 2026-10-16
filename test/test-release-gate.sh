@@ -47,6 +47,10 @@ STUB
 #!/bin/sh
 echo "skeleton-sync stub"
 STUB
+  for n in image-template image-scrub; do
+    printf '#!/bin/sh\necho "%s stub"\n' "$n" > "$WORK/test/test-$n.sh"
+    chmod +x "$WORK/test/test-$n.sh"
+  done
   cat > "$WORK/test/test-fetch-sync.sh" <<'STUB'
 #!/bin/sh
 echo "fetch-sync stub"
@@ -163,6 +167,8 @@ check "exit 0" "$?"
 check "ran the boundary guard" "$(echo "$OUT" | grep -q 'boundary stub' && echo 0 || echo 1)"
 check "ran the smoke gate" "$(echo "$OUT" | grep -q 'smoke stub' && echo 0 || echo 1)"
 check "ran the skeleton-sync guard" "$(echo "$OUT" | grep -q 'skeleton-sync stub' && echo 0 || echo 1)"
+check "ran the image-template gate" "$(echo "$OUT" | grep -q 'image-template stub' && echo 0 || echo 1)"
+check "ran the image-scrub gate" "$(echo "$OUT" | grep -q 'image-scrub stub' && echo 0 || echo 1)"
 check "ran the fetch-sync guard" "$(echo "$OUT" | grep -q 'fetch-sync stub' && echo 0 || echo 1)"
 check "no chefspec on the v path" "$(echo "$OUT" | grep -q 'chefspec stub' && echo 1 || echo 0)"
 check "tag exists on HEAD" "$([ "$(git -C "$WORK" rev-parse v9.0.0 2>/dev/null)" = "$(git -C "$WORK" rev-parse HEAD)" ] && echo 0 || echo 1)"

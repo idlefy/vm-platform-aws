@@ -5,7 +5,7 @@ METADATA := cinc/cookbooks/base/metadata.rb
 POLICYFILE  := cinc/policyfiles/dev-vm.rb
 LOCKFILE    := cinc/policyfiles/dev-vm.lock.json
 
-.PHONY: help release test-release-gate boundary-check test-boundary-check smoke pin-check test-pin-check test-skeleton-sync test-fetch-sync test-policy-publish
+.PHONY: help release test-release-gate boundary-check test-boundary-check smoke pin-check test-pin-check test-skeleton-sync test-fetch-sync test-policy-publish test-image-template
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -28,6 +28,9 @@ pin-check: ## Verify the committed lock matches the remote tag and the policyfil
 
 test-pin-check: ## Test the pin gate (needs a local git remote only)
 	@./test/test-pin-check.sh
+
+test-image-template: ## packer fmt + validate on image/, no AWS
+	@./test/test-image-template.sh
 
 test-skeleton-sync: ## Prove tenant-skeleton's script copies have not drifted
 	@./test/test-skeleton-sync.sh
@@ -105,6 +108,8 @@ release: ## Gate and cut an artifact tag (usage: make release TAG=base-X.Y.Z | v
 	           && ./test/test-skeleton-sync.sh \
 	           && ./test/test-fetch-sync.sh \
 	           && ./test/test-policy-publish.sh \
+	           && ./test/test-image-template.sh \
+	           && ./test/test-image-scrub.sh \
 	           && ./scripts/smoke.sh ;; \
 	 esac \
 	 && git tag "$(TAG)" "$$sha" \

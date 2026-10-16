@@ -19,7 +19,8 @@ make boundary-check                                    # modules stay inside the
 make smoke                                             # the skeleton against this tree
 for t in test/test-release-gate.sh test/test-resolve-pin.sh test/test-boundary-check.sh \
          test/test-placeholder-check.sh test/test-prepare.sh test/test-pin-to-worktree.sh \
-         test/test-preflight.sh test/test-skeleton-sync.sh test/test-get-started.sh; do "$t"; done
+         test/test-preflight.sh test/test-skeleton-sync.sh test/test-get-started.sh \
+         test/test-image-template.sh test/test-image-scrub.sh; do "$t"; done
 ( cd cinc && make lint && make test && make test-broker && make test-loki-token )
 make test-pin-check                                    # root target; needs chef
 mkdocs build --strict
@@ -47,7 +48,7 @@ time against one set of gates:
 | Stream | Publishes | Gates | Lockstep |
 |---|---|---|---|
 | `base-X.Y.Z` | `cinc/cookbooks/base/**` | `cookstyle`, `chefspec`, `test-broker`, `test-loki-token` | `metadata.rb` must say `X.Y.Z`, byte for byte |
-| `vX.Y.Z` | `vms/modules/**` + `tenant-skeleton/**` | `boundary-check`, `test-skeleton-sync`, `smoke` | none — the module carries no version string |
+| `vX.Y.Z` | `vms/modules/**` + `tenant-skeleton/**` + `image/**` | `boundary-check`, `test-skeleton-sync`, `test-image-template`, `test-image-scrub`, `smoke` | none — the module carries no version string |
 
 A pull request that changes both is a pull request that cannot be released as
 one thing. Split it, unless the change genuinely spans the two — in which case
