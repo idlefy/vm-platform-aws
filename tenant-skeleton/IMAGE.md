@@ -80,7 +80,7 @@ packer version                    # 1.11 or newer
 ```
 
 Optional knobs: `POLICY=<name>` (default `dev-vm`), `VOLUME=<gb>` (default
-20), `SUBNET=<subnet-id>`, `INSTANCE_TYPE=<type>` (default `t3.large`).
+20), `SUBNET=<subnet-id>`, `INSTANCE_TYPE=<type>` (default `c7a.xlarge`).
 
 `make ami` refuses, with a message that names the cause, when:
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ami-build.sh — build the fleet image from the promoted production revision.
 #
-#   cd cinc && make ami [POLICY=dev-vm] [VOLUME=20] [SUBNET=subnet-…] [INSTANCE_TYPE=t3.large]
+#   cd cinc && make ami [POLICY=dev-vm] [VOLUME=20] [SUBNET=subnet-…] [INSTANCE_TYPE=c7a.xlarge]
 #
 # One converge of the revision production.json names, through the same signed
 # path and the same first-boot script every VM runs, then the scrub, then a
@@ -195,7 +195,7 @@ packer build -machine-readable \
   -var "platform_sha=$PIN_SHA" \
   -var "cookbook_version=$COOKBOOK_VERSION" \
   -var "subnet_id=${SUBNET:-}" \
-  -var "instance_type=${INSTANCE_TYPE:-t3.large}" \
+  -var "instance_type=${INSTANCE_TYPE:-c7a.xlarge}" \
   -var "volume_size_gb=$VOLUME" \
   "$IMG" \
   | tee "$PKLOG" \

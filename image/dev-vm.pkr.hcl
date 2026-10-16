@@ -30,8 +30,11 @@ variable "subnet_id" {
   default = ""
 }
 variable "instance_type" {
-  type    = string
-  default = "t3.large"
+  type = string
+  # Not burstable: the build is one long CPU-bound converge, and a t3 spends
+  # it throttled on credits (measured 2026-10-16: ~10 min on t3.large against
+  # ~3.5 min for the same converge on a c7a.large VM).
+  default = "c7a.xlarge"
 }
 variable "volume_size_gb" {
   type    = number
@@ -114,9 +117,14 @@ source "amazon-ebs" "dev_vm" {
   communicator          = "none"
   disable_stop_instance = true
   user_data_file        = var.user_data_file
+  # One setting for every wait: the self-stop, the first (full) snapshot and
+  # each cross-region copy, each with its own budget. 15 s x 480 = 2 h; 40
+  # minutes left little margin when the first snapshot alone took 12+. The
+  # cost is that a build whose bootstrap failed waits the full 2 h unless the
+  # operator stops it (its serial console says why).
   aws_polling {
     delay_seconds = 15
-    max_attempts  = 160
+    max_attempts  = 480
   }
 
   tags          = local.tags
