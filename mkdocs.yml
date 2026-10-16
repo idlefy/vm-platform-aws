@@ -57,5 +57,6 @@ nav:
       - Per-VM AWS access: design/per-vm-aws-access.md
       - Serverless policy delivery: design/serverless-policy-delivery.md
       - First external review: design/first-external-review.md
+      - Prebuilt image: design/ami-image.md
   - Versioning: versioning.md
   - Changelog: changelog.md

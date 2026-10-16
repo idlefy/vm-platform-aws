@@ -39,7 +39,7 @@ head_ "Reading tenant configuration"
 # pretty-printed expression fails with "Expected the start of an expression, but
 # found the end of the file" — which reads like a syntax error in the HCL rather
 # than in this script.
-CONSOLE_EXPR='jsonencode({regions = keys(local.regions), loki = var.loki_ssm_parameter_name, shipping = var.log_shipping, profile = var.aws_profile, bucket = var.policy_bucket, owner = var.policy_bucket_owner, bucket_region = var.policy_bucket_region, prefix = var.policy_prefix, kms = var.policy_kms_key_arn, signers = var.policy_signers, bundles = {for k, v in var.access_bundles : k => v.policy_arns}})'
+CONSOLE_EXPR='jsonencode({regions = keys(local.regions), loki = var.loki_ssm_parameter_name, shipping = var.log_shipping, profile = var.aws_profile, bucket = var.policy_bucket, owner = var.policy_bucket_owner, bucket_region = var.policy_bucket_region, prefix = var.policy_prefix, kms = var.policy_kms_key_arn, signers = var.policy_signers, bundles = {for k, v in var.access_bundles : k => v.policy_arns}, ami_owners = var.ami_owners, ami_pattern = var.ami_name_pattern})'
 
 # console prints the jsonencode() result as a quoted JSON *string*, hence the
 # double decode below.
@@ -80,6 +80,8 @@ try:
     arns = sorted({a for v in c["bundles"].values() for a in v})
     out.append("BUNDLE_ARNS=%s" % shlex.quote(" ".join(arns)))
     out.append("BUNDLE_COUNT=%d" % len(c["bundles"]))
+    out.append("AMI_OWNERS=%s" % shlex.quote(" ".join(c["ami_owners"])))
+    out.append("AMI_PATTERN=%s" % shlex.quote(c["ami_pattern"]))
     print("\n".join(out))
 except Exception:
     sys.exit(1)
@@ -299,6 +301,30 @@ else
       bad "does not resolve: $A"
     fi
   done
+fi
+
+# ---------------------------------------------------------------------------
+# The fleet image. With ami_owners = ["self"] the AMI data source resolves in
+# each VM's own region, so a region with no matching image fails `terraform
+# plan` there, and an old image makes every new VM start with a long first
+# converge and stale packages. Read-only: describe-images only.
+# ---------------------------------------------------------------------------
+head_ "Fleet image"
+if [[ " $AMI_OWNERS " == *" self "* ]]; then
+  for R in $REGIONS; do
+    d=$(aws ec2 describe-images --region "$R" --owners self \
+          --filters "Name=name,Values=$AMI_PATTERN" \
+          --query 'sort_by(Images,&CreationDate)[-1].CreationDate' --output text 2>/dev/null || true)
+    if [ -z "$d" ] || [ "$d" = None ]; then
+      bad "$R — no image matches $AMI_PATTERN; terraform plan will fail here (make ami copies to every region)"
+    elif [ $(( ($(date +%s) - $(date -d "$d" +%s)) / 86400 )) -gt 35 ]; then
+      warn "$R — newest image is from ${d%%T*}, older than 35 days; rebuild with make ami"
+    else
+      ok "$R — image from ${d%%T*}"
+    fi
+  done
+else
+  ok "ami_owners does not name self — no prebuilt image in use"
 fi
 
 # ---------------------------------------------------------------------------

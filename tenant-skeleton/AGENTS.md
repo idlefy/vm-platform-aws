@@ -12,6 +12,8 @@ where the long form is.
 
 **Agent guides.** A fresh clone whose configuration is not filled in yet →
 follow [`SETUP.md`](SETUP.md).
+Building or refreshing the fleet's prebuilt image → follow
+[`IMAGE.md`](IMAGE.md).
 
 ---
 
@@ -54,6 +56,12 @@ statements, not from its description or its name. The description is prose and i
 routinely stale; `allowed_actions` is the ceiling the VM's permissions boundary
 enforces, so a namespace missing from it turns into an `AccessDenied` on the VM,
 and a namespace wrongly added to it silently widens the ceiling.
+
+**Prebuilt image.** A fleet on a prebuilt image boots the same way, with a
+shorter first converge. `ami_owners = ["self"]` in `vms/tenant.auto.tfvars` means an
+image matching `ami_name_pattern` must exist in the VM's region, or `terraform
+plan` fails there; [`IMAGE.md`](IMAGE.md) builds one, and `make preflight`
+checks every region.
 
 ### Delete a VM
 
