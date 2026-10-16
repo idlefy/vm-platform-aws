@@ -226,6 +226,13 @@ run "boundary_denies_asset_routes_found_in_review" {
         "ec2:DisableImage", "ec2:EnableImageDeprecation", "ec2:DisableImageDeprecation",
         "ec2:DisableImageBlockPublicAccess", "ec2:DisableImageDeregistrationProtection",
         "ec2:RestoreImageFromRecycleBin", "ec2:RestoreSnapshotFromRecycleBin",
+        # Image Builder registers AMIs in this account through its own role, so
+        # these need no iam:PassRole once an infrastructure configuration exists.
+        "imagebuilder:CreateImage", "imagebuilder:CreateImageRecipe", "imagebuilder:CreateImagePipeline",
+        "imagebuilder:StartImagePipelineExecution", "imagebuilder:CreateDistributionConfiguration",
+        "imagebuilder:UpdateDistributionConfiguration", "imagebuilder:ImportVmImage",
+        "imagebuilder:ImportDiskImage", "imagebuilder:CreateLifecyclePolicy",
+        "imagebuilder:StartResourceStateUpdate", "imagebuilder:PutImagePolicy",
         ] : anytrue([
           for st in jsondecode(aws_iam_policy.identity_boundary["vm"].policy).Statement :
           st.Effect == "Deny" && anytrue([

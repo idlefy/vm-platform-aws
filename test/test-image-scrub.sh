@@ -20,9 +20,22 @@ mkdir -p "$T/bin"
 for c in systemctl journalctl cloud-init fstrim poweroff; do
   printf '#!/usr/bin/env bash\necho "%s $*" >> "$SHIM_LOG"\n' "$c" > "$T/bin/$c"; chmod +x "$T/bin/$c"
 done
-# `systemctl is-enabled` answers "nothing enabled" unless SHIM_ENABLED=0.
+# `systemctl is-enabled` answers "nothing enabled" unless SHIM_ENABLED=0. A
+# unit named in SHIM_MISSING does not exist: every verb naming it fails, as
+# real systemctl does ("Unit … does not exist", "not loaded").
 # shellcheck disable=SC2016
-printf '[ "$1" = is-enabled ] && exit "${SHIM_ENABLED:-1}"\nexit 0\n' >> "$T/bin/systemctl"
+cat >> "$T/bin/systemctl" <<'SHIM'
+[ "$1" = is-enabled ] && exit "${SHIM_ENABLED:-1}"
+# SHIM_SERIAL_TO: the queued converge fetched a newer envelope before it was stopped.
+[ "$*" = "stop cinc-client.service" ] && [ -n "${SHIM_SERIAL_TO:-}" ] \
+  && echo "$SHIM_SERIAL_TO" > "$DEV_VM_IMAGE_ROOT/var/lib/dev-vm/policy/last-serial"
+for a in "${@:2}"; do
+  for m in ${SHIM_MISSING:-}; do [ "$a" = "$m" ] && exit 5; done
+done
+exit 0
+SHIM
+# shellcheck disable=SC2016
+printf '[ -n "${SHIM_FAIL_CLOUDINIT:-}" ] && exit 1\nexit 0\n' >> "$T/bin/cloud-init"
 
 build_root() {  # build_root DIR STATUS_LINE
   local r=$1 verb path
@@ -83,6 +96,28 @@ echo "== a unit still enabled at the end means no image =="
 SHIM_ENABLED=0 run_scrub "$R"; got=$?
 check "a timer re-enabled behind the scrub → exit 70" "$(rc [ "$got" = 70 ])"
 check "  …and says why on the console" "$(grep -q 're-enabled behind the scrub' "$T/console"; echo $?)"
+check "  …and does not power off" "$(rc [ -z "$(grep '^poweroff' "$T/log")" ])"
+
+echo "== a unit the policy never installed is not an error =="
+# log_shipping = false purges alloy; a run_list may omit aws_access or cinc_client.
+: > "$T/log"; build_root "$R" "2026-10-16T00:00:00Z ok $REV"
+SHIM_MISSING="alloy aws-vm-credentials.timer aws-vm-credentials.service" run_scrub "$R"; got=$?
+check "alloy and the credential units absent → exit 0" "$(rc [ "$got" = 0 ])"
+check "  …and powers off" "$(tail -1 "$T/log" | grep -q '^poweroff'; echo $?)"
+check "  …and still disables cinc-client.timer" "$(grep -q 'systemctl disable .*cinc-client.timer' "$T/log"; echo $?)"
+
+echo "== a converge that fetched another envelope behind the bootstrap means no image =="
+: > "$T/log"; build_root "$R" "2026-10-16T00:00:00Z ok $REV"
+SHIM_SERIAL_TO="1792160000 $(printf 'c%.0s' {1..64}) x" run_scrub "$R"; got=$?
+check "last-serial moved while the queued converge was stopped → exit 65" "$(rc [ "$got" = 65 ])"
+check "  …says why on the console" "$(grep -q 'another envelope' "$T/console"; echo $?)"
+check "  …and does not power off" "$(rc [ -z "$(grep '^poweroff' "$T/log")" ])"
+
+echo "== any other failure says so on the console and powers nothing off =="
+: > "$T/log"; build_root "$R" "2026-10-16T00:00:00Z ok $REV"
+SHIM_FAIL_CLOUDINIT=1 run_scrub "$R"; got=$?
+check "a failing step → non-zero exit" "$(rc [ "$got" != 0 ])"
+check "  …names the line on the console" "$(grep -q 'internal error at line' "$T/console"; echo $?)"
 check "  …and does not power off" "$(rc [ -z "$(grep '^poweroff' "$T/log")" ])"
 
 echo "== it refuses anything but ok for the expected revision =="

@@ -148,7 +148,7 @@ check "...and var.policy_signers" "$(grep -qxF "$SIGNER" "$T/show.env.signers"; 
 check "prints one line per region" \
   "$(grep -qx 'eu-central-1 ami-0aaa' "$T/out" && grep -qx 'us-east-1 ami-0bbb' "$T/out"; echo $?)"
 check "prints the tfvars to set" \
-  "$(grep -qE 'ami_owners +=  *\["self"\]' "$T/out" && grep -qE 'ami_name_pattern +=  *"dev-vm-dev-vm-\*"' "$T/out"; echo $?)"
+  "$(grep -qE 'ami_owners +=  *\["self"\]' "$T/out" && grep -qE 'ami_name_pattern +=  *"dev-vm-dev-vm-2\*"' "$T/out"; echo $?)"
 check "the user data temp file is gone" "$(! grep -o 'user_data_file=[^ ]*' "$T/packer.log" | cut -d= -f2 | xargs -r ls 2>/dev/null | grep -q .; echo $?)"
 
 echo "== inputs passed through =="

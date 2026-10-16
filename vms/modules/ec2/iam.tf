@@ -373,6 +373,16 @@ resource "aws_iam_policy" "identity_boundary" {
           "ec2:Enable*Image*",
           "ec2:Disable*Image*",
           "ec2:Restore*FromRecycleBin",
+          # Image Builder reaches the same AMIs through its service-linked
+          # role: a recipe and a distribution named under the pattern, run
+          # against any existing infrastructure configuration, register one,
+          # and lifecycle policies or state updates deprecate or disable one.
+          # None of it needs iam:PassRole. Reads stay open.
+          "imagebuilder:Create*",
+          "imagebuilder:Update*",
+          "imagebuilder:Start*",
+          "imagebuilder:Import*",
+          "imagebuilder:Put*",
           "ec2:CreateSnapshot",
           "ec2:CreateSnapshots",
           "ec2:CopySnapshot",

@@ -603,7 +603,7 @@ measurements and threat model are in [Prebuilt image](design/ami-image.md).
 cd cinc && make ami                 # 15-30 minutes; production only
 ```
 
-Then set `ami_owners = ["self"]` and `ami_name_pattern = "dev-vm-<policy>-*"`
+Then set `ami_owners = ["self"]` and `ami_name_pattern = "dev-vm-<policy>-2*"`
 in `vms/tenant.auto.tfvars` and read `terraform plan`: it must replace no
 running VM, because the module ignores AMI changes on existing instances.
 

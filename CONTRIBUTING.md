@@ -14,14 +14,15 @@ to re-measure.
 
 ```bash
 make boundary-check                                    # modules stay inside themselves
-( cd vms/modules/ec2          && terraform test )      # 26 runs
+( cd vms/modules/ec2          && terraform test )      # 55 runs
 ( cd vms/modules/fleet-guards && terraform test )      # 5 runs
 make smoke                                             # the skeleton against this tree
 for t in test/test-release-gate.sh test/test-resolve-pin.sh test/test-boundary-check.sh \
          test/test-placeholder-check.sh test/test-prepare.sh test/test-pin-to-worktree.sh \
-         test/test-preflight.sh test/test-skeleton-sync.sh test/test-get-started.sh \
+         test/test-preflight.sh test/test-skeleton-sync.sh test/test-fetch-sync.sh \
+         test/test-policy-publish.sh test/test-get-started.sh \
          test/test-image-template.sh test/test-image-scrub.sh test/test-ami-build.sh; do "$t"; done
-( cd cinc && make lint && make test && make test-broker && make test-loki-token )
+( cd cinc && make lint && make test && make test-broker && make test-loki-token && make test-policy-fetch )
 make test-pin-check                                    # root target; needs chef
 mkdocs build --strict
 ```
@@ -29,9 +30,10 @@ mkdocs build --strict
 None of it touches AWS: every `terraform test` uses `mock_provider`, the broker
 and Loki-token tests stub `aws` on `PATH`, and the pin tests build their own
 bare repository in a temp directory. You need Terraform (≥1.7 for the tests,
-which use `mock_provider`), Packer (1.11.2 in CI; `packer init` downloads
-its plugin, so the image-template test needs network), CINC Workstation for the `cinc` targets and
-`test-pin-check`, and `mkdocs-material` for the docs build.
+which use `mock_provider`), Packer (1.11.2 in CI; `packer init`
+downloads its plugin, so the image-template test needs network), CINC
+Workstation for the `cinc` targets and `test-pin-check`, and `mkdocs-material`
+for the docs build.
 
 `.github/workflows/ci.yml` runs the same list on every pull request, split by
 stream; `.github/workflows/docs.yml` runs the docs build. The three lists — this
@@ -48,8 +50,8 @@ time against one set of gates:
 
 | Stream | Publishes | Gates | Lockstep |
 |---|---|---|---|
-| `base-X.Y.Z` | `cinc/cookbooks/base/**` | `cookstyle`, `chefspec`, `test-broker`, `test-loki-token` | `metadata.rb` must say `X.Y.Z`, byte for byte |
-| `vX.Y.Z` | `vms/modules/**` + `tenant-skeleton/**` + `image/**` | `boundary-check`, `test-skeleton-sync`, `test-image-template`, `test-image-scrub`, `test-ami-build`, `smoke` | none — the module carries no version string |
+| `base-X.Y.Z` | `cinc/cookbooks/base/**` | `cookstyle`, `chefspec`, `test-broker`, `test-loki-token`, `test-policy-fetch`, `test-fetch-sync` | `metadata.rb` must say `X.Y.Z`, byte for byte |
+| `vX.Y.Z` | `vms/modules/**` + `tenant-skeleton/**` + `image/**` | `boundary-check`, `test-skeleton-sync`, `test-fetch-sync`, `test-policy-publish`, `test-image-template`, `test-image-scrub`, `test-ami-build`, `smoke` | none — the module carries no version string |
 
 A pull request that changes both is a pull request that cannot be released as
 one thing. Split it, unless the change genuinely spans the two — in which case

@@ -312,10 +312,11 @@ fi
 head_ "Fleet image"
 if [[ " $AMI_OWNERS " == *" self "* ]]; then
   for R in $REGIONS; do
-    d=$(aws ec2 describe-images --region "$R" --owners self \
-          --filters "Name=name,Values=$AMI_PATTERN" \
-          --query 'sort_by(Images,&CreationDate)[-1].CreationDate' --output text 2>/dev/null || true)
-    if [ -z "$d" ] || [ "$d" = None ]; then
+    if ! d=$(aws ec2 describe-images --region "$R" --owners self \
+               --filters "Name=name,Values=$AMI_PATTERN" \
+               --query 'sort_by(Images,&CreationDate)[-1].CreationDate' --output text 2>&1); then
+      bad "$R — could not query images: $(tail -1 <<<"$d")"
+    elif [ -z "$d" ] || [ "$d" = None ]; then
       bad "$R — no image matches $AMI_PATTERN; terraform plan will fail here (make ami copies to every region)"
     elif [ $(( ($(date +%s) - $(date -d "$d" +%s)) / 86400 )) -gt 35 ]; then
       warn "$R — newest image is from ${d%%T*}, older than 35 days; rebuild with make ami"

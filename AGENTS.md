@@ -32,7 +32,7 @@ are in `docs/design/serverless-policy-delivery.md`.
 
 ```bash
 make boundary-check                                    # modules stay inside themselves
-( cd vms/modules/ec2          && terraform test )      # 53 runs
+( cd vms/modules/ec2          && terraform test )      # 55 runs
 ( cd vms/modules/fleet-guards && terraform test )      # 5 runs
 make smoke                                             # the skeleton against this tree
 for t in test/test-release-gate.sh test/test-resolve-pin.sh test/test-boundary-check.sh \

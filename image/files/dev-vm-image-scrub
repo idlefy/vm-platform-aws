@@ -21,6 +21,9 @@ log() {
   echo "dev-vm-image-scrub: $*" >&2
   { echo "dev-vm-image-scrub: $*" > "$CONSOLE"; } 2>/dev/null || true
 }
+# Under set -e any other failure would end the script with nothing on the
+# console and the bootstrap's own ERR trap already cleared.
+trap 'log "internal error at line $LINENO; no image will be taken"' ERR
 
 [[ $REV =~ ^[0-9a-f]{64}$ ]] || { log "internal error: expected a revision id, got '$REV'"; exit 70; }
 
@@ -33,6 +36,7 @@ fi
 
 # The status file is read before anything else: the fixture removes it below.
 read -r _ result got < "$STATE/status" 2>/dev/null || true
+serial=$(cat "$STATE/last-serial" 2>/dev/null || true)
 if [ "${result:-}" != ok ] || [ "${got:-}" != "$REV" ]; then
   log "refusing: status is '${result:-none} ${got:-}', expected 'ok $REV'; no image will be taken"
   exit 65
@@ -47,10 +51,23 @@ chmod 0644 "$R/etc/dev-vm/image-revision"
 # starts the moment the lock frees and re-enabled both timers 13 s into the
 # first live build's scrub. So: timers, then the services they start, then
 # disable. The check before poweroff below is what makes this load-bearing.
+# A unit the policy never installed is not an error: log_shipping = false
+# purges alloy, and a run_list may leave out aws_access.
 TIMERS=(cinc-client.timer aws-vm-credentials.timer)
-systemctl stop "${TIMERS[@]}"
-systemctl stop cinc-client.service aws-vm-credentials.service
-systemctl disable --now "${TIMERS[@]}" alloy
+present() { systemctl cat "$1" >/dev/null 2>&1; }
+for u in "${TIMERS[@]}" cinc-client.service aws-vm-credentials.service; do
+  if present "$u"; then systemctl stop "$u"; fi
+done
+for u in "${TIMERS[@]}" alloy; do
+  if present "$u"; then systemctl disable --now "$u"; fi
+done
+# That converge verifies whatever production.json says when it starts. If a
+# promote landed during the build it fetched a newer envelope, and part of
+# that revision may now be on this disk under the old revision's tag.
+if [ "$(cat "$STATE/last-serial" 2>/dev/null || true)" != "$serial" ]; then
+  log "refusing: a converge queued behind the bootstrap fetched another envelope; no image will be taken"
+  exit 65
+fi
 # Stop what writes state before its state is removed. Rootless docker and
 # traefik live under user@1000.
 # One unit at a time: one that is missing or will not stop must not abort the

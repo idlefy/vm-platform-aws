@@ -172,13 +172,17 @@ user data:
    services they start, then disables both timers and `alloy`. The order
    matters: the bootstrap's converge starts `cinc-client.timer`, which is past
    its `OnBootSec` by then and queues a second converge behind the lock (see
-   *Measured*, item 3).
+   *Measured*, item 3). A unit the policy never installed is skipped
+   (`log_shipping = false` purges Alloy). If `last-serial` moved while that
+   converge ran, it fetched a newer envelope, and the scrub refuses.
 4. Stops the services that write state: `user@1000.service` (Docker and
    Traefik are rootless user units), the root daemons, `syslog.socket` before
    `rsyslog`, and `systemd-update-utmp` and `systemd-random-seed`, which write
    on stop. Moves journald to `/run` with `journalctl --relinquish-var`.
 5. Removes the measured list.
 6. Refuses, with no poweroff, if any of the three units is enabled again.
+   Every refusal, and any unexpected failure, is written to the serial
+   console, the one place a terminated build's operator can read.
 7. Runs `cloud-init clean --logs --machine-id`.
 8. Runs `poweroff`.
 
@@ -237,7 +241,7 @@ readme.
   group and key pair;
 - the first build;
 - checking the AMI tags against the lock;
-- switching `ami_owners = ["self"]` and `ami_name_pattern = "dev-vm-<policy>-*"`;
+- switching `ami_owners = ["self"]` and `ami_name_pattern = "dev-vm-<policy>-2*"`;
 - a test VM;
 - when to rebuild: after each promote of a new cookbook release, and at least
   monthly for OS updates;
@@ -267,7 +271,10 @@ older than 35 days.
   without creating one: `DisableImage`, `EnableImageDeprecation` (the data
   source skips deprecated images), and `RestoreImageFromRecycleBin` /
   `RestoreSnapshotFromRecycleBin`. Finally, it denies the routes that read
-  one out: `CreateStoreImageTask` and `ExportImage`. Operators who can register images in the account are
+  one out: `CreateStoreImageTask` and `ExportImage`. Image Builder reaches
+  the same images through its own service role, without `iam:PassRole`, so
+  its `Create*`, `Update*`, `Start*`, `Import*` and `Put*` are denied too.
+  Operators who can register images in the account are
   trusted the same way as those who can sign policy.
 - **The first-boot window.** A VM from the image boots with the IMDS rules
   restored from `rules.v4`, and the cookbook's sudoers is already in place.

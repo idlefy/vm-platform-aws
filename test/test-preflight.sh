@@ -45,7 +45,8 @@ case "$1 $2" in
   "ssm describe-parameters")  echo SecureString ;;
   "ssm get-parameter")        echo not-a-real-token ;;
   "iam get-policy")           exit 0 ;;
-  "ec2 describe-images")      echo "${IMAGE_DATE:-}" ;;
+  "ec2 describe-images")      [ -n "${IMAGE_ERR:-}" ] && { echo "$IMAGE_ERR" >&2; exit 254; }
+                              echo "${IMAGE_DATE:-}" ;;
   *)                          exit 1 ;;
 esac
 SH
@@ -345,6 +346,11 @@ check "no image: names the region and the plan failure" \
   "$(grep -q 'eu-central-1 — no image matches dev-vm-dev-vm-\*.*terraform plan will fail' "$T/out"; echo $?)"
 rc=$(IMAGE_DATE= run_preflight)
 check "empty answer is also no image" "$([ "$rc" = 1 ]; echo $?)"
+rc=$(IMAGE_ERR="An error occurred (UnauthorizedOperation) when calling the DescribeImages operation" run_preflight)
+check "query error: exit 1" "$([ "$rc" = 1 ]; echo $?)"
+check "query error: says the query failed, with AWS's reason" \
+  "$(grep -q 'eu-central-1 — could not query images.*UnauthorizedOperation' "$T/out"; echo $?)"
+check "query error: does not claim there is no image" "$(! grep -q 'no image matches' "$T/out"; echo $?)"
 
 echo "== fleet image: Canonical owner makes no describe-images call =="
 fixture true /t/loki 111122223333 "" '["099720109477"]' 'dev-vm-dev-vm-*'

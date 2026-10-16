@@ -212,4 +212,4 @@ echo "$AMIS"
 echo
 echo "To launch VMs from it, set in vms/tenant.auto.tfvars:"
 echo '  ami_owners       = ["self"]'
-echo "  ami_name_pattern = \"dev-vm-$POLICY-*\""
+echo "  ami_name_pattern = \"dev-vm-$POLICY-2*\""
