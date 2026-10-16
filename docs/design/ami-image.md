@@ -113,7 +113,7 @@ piece of work (a CloudFormation product).
 11. **Agent instructions are one file per repository, and skills are plain
     files in the root.** `CLAUDE.md` becomes `AGENTS.md` in this repository and
     in `tenant-skeleton/`, with the text unchanged. Claude Code reads
-    `AGENTS.md` when there is no `CLAUDE.md` (code.claude.com/docs/en/memory),
+    `AGENTS.md` when there is no `CLAUDE.md` (its memory documentation),
     and Codex reads it natively. The skills move out of `.claude/skills/`:
     - `get-started` becomes `GET-STARTED.md` here;
     - `tenant-setup` becomes `SETUP.md` in the skeleton;

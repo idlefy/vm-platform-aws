@@ -129,7 +129,7 @@ the build region:
 
 ```bash
 aws ec2 describe-images --owners self --region <region> \
-  --filters 'Name=name,Values=dev-vm-<POLICY>-2*' \
+  --filters 'Name=name,Values=dev-vm-<POLICY>-2*' 'Name=virtualization-type,Values=hvm' \
   --query 'sort_by(Images,&CreationDate)[-1].Tags'
 ```
 
@@ -180,7 +180,7 @@ Keep the newest two images. List them per region, then deregister the older
 ones and delete their snapshots, in every region:
 
 ```bash
-aws ec2 describe-images --owners self --filters 'Name=name,Values=dev-vm-<POLICY>-2*' --region <region> \
+aws ec2 describe-images --owners self --filters 'Name=name,Values=dev-vm-<POLICY>-2*' 'Name=virtualization-type,Values=hvm' --region <region> \
   --query 'sort_by(Images,&CreationDate)[].[ImageId,Name,CreationDate,BlockDeviceMappings[0].Ebs.SnapshotId]' \
   --output text
 aws ec2 deregister-image --image-id <old-ami> --region <region>
