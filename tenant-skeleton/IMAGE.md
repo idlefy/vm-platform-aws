@@ -40,11 +40,12 @@ Check each one and report what is missing; do not work around it.
 
 ```bash
 packer version                    # 1.11 or newer
-( cd cinc && make preflight )     # no "production missing" or "production invalid" for the policy
+( cd cinc && make preflight )     # no "no production.json yet" warning, no "production.json does not verify" failure
 ```
 
-- A promoted production revision: `make preflight` prints no `production
-  missing` and no `production invalid` warning or failure for the policy. The image is built only from
+- A promoted production revision: `make preflight` prints neither the warning
+  "there is no production.json yet" nor the failure "production.json does not
+  verify against var.policy_signers" for the policy. The image is built only from
   `production.json`, because one image feeds both groups and a staging build
   would put unpromoted content on production VMs. `make ami` refuses when
   production is missing, does not verify, or names a different revision than
