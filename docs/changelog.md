@@ -28,9 +28,9 @@ server stays on `base-1.x`, and moving a tenant means recreating its VMs.
 - The bootstrap writes the policy settings and the trusted signers and runs
   the first converge from the bucket. It fails closed on any `PolicyGroup`
   other than `staging` or `production`.
-- The permissions boundary denies writes to the policy prefix, changes to the
-  bucket and its key, and the routes that redirect where S3's name resolves or
-  where traffic leaves the VPC.
+- The permissions boundary denies writes anywhere in the policy bucket,
+  changes to the bucket and its key, and the routes that redirect where S3's
+  name resolves or where traffic leaves the VPC.
 - `make push` / `make promote` sign and publish through
   `scripts/policy-publish.sh`. It never signs an archive whose contents differ
   from a fresh export of the lock. `make preflight` checks the bucket and both

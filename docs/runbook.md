@@ -65,7 +65,8 @@ the call without it.
 ### The policy bucket
 
 `make push` writes each policy's archive and its signed envelopes here, and
-every VM reads from it every 30 minutes. A dedicated bucket is recommended; any
+every VM reads from it every 30 minutes. A dedicated bucket is recommended:
+developers' VMs are denied every write to it, not only under the prefix. Any
 bucket works, in this account or another, SSE-S3 or SSE-KMS. Versioning keeps
 the history of every envelope, which is what an investigation reads.
 

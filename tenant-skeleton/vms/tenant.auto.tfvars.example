@@ -14,7 +14,8 @@ route53_zone_id = "Z01234567ABCDEFGHIJKL"
 # each policy, signs a manifest with your SSH key and writes both to a bucket
 # you own; every VM fetches, verifies and converges from it. Any bucket works —
 # same account or another one, SSE-S3 or SSE-KMS. The runbook has the bucket
-# policy a cross-account bucket needs. A dedicated bucket is recommended.
+# policy a cross-account bucket needs. A dedicated bucket is recommended: VMs
+# are denied every write to it, not only under the prefix.
 policy_bucket        = "your-org-dev-vm-policies"
 policy_bucket_owner  = "123456789012"
 policy_bucket_region = "eu-central-1"

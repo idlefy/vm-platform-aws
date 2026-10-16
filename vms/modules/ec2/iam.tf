@@ -259,8 +259,13 @@ resource "aws_iam_instance_profile" "bootstrap" {
 #       envelope, lock or expire objects so the next push fails, rewrite the
 #       bucket's policy, re-encrypt it with a key the operator cannot use,
 #       turn on requester-pays, or tier objects into an archive class.
-#       Object actions are scoped to <bucket>/<prefix>/*, bucket configuration
-#       to the bucket — a developer's own S3 elsewhere is untouched. Access
+#       Object actions are denied on every key in the bucket, not only under
+#       <prefix>/: a prefix-scoped deny still let an s3:* bundle write any
+#       other key (measured on a live VM, 2026-10-16), and a bucket VMs trust
+#       is no place for developer writes. That costs a tenant who shares the
+#       bucket with other data its developers' writes there, which is why the
+#       runbook recommends a dedicated one. Bucket configuration is denied on
+#       the bucket; a developer's own S3 elsewhere is untouched. Access
 #       points get their own entries because S3 authorises a request made
 #       through one against the ACCESS POINT's ARN, which a deny on the bucket
 #       ARN never matches; those are denied on "*". Known gaps, closed only by
@@ -486,7 +491,7 @@ resource "aws_iam_policy" "identity_boundary" {
           "s3:DeleteObjectTagging",
           "s3:DeleteObjectVersionTagging",
         ]
-        Resource = "arn:aws:s3:::${var.policy_bucket}/${var.policy_prefix}/*"
+        Resource = "arn:aws:s3:::${var.policy_bucket}/*"
       },
       {
         Sid    = "DenyPolicyBucketConfiguration"

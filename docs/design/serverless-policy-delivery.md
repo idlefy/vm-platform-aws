@@ -497,11 +497,13 @@ the deny has to cover every route to the asset, not just the obvious API.
 These entries only matter when a bundle declares `s3` or `kms`. Without that,
 the boundary's allow list already leaves those namespaces out. Each entry is
 scoped to the policy bucket, so a developer's own S3 use elsewhere is not
-affected.
+affected. Object writes are denied on every key in the bucket, not only under
+the prefix: the first version scoped them to `<prefix>/*`, and a live VM with
+an `s3:*` bundle could then write any other key (measured 2026-10-16).
 
 | Route | Actions | Resource |
 |---|---|---|
-| Overwrite or delete objects. `CopyObject` and multipart uploads authorise as `PutObject` | `s3:PutObject`, `s3:DeleteObject`, `s3:DeleteObjectVersion` | `arn:aws:s3:::<bucket>/<prefix>/*` |
+| Overwrite or delete objects. `CopyObject` and multipart uploads authorise as `PutObject` | `s3:PutObject`, `s3:DeleteObject`, `s3:DeleteObjectVersion` | `arn:aws:s3:::<bucket>/*` |
 | Lock objects so the next push fails | `s3:PutObjectRetention`, `s3:PutObjectLegalHold`, `s3:BypassGovernanceRetention` | same |
 | ACLs and tags on objects, where lifecycle or bucket policy rules match on tags | `s3:PutObjectAcl`, `s3:PutObjectVersionAcl`, `s3:PutObjectTagging`, `s3:PutObjectVersionTagging`, `s3:DeleteObjectTagging`, `s3:DeleteObjectVersionTagging` | same |
 | Rewrite the bucket's own rules | `s3:PutBucketPolicy`, `s3:DeleteBucketPolicy`, `s3:PutBucketAcl`, `s3:PutBucketOwnershipControls`, `s3:PutBucketPublicAccessBlock` | `arn:aws:s3:::<bucket>` |
@@ -550,9 +552,9 @@ unless the flag is set. The deny list stays as the second layer.
 `route53:VPCs` would rest on a condition key no one here has verified for
 that action.
 
-If the bucket is shared with other data, the bucket-ARN rows deny those
-configuration changes for the whole bucket. The runbook recommends a
-dedicated bucket.
+If the bucket is shared with other data, the boundary denies developers every
+object write and every configuration change in all of it, not only in the
+prefix. The runbook recommends a dedicated bucket.
 
 The existing SSM entries stay. `ssm:GetParameter*` still guards the Loki
 token and `ssm:PutParameter` still guards its integrity. Their comments

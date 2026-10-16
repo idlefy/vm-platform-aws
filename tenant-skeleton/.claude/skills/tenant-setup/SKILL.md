@@ -52,7 +52,7 @@ Ask one at a time. Do not accept a blank.
 | `domain_root` | `infra.example.com` | Matches the zone. |
 | `admin_email` | `ops@example.com` | Let's Encrypt registration. |
 | `state_bucket` | `platform-tf-state` | Must already exist. |
-| `policy_bucket` | `platform-dev-vm-policies` | Where `make push` writes signed policy. Must already exist — the runbook says how to create it. A dedicated bucket is recommended. |
+| `policy_bucket` | `platform-dev-vm-policies` | Where `make push` writes signed policy. Must already exist — the runbook says how to create it. A dedicated bucket is recommended: developers' VMs may not write anywhere in it. |
 | `policy_bucket_owner` | `123456789012` | The 12-digit account that owns it. |
 | `policy_bucket_region` | `eu-central-1` | The bucket's region. |
 | `policy_kms_key_arn` | *(blank)* | Only for an SSE-KMS bucket; the one blank answer allowed. |

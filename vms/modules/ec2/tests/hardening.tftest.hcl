@@ -529,8 +529,10 @@ run "boundary_denies_writes_to_the_policy_bucket" {
   }
 
   assert {
-    condition     = strcontains(aws_iam_policy.identity_boundary["vm"].policy, "\"Resource\":\"arn:aws:s3:::tenant-policies/dev-vm-policies/*\"")
-    error_message = "Object writes are denied on the policy prefix, not on all of S3."
+    # The whole bucket, not just the prefix: measured on a live VM 2026-10-16,
+    # a prefix-scoped deny still let an s3:* bundle write any other key.
+    condition     = strcontains(aws_iam_policy.identity_boundary["vm"].policy, "\"Resource\":\"arn:aws:s3:::tenant-policies/*\"") && !strcontains(aws_iam_policy.identity_boundary["vm"].policy, "tenant-policies/dev-vm-policies/*")
+    error_message = "Object writes are denied on every key in the policy bucket, and on nothing outside it."
   }
 
   assert {
