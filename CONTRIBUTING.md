@@ -5,7 +5,7 @@ and deploys nothing, so a contribution is a change to one of them — the CINC
 cookbook under `cinc/cookbooks/base/`, or the Terraform modules and tenant
 skeleton under `vms/modules/` and `tenant-skeleton/`.
 
-[`CLAUDE.md`](CLAUDE.md) is the working guide: how the two artifacts are
+[`AGENTS.md`](AGENTS.md) is the working guide: how the two artifacts are
 consumed, the traps that have actually bitten this platform, and the hard rules.
 Read it before a first change — most of it is evidence you would otherwise have
 to re-measure.
@@ -33,7 +33,7 @@ which use `mock_provider`), CINC Workstation for the `cinc` targets and
 
 `.github/workflows/ci.yml` runs the same list on every pull request, split by
 stream; `.github/workflows/docs.yml` runs the docs build. The three lists — this
-one, `CLAUDE.md`'s and CI's — are kept in step by hand, so if you add a test,
+one, `AGENTS.md`'s and CI's — are kept in step by hand, so if you add a test,
 add it to all three.
 
 CodeRabbit reviews every pull request against `main` automatically

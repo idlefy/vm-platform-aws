@@ -1,8 +1,8 @@
 # Runbook: from a fresh tenant repository to a running fleet
 
 This is the operator's path from a fresh tenant repository to running VMs.
-The tenant repository is generated from `tenant-skeleton/` (the `get-started`
-skill or the manual steps in the README do that); everything below happens
+The tenant repository is generated from `tenant-skeleton/` (`GET-STARTED.md`
+or the manual steps in the README do that); everything below happens
 inside it. Nothing in it is a copy of the platform: the CINC cookbook and the
 two Terraform modules are pinned artifacts fetched from their tags, so the only
 files you edit are configuration.
@@ -596,7 +596,7 @@ These are the template's starting values, not leftovers. Each is a deliberate
 default a tenant is expected to review:
 
 - **SSM parameter convention** — `/developer-vms/observability/...` in the
-  `.example` file, and the form the `tenant-setup` skill generates. Change it in `tenant.auto.tfvars` to
+  `.example` file, and the form `SETUP.md` generates. Change it in `tenant.auto.tfvars` to
   whatever naming scheme you prefer; the Loki one must stay byte-identical to
   the policyfile attribute.
 - **VPC CIDR `10.8.0.0/16`** in `vms/config.tf` — change if you peer with

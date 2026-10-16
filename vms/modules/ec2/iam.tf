@@ -322,7 +322,7 @@ resource "aws_iam_policy" "identity_boundary" {
           # imagebuilder families each live in their own namespaces, which ec2:*
           # entries can never cover once a bundle declares those namespaces.
           # Any future launch API belongs here. (Fifth instance of the
-          # multi-call-path omission CLAUDE.md documents; enumerated 2026-08-25.)
+          # multi-call-path omission AGENTS.md documents; enumerated 2026-08-25.)
           # Every Create in this list carries its Update/Modify sibling, because
           # modifying an existing resource to point at a bootstrap-profile launch
           # template is the same escalation without iam:PassRole
@@ -361,7 +361,7 @@ resource "aws_iam_policy" "identity_boundary" {
           # Routes found in the first external review (docs/design/first-external-review.md §3).
           # EBS direct APIs read and write snapshot blocks without any ec2: call —
           # the snapshot denies above do not cover them. Sixth instance of the
-          # multi-call-path omission CLAUDE.md documents.
+          # multi-call-path omission AGENTS.md documents.
           "ebs:ListSnapshotBlocks",
           "ebs:ListChangedBlocks",
           "ebs:GetSnapshotBlock",

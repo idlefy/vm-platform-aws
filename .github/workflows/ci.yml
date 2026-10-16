@@ -5,8 +5,8 @@
 # pin tests build their own bare repository in a temp dir. No secrets are
 # configured and none are needed — the only network traffic is tool downloads.
 #
-# Two jobs, one per release stream (see CLAUDE.md "Release"), so a failure names
-# the stream it belongs to. The lists mirror CLAUDE.md "Verify your own edits";
+# Two jobs, one per release stream (see AGENTS.md "Release"), so a failure names
+# the stream it belongs to. The lists mirror AGENTS.md "Verify your own edits";
 # change them together.
 name: ci
 

@@ -358,7 +358,7 @@ variable "ami_name_pattern" {
   #     path — `sudo -n` alone logs nothing on classic sudo either, so a
   #     `-n`-only test falsely shows the two behaving the same.
   #   - `rust-coreutils` changes `stat` output formatting, which the credential
-  #     broker's uid/mode gate parses (see the trap in CLAUDE.md).
+  #     broker's uid/mode gate parses (see the trap in AGENTS.md).
   #   - CINC publishes no 26.04 build, so a resolute VM installs the 24.04
   #     omnibus package anyway — the config agent was already running on a
   #     compatibility workaround.

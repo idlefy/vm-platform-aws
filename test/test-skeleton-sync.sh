@@ -11,11 +11,12 @@
 #
 # The comparison is byte-identity, not "identical apart from comments". An
 # earlier draft allowed comments to differ, because three copies pointed at
-# the runbook upstream and at CLAUDE.md in a tenant — and it immediately missed a
-# fourth difference that sat in a `say` line rather than a comment. The pointers
-# were reworded to be true in both trees instead, which removes the exemption
-# and the class of bug it hides. If a copy ever needs a genuine difference it
-# has stopped being a copy: give it its own name and drop it from SHIPPED.
+# the runbook upstream and at the agent guide in a tenant — and it immediately
+# missed a fourth difference that sat in a `say` line rather than a comment. The
+# pointers were reworded to be true in both trees instead, which removes the
+# exemption and the class of bug it hides. If a copy ever needs a genuine
+# difference it has stopped being a copy: give it its own name and drop it from
+# SHIPPED.
 
 set -uo pipefail
 
@@ -57,6 +58,12 @@ done
 check "tenant-skeleton/SETUP.md exists" "$([ -f "$ROOT/tenant-skeleton/SETUP.md" ]; echo $?)"
 check "the skeleton's AGENTS.md points at SETUP.md" \
   "$(grep -q 'SETUP.md' "$ROOT/tenant-skeleton/AGENTS.md" 2>/dev/null; echo $?)"
+# Live files must not point at the old names. The design records and old
+# changelog entries describe the tree as it was, and keep their wording.
+stale=$(cd "$ROOT" && git grep -n -e 'CLAUDE\.md' -e '\.claude/skills' -e 'tenant-setup' -e 'get-started skill' -- \
+  ':!docs/design/' ':!docs/changelog.md' ':!test/test-skeleton-sync.sh' ':!test/test-get-started.sh' 2>/dev/null)
+check "no live file names CLAUDE.md, .claude/skills or the old skill names" "$([ -z "$stale" ]; echo $?)"
+[ -z "$stale" ] || printf '%s\n' "$stale" | sed 's/^/      /'
 
 echo "== the guard itself notices a drift =="
 # Without this, a comparison that always succeeded would make every check above

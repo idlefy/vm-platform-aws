@@ -46,7 +46,7 @@ stops it on the developer's schedule.
 ```bash
 git clone https://github.com/idlefy/vm-platform-aws.git
 cd vm-platform-aws
-claude          # the get-started skill creates your tenant repository
+claude          # or codex; GET-STARTED.md creates your tenant repository
 ```
 
 Without Claude Code: create a private repository, copy the contents of

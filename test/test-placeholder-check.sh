@@ -4,7 +4,7 @@
 #
 # The third state is the point. A two-state helper makes "no placeholders" and
 # "the check could not run" the same exit code, and the Makefile's warn branch
-# and the tenant-setup skill would then read a broken check as a pinned tree —
+# and the tenant's SETUP.md would then read a broken check as a pinned tree —
 # the original defect, relocated into the fix.
 
 set -uo pipefail

@@ -38,7 +38,7 @@ cd vm-platform-aws
 claude
 ```
 
-The `get-started` skill checks your tools, asks where the tenant repository should live, and creates it from `tenant-skeleton/`. The `tenant-setup` skill takes over inside the new repository — open it with `claude` there; it collects the values, resolves the pin, and stops before anything is applied.
+[`GET-STARTED.md`](GET-STARTED.md) checks your tools, asks where the tenant repository should live, and creates it from `tenant-skeleton/`. Inside the new repository its `SETUP.md` takes over — open it with Claude Code or Codex there; it collects the values, resolves the pin, and stops before anything is applied.
 
 Without Claude Code:
 
@@ -98,7 +98,7 @@ mkdocs build --strict
 
 `terraform test` needs Terraform ≥1.7 for `mock_provider` (everything else works on the declared `>= 1.5.0` floor), and `mkdocs build --strict` needs `mkdocs-material`. CI runs the same list on every pull request and on every push to `main` — the docs build in its own workflow.
 
-Working in this repository with an agent? Read [`CLAUDE.md`](CLAUDE.md) — it carries the traps, each of which has actually happened. How to open a pull request is in [`CONTRIBUTING.md`](CONTRIBUTING.md).
+Working in this repository with an agent? Read [`AGENTS.md`](AGENTS.md) — it carries the traps, each of which has actually happened. How to open a pull request is in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Contributing, security, license
 
