@@ -17,6 +17,9 @@ VM permissions boundary denies every such route to a developer's VM on
 purpose. Operators with image rights are therefore trusted like signers: grant
 them as carefully, and never share an image outside the account.
 
+Every command below runs from the tenant root; the ones that need another
+directory use a subshell, and every path is relative to the root.
+
 ## 1. Already on an image?
 
 ```bash
@@ -37,20 +40,23 @@ Check each one and report what is missing; do not work around it.
 
 ```bash
 packer version                    # 1.11 or newer
-cd cinc && make preflight         # the policy line must read: production ok
+( cd cinc && make preflight )     # no "production missing" or "production invalid" for the policy
 ```
 
-- A promoted production revision. The image is built only from
+- A promoted production revision: `make preflight` prints no `production
+  missing` and no `production invalid` warning or failure for the policy. The image is built only from
   `production.json`, because one image feeds both groups and a staging build
   would put unpromoted content on production VMs. `make ami` refuses when
   production is missing, does not verify, or names a different revision than
   the committed lock.
 - `vms/` initialised on `v2.1.0` or later (`terraform init`), so the pinned
   platform checkout holds `image/`.
-- `terraform apply` has been run once on `v2.1.0` or later by the operator.
-  The first-boot script the image bakes is read from Terraform **state**
-  (`terraform output bootstrap_user_data`); a state without that output is
-  refused with a message saying so.
+- The operator has applied `v2.1.0` or later at least once. The first-boot
+  script the image bakes is read from Terraform **state**
+  (`terraform output bootstrap_user_data`). If `make ami` says
+  `bootstrap_user_data` is missing, or the platform pin was bumped and not
+  applied, tell the operator that `terraform apply` is needed, and stop. You
+  never run apply yourself.
 - Every VM's `volume_size_gb` in `vms/instances.auto.tfvars` is at least the
   image's volume (default 20). A smaller VM is refused; pass `VOLUME=<n>` to
   match the smallest one.
@@ -69,7 +75,7 @@ cd cinc && make preflight         # the policy line must read: production ok
 ## 3. Build
 
 ```bash
-cd cinc && make ami
+( cd cinc && make ami )
 ```
 
 Optional knobs: `POLICY=<name>` (default `dev-vm`), `VOLUME=<gb>` (default
@@ -101,22 +107,34 @@ The scrub refuses to power off a VM whose last converge was not this revision,
 so a failed converge shows up as a timeout, never as a bad image.
 
 **Known limitation.** The bootstrap that `make ami` bakes comes from Terraform
-state, not from the working tree. After a platform pin bump, run
-`terraform apply` (the operator's step, after the plan is approved) before
-`make ami`; otherwise the image boots the previous pin's bootstrap while its
-`PlatformSha` tag names the new one.
+state, not from the working tree. After a platform pin bump the operator must
+apply the plan before `make ami`; otherwise the image boots the previous pin's
+bootstrap while its `PlatformSha` tag names the new one. If the pin changed
+and no apply has happened since, tell the operator and stop; do not build.
 
 ## 4. Check
 
+`make ami` enforces lock == production, so the lock is the reference. Read its
+revision and the cookbook version, then compare them with each region's image
+(`<POLICY>` is `dev-vm` unless `POLICY=` was given):
+
 ```bash
-aws ec2 describe-images --owners self --filters 'Name=name,Values=dev-vm-*' \
-  --query 'sort_by(Images,&CreationDate)[-1].Tags' --region <region>
+python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d["revision_id"], d["cookbook_locks"]["base"]["version"])' cinc/policyfiles/<POLICY>.lock.json
+( cd vms && echo 'jsonencode(keys(local.regions))' | terraform console )
 ```
 
-`RevisionId` must equal the production revision `make preflight` printed, and
-`CookbookVersion` must equal `cookbook_locks.base.version` in
-`cinc/policyfiles/dev-vm.lock.json`. Anything else → stop and report it; do not
-switch the fleet to that image. Check every region the build reported.
+The second command lists the regions; loop over every one of them, not just
+the build region:
+
+```bash
+aws ec2 describe-images --owners self --region <region> \
+  --filters 'Name=name,Values=dev-vm-<POLICY>-*' \
+  --query 'sort_by(Images,&CreationDate)[-1].Tags'
+```
+
+`RevisionId` must equal the lock's `revision_id`, and `CookbookVersion` the
+lock's cookbook version, in every region. Anything else: stop and report it;
+do not switch the fleet to that image.
 
 ## 5. Switch
 
@@ -130,7 +148,7 @@ ami_name_pattern = "dev-vm-dev-vm-*"   # dev-vm-<POLICY>-*
 Then:
 
 ```bash
-cd vms && terraform plan
+( cd vms && terraform plan )
 ```
 
 Expect **no replacement of running VMs**: the module ignores AMI changes on
@@ -151,7 +169,7 @@ this; remember step 3 of *Delete a VM* if anyone logged it into the tailnet.
 ## 7. Rebuild
 
 Rebuild after each promote of a new `base-` release, and at least monthly, so
-new VMs do not start on old packages. `cd cinc && make preflight` warns at 35
+new VMs do not start on old packages. `( cd cinc && make preflight )` warns at 35
 days. A rebuilt image changes nothing for running VMs; they converge from
 the signed envelope as always.
 
@@ -161,7 +179,7 @@ Keep the newest two images. List them per region, then deregister the older
 ones and delete their snapshots, in every region:
 
 ```bash
-aws ec2 describe-images --owners self --filters 'Name=name,Values=dev-vm-*' --region <region> \
+aws ec2 describe-images --owners self --filters 'Name=name,Values=dev-vm-<POLICY>-*' --region <region> \
   --query 'sort_by(Images,&CreationDate)[].[ImageId,Name,CreationDate,BlockDeviceMappings[0].Ebs.SnapshotId]' \
   --output text
 aws ec2 deregister-image --image-id <old-ami> --region <region>
