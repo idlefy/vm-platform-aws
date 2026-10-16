@@ -51,7 +51,8 @@ setup() {
   cat > "$STUB/aws" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$AWS_LOG"
-[ -n "${STUB_S3_DOWN:-}" ] && { echo "Could not connect to the endpoint URL" >&2; exit 255; }
+# The real CLI opens its error with a blank line (measured on a VM).
+[ -n "${STUB_S3_DOWN:-}" ] && { printf '\naws: [ERROR]: Could not connect to the endpoint URL\n' >&2; exit 255; }
 [ "$1 $2" = "s3api get-object" ] || { echo "stub: unsupported: $*" >&2; exit 2; }
 shift 2
 bucket= key= out=
@@ -409,6 +410,9 @@ for n in 1 2; do
   check "failure $n: converged the last good revision" "$(ok [ "$(converged_rev)" = "$BASE_REV" ])"
 done
 check "status says degraded" "$(ok grep -q ' delivery-failed ' "$WORK/state/status")"
+# One journal line per failure, reason included: the CLI's leading newline
+# used to leave "is unreachable:" empty and the reason on an unprefixed line.
+check "the reason is on the unreachable line" "$(ok grep -q 'is unreachable: aws: \[ERROR\]: Could not connect' "$WORK/err")"
 rc=$(STUB_S3_DOWN=1 fetch)
 check "failure 3: exit 11" "$(ok [ "$rc" = 11 ])"
 rc=$(fetch)

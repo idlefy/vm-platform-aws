@@ -179,7 +179,9 @@ s3_get_retrying() {  # s3_get_retrying KEY OUTFILE
   if grep -qE 'AccessDenied|NoSuchKey|\(403\)|\(404\)' "$W/aws.err"; then
     log "s3://$POLICY_BUCKET/$1 is missing or denied"
   else
-    log "s3://$POLICY_BUCKET/$1 is unreachable: $(head -c 300 "$W/aws.err")"
+    # One line: the CLI opens its error with a blank line, which otherwise
+    # leaves the reason on a journal line of its own, without our prefix.
+    log "s3://$POLICY_BUCKET/$1 is unreachable: $(tr -s '\n' ' ' < "$W/aws.err" | sed 's/^ //' | head -c 300)"
   fi
   return 1
 }
