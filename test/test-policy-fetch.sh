@@ -223,6 +223,21 @@ check "local mode" "$(ok grep -q '^ARGS.* -z' "$CINC_LOG")"
 check "node_name from policy.conf" "$(ok grep -qx 'CONF node_name "vm-one"' "$CINC_LOG")"
 check "policy_name from policy.conf" "$(ok grep -qx "CONF policy_name \"$POLICY\"" "$CINC_LOG")"
 check "policyfile mode" "$(ok grep -qx 'CONF use_policyfile true' "$CINC_LOG")"
+# The stub accepts any config, and so did this test while the script wrote
+# `chef_zero.listen false`, which the real client refuses as an unknown option:
+# every first boot failed closed (measured on a live VM, 2026-10-16). So the
+# config is also loaded by chef-config itself, strict as cinc-client is.
+check "no chef-zero socket" "$(ok grep -qx 'CONF listen false' "$CINC_LOG")"
+sed -n 's/^CONF //p' "$CINC_LOG" > "$WORK/client.rb"
+if command -v chef >/dev/null; then
+  chef exec ruby -e \
+    'require "chef-config/config"; ChefConfig::Config.from_file(ARGV[0]); exit(ChefConfig::Config[:listen] == false ? 0 : 1)' \
+    "$WORK/client.rb" >/dev/null 2>&1
+  check "chef-config accepts the client config" "$?"
+else
+  echo "  FAIL: chef-config accepts the client config — needs chef (Cinc Workstation) on PATH"
+  FAIL=$((FAIL + 1))
+fi
 check "every S3 call pins the bucket owner" "$(ok [ "$(grep -c -- "--expected-bucket-owner $OWNER" "$AWS_LOG")" = "$(wc -l < "$AWS_LOG")" ])"
 check "every S3 call names the bucket region" "$(ok [ "$(grep -c -- '--region eu-central-1' "$AWS_LOG")" = "$(wc -l < "$AWS_LOG")" ])"
 check "reads the production envelope" "$(ok grep -q -- "--key $PREFIX/$POLICY/production.json" "$AWS_LOG")"

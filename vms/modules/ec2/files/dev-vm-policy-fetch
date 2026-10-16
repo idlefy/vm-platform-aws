@@ -238,11 +238,13 @@ converge() {
   # node_name must equal the Name tag: alloy.rb and aws_access.rb pass
   # node.name on as the Loki `instance` label and as the per-VM SSM key, and
   # local mode would otherwise default it to the hostname.
-  # chef_zero.listen: local mode must not open a port any local uid could
-  # reach mid-converge. Measured, not assumed: see the design record.
+  # listen: local mode must not open a port any local uid could reach
+  # mid-converge. It is a top-level option, already false by default; it is
+  # spelled out so a changed default cannot open one. `chef_zero.listen` is
+  # not an option at all, and the client refuses the whole file over it.
   cat > "$W/client.rb" <<EOF
 local_mode true
-chef_zero.listen false
+listen false
 chef_repo_path "$tree"
 cache_path "$tree/.cache"
 use_policyfile true
