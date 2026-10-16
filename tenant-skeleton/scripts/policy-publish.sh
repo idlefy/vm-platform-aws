@@ -196,16 +196,24 @@ EOF
 }
 
 # The key you sign with must be one the lock installs, in the namespace you sign
-# for: a revision whose signers set drops its own signer would make every VM
-# reject the next push, and a VM would refuse a signature outside its namespace.
+# for, and not already expired: a revision whose signers set drops its own
+# signer would make every VM reject the next push, a VM would refuse a
+# signature outside its namespace, and ssh-keygen refuses a key past its
+# valid-before (UTC with a trailing Z, local time without one).
 require_key_for() {  # require_key_for GROUP
-  python3 -I - "$PUBKEY" "$LOCK_SIGNERS" "dev-vm-policy-$1" <<'EOF' \
-    || die "your key ($PUBKEY) is not in the signers this revision installs with the $1 namespace (base.policy.signers in the lock)"
-import re, sys
+  python3 -I - "$PUBKEY" "$LOCK_SIGNERS" "dev-vm-policy-$1" "$NOW" <<'EOF' \
+    || die "your key ($PUBKEY) is not in the signers this revision installs with the $1 namespace, or has expired there (base.policy.signers in the lock)"
+import calendar, re, sys, time
 key = " ".join(open(sys.argv[1]).read().split()[:2])
+now = int(sys.argv[4])
+def expiry(v):
+    d = v.rstrip("Z").ljust(14, "0")
+    t = (int(d[0:4]), int(d[4:6]), int(d[6:8]), int(d[8:10]), int(d[10:12]), int(d[12:14]), 0, 0, -1)
+    return calendar.timegm(t) if v.endswith("Z") else time.mktime(t)
 for line in open(sys.argv[2]):
-    m = re.fullmatch(r'(\S+) namespaces="([^"]+)"(?:,valid-before="[0-9Z]+")? (\S+ \S+)', line.strip())
-    if m and m.group(3) == key and sys.argv[3] in m.group(2).split(","):
+    m = re.fullmatch(r'(\S+) namespaces="([^"]+)"(?:,valid-before="([0-9]{8}(?:[0-9]{4}(?:[0-9]{2})?)?Z?)")? (\S+ \S+)', line.strip())
+    if m and m.group(4) == key and sys.argv[3] in m.group(2).split(",") \
+            and (m.group(3) is None or expiry(m.group(3)) > now):
         sys.exit(0)
 sys.exit(1)
 EOF

@@ -348,6 +348,15 @@ check "no production envelope" "$(ok [ ! -e "$S3/$BUCKET/$PREFIX/$POLICY/product
 write_lock "$REV" "$CI_LINE"
 rc=$(publish push)
 check "a lock that drops the pushing key is refused" "$(no [ "$rc" = 0 ])"
+# ssh-keygen honours valid-before: a lock that keeps the key already expired
+# drops it in all but name. NOW is 2025-10-15T00:00Z.
+write_lock "$(newrev)" "${OPS_LINE/namespaces=\"dev-vm-policy-staging,dev-vm-policy-production\"/namespaces=\"dev-vm-policy-staging,dev-vm-policy-production\",valid-before=\"20251014Z\"}" "$CI_LINE"
+rc=$(publish push)
+check "a lock that keeps the pushing key expired is refused" "$(no [ "$rc" = 0 ])"
+check "...naming the key" "$(ok grep -qi 'not in the signers' "$WORK/err")"
+write_lock "$(newrev)" "${OPS_LINE/namespaces=\"dev-vm-policy-staging,dev-vm-policy-production\"/namespaces=\"dev-vm-policy-staging,dev-vm-policy-production\",valid-before=\"20251016Z\"}" "$CI_LINE"
+rc=$(publish push)
+check "a lock whose key is still valid is accepted" "$(ok [ "$rc" = 0 ])"
 teardown
 
 echo "== serial =="

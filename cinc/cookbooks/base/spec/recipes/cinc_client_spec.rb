@@ -212,8 +212,32 @@ describe 'base::cinc_client' do
       end
     end
 
+    # Dates relative to now: a fixed date here would turn this test red the day
+    # it passed.
     context 'with an expiry' do
-      let(:signers) { [%(ops namespaces="dev-vm-policy-staging,dev-vm-policy-production",valid-before="20271231" #{OPS_KEY})] }
+      let(:signers) { [%(ops namespaces="dev-vm-policy-staging,dev-vm-policy-production",valid-before="#{(Time.now.utc + 86_400 * 365).strftime('%Y%m%d')}Z" #{OPS_KEY})] }
+
+      it 'accepts it' do
+        expect { chef_run }.to_not raise_error
+      end
+    end
+
+    # ssh-keygen honours valid-before, so a line that keeps the signing key but
+    # has already expired drops it in all but name, and every later envelope is
+    # rejected. Found by review, 2026-10-16.
+    context 'when the signing key is kept but has already expired' do
+      let(:signers) { [%(ops namespaces="dev-vm-policy-staging,dev-vm-policy-production",valid-before="#{(Time.now.utc - 3600).strftime('%Y%m%d%H%M')}Z" #{OPS_KEY})] }
+
+      it 'refuses to converge' do
+        expect { chef_run }.to raise_error(RuntimeError, /drop the key that signed/)
+      end
+    end
+
+    context 'when the signing key is expired on one line and valid on another' do
+      let(:signers) do
+        [%(ops namespaces="dev-vm-policy-staging,dev-vm-policy-production",valid-before="20200101" #{OPS_KEY}),
+         %(ops2 namespaces="dev-vm-policy-staging,dev-vm-policy-production" #{OPS_KEY})]
+      end
 
       it 'accepts it' do
         expect { chef_run }.to_not raise_error
