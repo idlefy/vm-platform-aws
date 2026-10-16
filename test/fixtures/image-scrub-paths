@@ -84,8 +84,8 @@ remove /tmp/*                                                # install leftovers
 remove /var/tmp/*                                            # systemd private dirs
 
 # --- what the image is for ---------------------------------------------------------
-keep   /var/lib/dev-vm/policy/archives/x.tgz                 # the revision's archive; every fetch re-verifies its hash
-keep   /var/lib/dev-vm/policy/revisions/x/Policyfile.lock.json # the extracted revision
+keep   /var/lib/dev-vm/policy/archives/<rev>.tgz              # the revision's archive; every fetch re-verifies its hash
+keep   /var/lib/dev-vm/policy/revisions/<rev>/Policyfile.lock.json # the extracted revision
 keep   /usr/share/dev-vm/home/.zshrc                         # base's staged home files
 keep   /etc/iptables/rules.v4                                # IMDS rules, restored before the bootstrap (decision 10)
 keep   /home/ubuntu/.config/traefik/traefik.yml              # static config; the converge rewrites it

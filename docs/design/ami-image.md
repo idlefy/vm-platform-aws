@@ -173,8 +173,9 @@ user data:
    matters: the bootstrap's converge starts `cinc-client.timer`, which is past
    its `OnBootSec` by then and queues a second converge behind the lock (see
    *Measured*, item 3). A unit the policy never installed is skipped
-   (`log_shipping = false` purges Alloy). If `last-serial` moved while that
-   converge ran, it fetched a newer envelope, and the scrub refuses.
+   (`log_shipping = false` purges Alloy). If that converge fetched any revision
+   but the expected one — it downloads and extracts before it converges — a
+   promote landed during the build, and the scrub refuses.
 4. Stops the services that write state: `user@1000.service` (Docker and
    Traefik are rootless user units), the root daemons, `syslog.socket` before
    `rsyslog`, and `systemd-update-utmp` and `systemd-random-seed`, which write

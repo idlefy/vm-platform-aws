@@ -36,7 +36,6 @@ fi
 
 # The status file is read before anything else: the fixture removes it below.
 read -r _ result got < "$STATE/status" 2>/dev/null || true
-serial=$(cat "$STATE/last-serial" 2>/dev/null || true)
 if [ "${result:-}" != ok ] || [ "${got:-}" != "$REV" ]; then
   log "refusing: status is '${result:-none} ${got:-}', expected 'ok $REV'; no image will be taken"
   exit 65
@@ -61,13 +60,19 @@ done
 for u in "${TIMERS[@]}" alloy; do
   if present "$u"; then systemctl disable --now "$u"; fi
 done
-# That converge verifies whatever production.json says when it starts. If a
-# promote landed during the build it fetched a newer envelope, and part of
-# that revision may now be on this disk under the old revision's tag.
-if [ "$(cat "$STATE/last-serial" 2>/dev/null || true)" != "$serial" ]; then
-  log "refusing: a converge queued behind the bootstrap fetched another envelope; no image will be taken"
-  exit 65
-fi
+# That converge verifies whatever production.json says when it starts, and
+# downloads and extracts that revision before converging it; status and
+# last-serial move only when it finishes. So another revision here means a
+# promote landed during the build, and part of it may be on this disk under
+# this revision's tag — whether or not its converge got to finish.
+for p in "$STATE"/archives/* "$STATE"/revisions/*; do
+  [ -e "$p" ] || continue
+  case "${p##*/}" in
+    "$REV" | "$REV.tgz") ;;
+    *) log "refusing: a converge queued behind the bootstrap fetched another revision (${p##*/}); no image will be taken"
+       exit 65 ;;
+  esac
+done
 # Stop what writes state before its state is removed. Rootless docker and
 # traefik live under user@1000.
 # One unit at a time: one that is missing or will not stop must not abort the

@@ -26,9 +26,11 @@ done
 # shellcheck disable=SC2016
 cat >> "$T/bin/systemctl" <<'SHIM'
 [ "$1" = is-enabled ] && exit "${SHIM_ENABLED:-1}"
-# SHIM_SERIAL_TO: the queued converge fetched a newer envelope before it was stopped.
-[ "$*" = "stop cinc-client.service" ] && [ -n "${SHIM_SERIAL_TO:-}" ] \
-  && echo "$SHIM_SERIAL_TO" > "$DEV_VM_IMAGE_ROOT/var/lib/dev-vm/policy/last-serial"
+# SHIM_FETCHED: the queued converge had fetched (and extracted) this other
+# revision when it was stopped — mid-converge, so status and last-serial are
+# still the bootstrap's.
+[ "$*" = "stop cinc-client.service" ] && [ -n "${SHIM_FETCHED:-}" ] \
+  && echo data > "$DEV_VM_IMAGE_ROOT/var/lib/dev-vm/policy/archives/$SHIM_FETCHED.tgz"
 for a in "${@:2}"; do
   for m in ${SHIM_MISSING:-}; do [ "$a" = "$m" ] && exit 5; done
 done
@@ -42,6 +44,7 @@ build_root() {  # build_root DIR STATUS_LINE
   rm -rf "$r"; mkdir -p "$r"
   while read -r verb path _; do
     case "$verb" in remove|empty|keep) ;; *) continue ;; esac
+    path=${path//<rev>/$REV}
     p="$r${path//\*/x}"            # a glob becomes one concrete match
     mkdir -p "$(dirname "$p")"; echo data > "$p"
   done < <(grep -v '^\s*#' "$LIST")
@@ -60,6 +63,7 @@ R="$T/root"; : > "$T/log"
 build_root "$R" "2026-10-16T00:00:00Z ok $REV"
 run_scrub "$R"; check "exits 0" "$?"
 while read -r verb path _; do
+  path=${path//<rev>/$REV}
   p="$R${path//\*/x}"
   case "$verb" in
     remove) check "removed: $path" "$(rc [ ! -e "$p" ])" ;;
@@ -106,11 +110,11 @@ check "alloy and the credential units absent → exit 0" "$(rc [ "$got" = 0 ])"
 check "  …and powers off" "$(tail -1 "$T/log" | grep -q '^poweroff'; echo $?)"
 check "  …and still disables cinc-client.timer" "$(grep -q 'systemctl disable .*cinc-client.timer' "$T/log"; echo $?)"
 
-echo "== a converge that fetched another envelope behind the bootstrap means no image =="
+echo "== a converge that fetched another revision behind the bootstrap means no image =="
 : > "$T/log"; build_root "$R" "2026-10-16T00:00:00Z ok $REV"
-SHIM_SERIAL_TO="1792160000 $(printf 'c%.0s' {1..64}) x" run_scrub "$R"; got=$?
-check "last-serial moved while the queued converge was stopped → exit 65" "$(rc [ "$got" = 65 ])"
-check "  …says why on the console" "$(grep -q 'another envelope' "$T/console"; echo $?)"
+SHIM_FETCHED=$(printf 'c%.0s' {1..64}) run_scrub "$R"; got=$?
+check "another revision's archive on disk after the stops → exit 65" "$(rc [ "$got" = 65 ])"
+check "  …says why on the console" "$(grep -q 'fetched another revision' "$T/console"; echo $?)"
 check "  …and does not power off" "$(rc [ -z "$(grep '^poweroff' "$T/log")" ])"
 
 echo "== any other failure says so on the console and powers nothing off =="
