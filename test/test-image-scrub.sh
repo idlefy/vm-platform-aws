@@ -10,13 +10,14 @@ PASS=0; FAIL=0
 rc() { "$@"; echo $?; }   # status of a command as a word, for check
 emptied() { [ -e "$1" ] && [ ! -s "$1" ]; }
 untouched() { [ ! -s "$T/log" ] && [ ! -e "$R/etc/dev-vm/image-revision" ]; }
+between() { [ "$1" -gt "$2" ] && [ "$1" -lt "$3" ]; }   # between N LOW HIGH
 check() { if [ "$2" = "0" ]; then PASS=$((PASS+1)); echo "  ok   $1"; else FAIL=$((FAIL+1)); echo "  FAIL $1"; fi; }
 
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 REV=$(printf 'a%.0s' {1..64})
 mkdir -p "$T/bin"
 # shellcheck disable=SC2016 # $* and $SHIM_LOG expand in the shim, not here
-for c in systemctl cloud-init fstrim poweroff; do
+for c in systemctl journalctl cloud-init fstrim poweroff; do
   printf '#!/usr/bin/env bash\necho "%s $*" >> "$SHIM_LOG"\n' "$c" > "$T/bin/$c"; chmod +x "$T/bin/$c"
 done
 
@@ -52,6 +53,12 @@ check "records the revision" "$(grep -qx "$REV" "$R/etc/dev-vm/image-revision"; 
 for u in cinc-client.timer aws-vm-credentials.timer alloy; do
   check "disables $u" "$(grep -q "systemctl disable .*$u" "$T/log"; echo $?)"
 done
+lineno() { grep -n "$1" "$T/log" | head -1 | cut -d: -f1; }
+dis=$(lineno 'systemctl disable'); cln=$(lineno 'cloud-init clean')
+for u in user@1000.service snap.amazon-ssm-agent.amazon-ssm-agent.service containerd fail2ban rsyslog falco-modern-bpf tailscaled; do
+  stp=$(lineno "systemctl stop $u"); [ -n "$stp" ] || stp=0
+  check "stops $u after disable and before cloud-init clean" "$(rc between "$stp" "${dis:-0}" "${cln:-0}")"
+done
 check "cleans cloud-init with the machine id" "$(grep -q 'cloud-init clean --logs --machine-id' "$T/log"; echo $?)"
 check "powers off last" "$(tail -1 "$T/log" | grep -q '^poweroff'; echo $?)"
 
@@ -63,6 +70,7 @@ for st in "2026-10-16T00:00:00Z converge-failed $REV" \
   run_scrub "$R"; rc=$?
   check "status '${st:-<empty>}' → exit 65" "$(rc [ "$rc" = 65 ])"
   check "  …and touches nothing" "$(rc untouched)"
+  check "  …and leaves a removable path alone" "$(rc [ -e "$R/etc/ssh/ssh_host_x" ])"
 done
 rm -f "$R/var/lib/dev-vm/policy/status"; : > "$T/log"
 run_scrub "$R"; got=$?

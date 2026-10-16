@@ -39,17 +39,36 @@ chmod 0644 "$R/etc/dev-vm/image-revision"
 systemctl disable --now cinc-client.timer aws-vm-credentials.timer alloy
 # Stop what writes state before its state is removed. Rootless docker and
 # traefik live under user@1000.
-systemctl stop user@1000.service falco-modern-bpf tailscaled
+# One unit at a time: one that is missing or will not stop must not abort the
+# image build.
+for u in user@1000.service falco-modern-bpf tailscaled \
+         snap.amazon-ssm-agent.amazon-ssm-agent.service containerd fail2ban rsyslog; do
+  systemctl stop "$u" || log "note: $u not stopped"
+done
+# Flush what journald still holds in memory or in the active file.
+journalctl --rotate || true
+journalctl --vacuum-time=1s || true
 
 # Entries are quoted so a glob is expanded below, under $R, not here.
 REMOVE=(
   "/etc/ssh/ssh_host_*" # host keys; regenerated on first boot
-  "/var/lib/amazon/ssm/Vault/Store/*" # SSM agent's EC2RegistrationKey for the build instance
+  "/var/lib/amazon/ssm/Vault" # SSM agent's EC2RegistrationKey and its manifest for the build instance; the agent re-registers
   "/var/lib/amazon/ssm/runtimeconfig/identity_config.json" # SSM agent's cached identity
   "/home/ubuntu/.local/share/docker/engine-id" # rootless dockerd's engine id
   "/home/ubuntu/.claude.json" # Claude Code's userID/machineID, created by its installer
   "/home/ubuntu/.claude/backups" # backups of that file
   "/var/lib/alloy/data/alloy_seed.json" # Alloy's instance seed
+  "/var/lib/systemd/random-seed" # an RNG seed clones must not share
+  "/var/cache/pollinate/seeded" # so pollinate seeds each VM on first boot
+  "/var/lib/dhcpcd/*" # the DHCP DUID and the build's lease
+  "/home/ubuntu/.local/share/docker/containerd/daemon/io.containerd.grpc.v1.introspection/uuid" # rootless containerd's instance uuid
+  "/home/ubuntu/.local/share/docker/buildkit/containerd-overlayfs/workerid" # rootless buildkit's worker id
+  "/var/lib/docker/engine-id" # dockerd's engine id
+  "/var/lib/docker/buildkit/containerd-overlayfs/workerid" # buildkit's worker id
+  "/var/lib/containerd/io.containerd.grpc.v1.introspection/uuid" # containerd's instance uuid
+  "/var/lib/fail2ban/fail2ban.sqlite3" # the build's ban database
+  "/home/ubuntu/.local/share/docker/containers/*" # traefik's --rm container metadata, carries the build hostname; ExecStartPre docker rm -f copes with its absence
+  "/var/lib/systemd/timers/stamp-*" # stale stamps would fire apt-daily-upgrade during the first converge
   "/home/ubuntu/.ssh/authorized_keys" # Packer's temporary key pair, written by cloud-init
   "/root/.ssh/authorized_keys" # the same key, behind cloud-init's "login as ubuntu" prefix
   "/home/ubuntu/.config/traefik/password" # base::traefik basic-auth password; regenerated when users is absent
@@ -74,6 +93,11 @@ REMOVE=(
   "/var/log/cinc-first-run.log" # the build's first converge
   "/var/log/*.gz" # rotated logs
   "/var/log/*.1" # rotated logs
+  "/var/log/amazon/ssm/*" # SSM agent logs of the build
+  "/var/log/sysstat/*" # the build's sysstat data
+  "/var/log/apt/*" # the build's apt history
+  "/var/log/unattended-upgrades/*" # the build's unattended-upgrades logs
+  "/var/log/landscape/*" # the build's landscape logs
   "/home/ubuntu/.npm/_logs" # npm debug logs from the installs
   "/home/ubuntu/.bash_history" # none expected; defensive
   "/root/.bash_history" # none expected; defensive
@@ -88,6 +112,9 @@ EMPTY=(
   "/var/log/wtmp" # login records
   "/var/log/btmp" # failed logins
   "/var/log/lastlog" # last logins
+  "/var/log/dpkg.log" # the build's package log
+  "/var/log/fail2ban.log" # the build's fail2ban log
+  "/var/log/dmesg" # the build's boot messages
 )
 
 shopt -s nullglob dotglob

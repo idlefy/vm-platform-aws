@@ -16,12 +16,23 @@
 # --- identity ------------------------------------------------------------------
 remove /etc/ssh/ssh_host_*                                   # host keys; regenerated on first boot
 empty  /etc/machine-id                                       # systemd/journald identity; /var/lib/dbus/machine-id links here
-remove /var/lib/amazon/ssm/Vault/Store/*                     # SSM agent's EC2RegistrationKey for the build instance
+remove /var/lib/amazon/ssm/Vault  # SSM agent's EC2RegistrationKey and its manifest for the build instance; the agent re-registers
 remove /var/lib/amazon/ssm/runtimeconfig/identity_config.json # SSM agent's cached identity
 remove /home/ubuntu/.local/share/docker/engine-id            # rootless dockerd's engine id
 remove /home/ubuntu/.claude.json                             # Claude Code's userID/machineID, created by its installer
 remove /home/ubuntu/.claude/backups                          # backups of that file
 remove /var/lib/alloy/data/alloy_seed.json                   # Alloy's instance seed
+remove /var/lib/systemd/random-seed  # an RNG seed clones must not share
+remove /var/cache/pollinate/seeded  # so pollinate seeds each VM on first boot
+remove /var/lib/dhcpcd/*  # the DHCP DUID and the build's lease
+remove /home/ubuntu/.local/share/docker/containerd/daemon/io.containerd.grpc.v1.introspection/uuid  # rootless containerd's instance uuid
+remove /home/ubuntu/.local/share/docker/buildkit/containerd-overlayfs/workerid  # rootless buildkit's worker id
+remove /var/lib/docker/engine-id  # dockerd's engine id
+remove /var/lib/docker/buildkit/containerd-overlayfs/workerid  # buildkit's worker id
+remove /var/lib/containerd/io.containerd.grpc.v1.introspection/uuid  # containerd's instance uuid
+remove /var/lib/fail2ban/fail2ban.sqlite3  # the build's ban database
+remove /home/ubuntu/.local/share/docker/containers/*  # traefik's --rm container metadata, carries the build hostname; ExecStartPre docker rm -f copes with its absence
+remove /var/lib/systemd/timers/stamp-*  # stale stamps would fire apt-daily-upgrade during the first converge
 
 # --- the build's keys and secrets (valid only on the build instance) -------------
 remove /home/ubuntu/.ssh/authorized_keys                     # Packer's temporary key pair, written by cloud-init
@@ -52,12 +63,20 @@ remove /var/log/user-data.log                                # the build's boots
 remove /var/log/cinc-first-run.log                           # the build's first converge
 remove /var/log/*.gz                                         # rotated logs
 remove /var/log/*.1                                          # rotated logs
+remove /var/log/amazon/ssm/*  # SSM agent logs of the build
+remove /var/log/sysstat/*  # the build's sysstat data
+remove /var/log/apt/*  # the build's apt history
+remove /var/log/unattended-upgrades/*  # the build's unattended-upgrades logs
+remove /var/log/landscape/*  # the build's landscape logs
 empty  /var/log/syslog                                       # the build's syslog
 empty  /var/log/auth.log                                     # the build's auth log
 empty  /var/log/kern.log                                     # the build's kernel log
 empty  /var/log/wtmp                                         # login records
 empty  /var/log/btmp                                         # failed logins
 empty  /var/log/lastlog                                      # last logins
+empty  /var/log/dpkg.log  # the build's package log
+empty  /var/log/fail2ban.log  # the build's fail2ban log
+empty  /var/log/dmesg  # the build's boot messages
 remove /home/ubuntu/.npm/_logs                               # npm debug logs from the installs
 remove /home/ubuntu/.bash_history                            # none expected; defensive
 remove /root/.bash_history                                   # none expected; defensive
