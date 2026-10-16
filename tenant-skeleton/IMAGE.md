@@ -31,8 +31,8 @@ grep -n 'ami_owners\|ami_name_pattern' vms/tenant.auto.tfvars
 first, then come back.
 
 `ami_owners = ["self"]` is set → the fleet is on an image already. The request
-is a rebuild: skip step 5 and start at step 2. Otherwise (the default
-`099720109477`, Canonical) → continue; step 5 is what switches the fleet over.
+is a rebuild: skip step 5 and start at step 2. Otherwise (the default,
+Canonical's account) → continue; step 5 is what switches the fleet over.
 
 ## 2. Prerequisites
 

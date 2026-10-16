@@ -311,9 +311,12 @@ fi
 # ---------------------------------------------------------------------------
 head_ "Fleet image"
 if [[ " $AMI_OWNERS " == *" self "* ]]; then
+  # The same query as the module's aws_ami.latest: every configured owner,
+  # the name pattern, HVM only.
+  read -ra OWNERS <<<"$AMI_OWNERS"
   for R in $REGIONS; do
-    if ! d=$(aws ec2 describe-images --region "$R" --owners self \
-               --filters "Name=name,Values=$AMI_PATTERN" \
+    if ! d=$(aws ec2 describe-images --region "$R" --owners "${OWNERS[@]}" \
+               --filters "Name=name,Values=$AMI_PATTERN" "Name=virtualization-type,Values=hvm" \
                --query 'sort_by(Images,&CreationDate)[-1].CreationDate' --output text 2>&1); then
       bad "$R — could not query images: $(tail -1 <<<"$d")"
     elif [ -z "$d" ] || [ "$d" = None ]; then

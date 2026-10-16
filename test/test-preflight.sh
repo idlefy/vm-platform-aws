@@ -334,8 +334,8 @@ new=$(date -u -d '3 days ago' +%Y-%m-%dT%H:%M:%S.000Z)
 rc=$(IMAGE_DATE=$old run_preflight)
 check "old image: exit 0 (a warning, not a failure)" "$([ "$rc" = 0 ]; echo $?)"
 check "old image: warns older than 35 days" "$(grep -q 'older than 35 days' "$T/out"; echo $?)"
-check "queried the owner self with the pattern" \
-  "$(grep -q 'ec2 describe-images --region eu-central-1 --owners self --filters Name=name,Values=dev-vm-dev-vm-\*' "$T/aws.log"; echo $?)"
+check "queried the owner self with the pattern and Terraform's HVM filter" \
+  "$(grep -q 'ec2 describe-images --region eu-central-1 --owners self --filters Name=name,Values=dev-vm-dev-vm-\* Name=virtualization-type,Values=hvm' "$T/aws.log"; echo $?)"
 rc=$(IMAGE_DATE=$new run_preflight)
 check "fresh image: exit 0" "$([ "$rc" = 0 ]; echo $?)"
 check "fresh image: no age warning" "$(! grep -q 'older than 35 days' "$T/out"; echo $?)"
@@ -351,6 +351,15 @@ check "query error: exit 1" "$([ "$rc" = 1 ]; echo $?)"
 check "query error: says the query failed, with AWS's reason" \
   "$(grep -q 'eu-central-1 — could not query images.*UnauthorizedOperation' "$T/out"; echo $?)"
 check "query error: does not claim there is no image" "$(! grep -q 'no image matches' "$T/out"; echo $?)"
+
+echo "== fleet image: self among other owners queries the whole owner set =="
+fixture true /t/loki 111122223333 "" '["self", "123456789012"]' 'dev-vm-dev-vm-*'
+agreeing
+: > "$T/aws.log"
+rc=$(IMAGE_DATE=$new run_preflight)
+check "exit 0" "$([ "$rc" = 0 ]; echo $?)"
+check "queried the same owners Terraform searches" \
+  "$(grep -q 'ec2 describe-images --region eu-central-1 --owners self 123456789012 ' "$T/aws.log"; echo $?)"
 
 echo "== fleet image: Canonical owner makes no describe-images call =="
 fixture true /t/loki 111122223333 "" '["099720109477"]' 'dev-vm-dev-vm-*'

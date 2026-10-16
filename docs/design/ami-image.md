@@ -101,8 +101,10 @@ piece of work (a CloudFormation product).
    Packer's `ami_regions`.
 10. **The bootstrap becomes idempotent where the image changes its starting
     state.**
-    - CINC is downloaded only when `dpkg-query -W -f='${Version}' cinc` is not
-      `${CINC_VERSION}-1`. The AWS CLI is already skipped when present.
+    - CINC is downloaded unless `dpkg-query -W -f='${db:Status-Abbrev}${Version}'
+      cinc` reports it fully installed (`ii`) at `${CINC_VERSION}-1`, so a
+      half-installed package is installed again. The AWS CLI is already
+      skipped when present.
     - The three IMDS `iptables -A` rules become `iptables -C … || iptables -A
       …`. `imds.rb` persists them to `/etc/iptables/rules.v4`, so a VM from the
       image boots with them already in place.
