@@ -83,6 +83,16 @@ while [ $# -gt 0 ]; do [ "$1" = "-c" ] && conf=$2; shift; done
 repo=$(sed -n 's/^chef_repo_path "\(.*\)"$/\1/p' "$conf")
 rev=$(python3 -I -c 'import json,sys;print(json.load(open(sys.argv[1]))["revision_id"])' "$repo/Policyfile.lock.json")
 printf 'REV %s\n' "$rev" >> "$CINC_LOG"
+# STUB_OVERLAP: start a second run of the script mid-converge, as the timer
+# did on a live first boot, and record whether this converge's tree survived.
+if [ -n "${STUB_OVERLAP:-}" ]; then
+  before=$(stat -c %i "$repo")
+  o=$STUB_OVERLAP
+  ( unset STUB_OVERLAP; "$STUB_FETCH" > "$o.out" 2>&1; echo $? > "$o.rc" ) &
+  sleep 2
+  after=$(stat -c %i "$repo" 2>/dev/null || echo gone)
+  [ "$before" = "$after" ] && echo 'TREE intact' >> "$CINC_LOG" || echo 'TREE replaced' >> "$CINC_LOG"
+fi
 exit "${STUB_CONVERGE_RC:-0}"
 EOF
   chmod +x "$STUB/aws" "$STUB/cinc-client"
@@ -423,6 +433,24 @@ publish ops dev-vm-policy-production serial=$((NOW + 60))
 rc=$(STUB_CONVERGE_RC=1 fetch)
 check "exit 13" "$(ok [ "$rc" = 13 ])"
 check "last-serial unchanged" "$(ok grep -q "$BASE_REV" "$WORK/state/last-serial")"
+teardown
+
+# Measured on a live first boot, 2026-10-16: the converge enables
+# cinc-client.timer, the timer fires two minutes later while that converge is
+# still running, and the unit's run re-extracted the revision tree under it.
+# The first converge then failed on a cookbook file chef-zero could no longer
+# serve, and, with cinc-client's own lock inside the replaced tree, the two
+# converged at once.
+echo "== a run that starts mid-converge waits for it =="
+setup
+REV=$(newrev); SHA=$(make_archive "$REV")
+publish ops dev-vm-policy-production
+rc=$(STUB_OVERLAP="$WORK/overlap" STUB_FETCH="$FETCH" fetch)
+check "first run exit 0" "$(ok [ "$rc" = 0 ])"
+check "the converging tree was left alone" "$(ok grep -qx 'TREE intact' "$CINC_LOG")"
+for _ in $(seq 1 50); do [ -s "$WORK/overlap.rc" ] && break; sleep 0.2; done
+check "the second run converged after it" "$(ok [ "$(cat "$WORK/overlap.rc" 2>/dev/null)" = 0 ])"
+check "two converges in all" "$(ok [ "$(converges)" = 2 ])"
 teardown
 
 echo "== bad configuration is an internal error =="

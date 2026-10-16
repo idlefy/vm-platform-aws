@@ -117,7 +117,7 @@ C[POLICY_MIN_SERIAL]=${C[POLICY_MIN_SERIAL]:-0}
 want POLICY_MIN_SERIAL    '^[0-9]{1,12}$'
 [ -r "$SIGNERS" ] || internal "cannot read $SIGNERS"
 
-for tool in aws ssh-keygen tar python3 sha256sum cinc-client; do
+for tool in aws ssh-keygen tar python3 sha256sum flock cinc-client; do
   command -v "$tool" >/dev/null || internal "$tool is not on PATH"
 done
 
@@ -131,6 +131,17 @@ NAMESPACE="dev-vm-policy-$POLICY_GROUP"
 
 mkdir -p "$STATE/archives" "$STATE/revisions" "$RUN" || internal "cannot create state directories"
 chmod 0700 "$STATE" "$STATE/archives" "$STATE/revisions" "$RUN" || internal "cannot set state modes"
+
+# One run at a time. The first converge enables cinc-client.timer, which
+# fires while that converge is still running, and the second run re-extracted
+# the revision tree under it: the first converge failed on a cookbook file
+# chef-zero could no longer serve, and since cinc-client keeps its own run
+# lock in that tree (cache_path), the two converged at once. Measured on a
+# live first boot, 2026-10-16. So a run waits here until the one before it
+# has finished, and the descriptor is closed for cinc-client, so nothing a
+# converge starts goes on holding it.
+exec 9> "$STATE/lock" || internal "cannot open $STATE/lock"
+flock 9 || internal "cannot lock $STATE/lock"
 rm -rf "$STATE"/revisions/.tmp.*
 W=$(mktemp -d "$RUN/fetch.XXXXXX") || internal "cannot create a work directory in $RUN"
 trap 'rm -rf "$W"' EXIT
@@ -254,7 +265,7 @@ policy_group "local"
 node_name "$NODE_NAME"
 EOF
   DEV_VM_POLICY_SIGNED_BY="$2" DEV_VM_POLICY_SIGNED_KEY="$3" DEV_VM_POLICY_GROUP="$POLICY_GROUP" \
-    cinc-client -z -c "$W/client.rb"
+    cinc-client -z -c "$W/client.rb" 9>&-
 }
 
 # fall_back CODE: converge the last good revision, then exit with CODE.
