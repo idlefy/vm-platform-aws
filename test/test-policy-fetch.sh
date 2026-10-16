@@ -430,6 +430,22 @@ check "exit 0 below the threshold" "$(ok [ "$rc" = 0 ])"
 check "says missing or denied" "$(ok grep -q 'missing or denied' "$WORK/err")"
 teardown
 
+# The envelope can stay readable while the archive it names is not. The
+# counter used to reset on every readable envelope, so it stuck at one and the
+# unit never failed. Found by a Codex review of PR #7.
+echo "== a missing archive counts to three as well =="
+setup; baseline
+REV=$(newrev); SHA=$(newrev)
+publish ops dev-vm-policy-production serial=$((NOW + 60))
+for n in 1 2; do
+  rc=$(fetch)
+  check "failure $n: exit 0" "$(ok [ "$rc" = 0 ])"
+done
+rc=$(fetch)
+check "failure 3: exit 11" "$(ok [ "$rc" = 11 ])"
+check "still on the last good revision" "$(ok [ "$(converged_rev)" = "$BASE_REV" ])"
+teardown
+
 echo "== a failed converge =="
 setup; baseline
 REV=$(newrev); SHA=$(make_archive "$REV")

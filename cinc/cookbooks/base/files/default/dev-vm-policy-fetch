@@ -308,7 +308,6 @@ delivery_failed() {
 # ---- 1. the envelope ---------------------------------------------------------
 
 s3_get_retrying "$KEY_BASE/$POLICY_GROUP.json" "$W/envelope.json" || delivery_failed
-rm -f "$STATE/delivery-failures"
 
 # One object holding both the manifest and its signature: S3 replaces a single
 # object atomically, two objects can be read either side of a write.
@@ -414,7 +413,9 @@ fi
 
 ensure_archive "$REV" "$SHA"
 case $? in
-  0) ;;
+  # Delivery is complete only once the archive is here: an envelope that
+  # stays readable while its archive does not must still count to THRESHOLD.
+  0) rm -f "$STATE/delivery-failures" ;;
   1) delivery_failed ;;
   *) status rejected "archive sha mismatch"; fall_back 12 ;;
 esac
