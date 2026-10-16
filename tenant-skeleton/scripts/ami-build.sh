@@ -43,8 +43,14 @@ if [ ! -f "$POLICYFILE" ] || [ ! -f "$LOCKFILE" ]; then
 fi
 
 # The scrub and the template come from the commit vms/ is pinned to. pin-check
-# is what says that commit is the one the lock and the sources agree on.
-make -C "$ROOT" pin-check || die "pin-check failed — the image is built only from a verified pin"
+# is what says that commit is the one the lock and the sources agree on, for
+# the policy being built. Its offline escape hatch is not honoured here: one
+# image feeds every VM, new and replaced, in both groups.
+if [ -n "${PIN_CHECK:-}" ]; then
+  die "PIN_CHECK=$PIN_CHECK is not accepted: the image feeds every VM, so the pin must verify — unset PIN_CHECK and retry"
+fi
+make -C "$ROOT" pin-check POLICYFILE="cinc/policyfiles/$POLICY.rb" LOCKFILE="cinc/policyfiles/$POLICY.lock.json" \
+  || die "pin-check failed — the image is built only from a verified pin"
 [ -f "$IMG/dev-vm.pkr.hcl" ] || die "the pinned platform checkout has no image/ — run 'cd vms && terraform init' on v2.1.0 or later"
 [ -f "$IMG/files/dev-vm-image-scrub" ] || die "the pinned platform checkout has no image/ — run 'cd vms && terraform init' on v2.1.0 or later"
 

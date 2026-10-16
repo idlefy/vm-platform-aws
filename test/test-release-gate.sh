@@ -47,7 +47,7 @@ STUB
 #!/bin/sh
 echo "skeleton-sync stub"
 STUB
-  for n in image-template image-scrub; do
+  for n in image-template image-scrub ami-build; do
     printf '#!/bin/sh\necho "%s stub"\n' "$n" > "$WORK/test/test-$n.sh"
     chmod +x "$WORK/test/test-$n.sh"
   done
@@ -180,6 +180,7 @@ check "ran the smoke gate" "$(echo "$OUT" | grep -q 'smoke stub' && echo 0 || ec
 check "ran the skeleton-sync guard" "$(echo "$OUT" | grep -q 'skeleton-sync stub' && echo 0 || echo 1)"
 check "ran the image-template gate" "$(echo "$OUT" | grep -q 'image-template stub' && echo 0 || echo 1)"
 check "ran the image-scrub gate" "$(echo "$OUT" | grep -q 'image-scrub stub' && echo 0 || echo 1)"
+check "ran the ami-build gate" "$(echo "$OUT" | grep -q 'ami-build stub' && echo 0 || echo 1)"
 check "ran the fetch-sync guard" "$(echo "$OUT" | grep -q 'fetch-sync stub' && echo 0 || echo 1)"
 check "no chefspec on the v path" "$(echo "$OUT" | grep -q 'chefspec stub' && echo 1 || echo 0)"
 check "tag exists on HEAD" "$([ "$(git -C "$WORK" rev-parse v9.0.0 2>/dev/null)" = "$(git -C "$WORK" rev-parse HEAD)" ] && echo 0 || echo 1)"
@@ -206,6 +207,7 @@ check "ran the chefspec gate" "$(echo "$OUT" | grep -q 'chefspec stub' && echo 0
 # Both streams ship a copy of dev-vm-policy-fetch, so both refuse a drifted one.
 check "no image-template gate on the cookbook path" "$(echo "$OUT" | grep -q 'image-template stub' && echo 1 || echo 0)"
 check "no image-scrub gate on the cookbook path" "$(echo "$OUT" | grep -q 'image-scrub stub' && echo 1 || echo 0)"
+check "no ami-build gate on the cookbook path" "$(echo "$OUT" | grep -q 'ami-build stub' && echo 1 || echo 0)"
 check "ran the fetch-sync guard on the cookbook path" "$(echo "$OUT" | grep -q 'fetch-sync stub' && echo 0 || echo 1)"
 teardown
 

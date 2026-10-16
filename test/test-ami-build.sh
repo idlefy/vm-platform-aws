@@ -76,6 +76,7 @@ esac
 SH
 cat > "$T/bin/packer" <<'SH'
 #!/usr/bin/env bash
+echo "packer $1" >> "$ORDER_LOG"
 echo "$*" >> "$PACKER_LOG"
 [ "$1" = build ] || exit 0
 for a in "$@"; do
@@ -87,6 +88,7 @@ exit "${PACKER_RC:-0}"
 SH
 cat > "$T/bin/make" <<'SH'
 #!/usr/bin/env bash
+echo "make $*" >> "$ORDER_LOG"
 echo "$*" >> "$MAKE_LOG"
 exit "${PIN_RC:-0}"
 SH
@@ -106,9 +108,9 @@ printf '%s' '{"eu-central-1":"#!/bin/bash\necho boot\n","us-east-1":"#!/bin/bash
 # run_ami — runs the script from cinc/, as `make ami` does; returns its status.
 run_ami() {
   local show="${SHOW_PRODUCTION:-production ok 7 $REV $SIG}"
-  : > "$T/packer.log"; : > "$T/make.log"; : > "$T/tfout.log"; rm -f "$T/ud.gz" "$T/show.env"*
+  : > "$T/packer.log"; : > "$T/make.log"; : > "$T/order.log"; : > "$T/tfout.log"; rm -f "$T/ud.gz" "$T/show.env"*
   ( cd "$T/cinc" && PATH="$T/bin:$PATH" TF_CONSOLE_IN="$T/console.in" TF_OUTPUT_LOG="$T/tfout.log" \
-      PACKER_LOG="$T/packer.log" UD_COPY="$T/ud.gz" MAKE_LOG="$T/make.log" SHOW_ENV="$T/show.env" \
+      PACKER_LOG="$T/packer.log" UD_COPY="$T/ud.gz" MAKE_LOG="$T/make.log" ORDER_LOG="$T/order.log" SHOW_ENV="$T/show.env" \
       BOOT_JSON="${BOOT_JSON:-$BOOT_DEFAULT}" SIGNER="$SIGNER" PIN_SHA="$PIN_SHA" REV="$REV" SIG="$SIG" \
       SHOW_PRODUCTION="$show" \
       "$T/scripts/ami-build.sh" > "$T/out" 2>&1 )
@@ -116,7 +118,9 @@ run_ami() {
 
 echo "== a promoted revision builds =="
 SHOW_PRODUCTION="production ok 7 $REV $SIG" run_ami; check "exits 0" "$?"
-check "pin-check ran first" "$(grep -q 'pin-check' "$T/make.log"; echo $?)"
+check "pin-check ran before packer" "$(head -1 "$T/order.log" | grep -q '^make .*pin-check' && grep -q '^packer build' "$T/order.log"; echo $?)"
+check "pin-check checked this policy's files" \
+  "$(grep -qF 'pin-check POLICYFILE=cinc/policyfiles/dev-vm.rb LOCKFILE=cinc/policyfiles/dev-vm.lock.json' "$T/make.log"; echo $?)"
 check "the console expression is one line" "$([ "$(wc -l < "$T/console.in")" = 1 ]; echo $?)"
 check "the volumes come from var.instances" "$(grep -q 'var.instances' "$T/console.in"; echo $?)"
 check "packer init ran on the pinned image" "$(grep -qx "init $IMG" "$T/packer.log"; echo $?)"
@@ -163,6 +167,8 @@ SHOW_PRODUCTION="production invalid" run_ami; check "invalid envelope → refuse
 check "...and packer never runs" "$([ ! -s "$T/packer.log" ]; echo $?)"
 SHOW_PRODUCTION="production ok 7 $OTHERREV $SIG" run_ami
 check "production is not the lock → refuses (the tags would lie)" "$([ $? -ne 0 ] && grep -q "${OTHERREV:0:12}" "$T/out"; echo $?)"
+PIN_CHECK=skip run_ami; check "PIN_CHECK=skip → refuses, packer never runs" "$([ $? -ne 0 ] && grep -q 'pin must verify' "$T/out" && [ ! -s "$T/packer.log" ]; echo $?)"
+check "...and pin-check is not even asked" "$([ ! -s "$T/make.log" ]; echo $?)"
 PIN_RC=1 run_ami;                             check "pin-check fails → refuses, packer never runs" "$([ $? -ne 0 ] && [ ! -s "$T/packer.log" ]; echo $?)"
 VOLUMES='{"eu-central-1/tiny":16,"us-east-1/b":50}' run_ami
 check "a VM smaller than the image → refuses, names it" "$([ $? -ne 0 ] && grep -q 'eu-central-1/tiny' "$T/out" && grep -q '16' "$T/out"; echo $?)"
@@ -171,6 +177,26 @@ VOLUMES='{"eu-central-1/tiny":16,"us-east-1/b":50}' VOLUME=16 run_ami; check "..
 VOLUMES='{}' run_ami; check "no VM yet → no volume check, builds" "$?"
 VOLUME=abc run_ami; check "a VOLUME that is not a number → refuses" "$([ $? -ne 0 ] && [ ! -s "$T/packer.log" ]; echo $?)"
 NO_OUTPUT=1 run_ami;                           check "no bootstrap_user_data in state → says apply v2.1.0 first" "$([ $? -ne 0 ] && grep -q 'terraform apply' "$T/out"; echo $?)"
+cp "$ROOT/image/files/dev-vm-image-scrub" "$T/scrub.orig"
+printf '#!/bin/bash\n%s\n' "$(head -c 15000 /dev/urandom | base64 -w0)" \
+  | python3 -I -c 'import json,sys; s=sys.stdin.read(); json.dump({"eu-central-1": s, "us-east-1": s}, sys.stdout)' > "$T/big.json"
+BOOT_JSON="$T/big.json" run_ami
+check "user data over 16 KB gzipped → refuses, says 16384, packer never runs" \
+  "$([ $? -ne 0 ] && grep -q '16384' "$T/out" && [ ! -s "$T/packer.log" ]; echo $?)"
+cp "$T/cinc/policyfiles/dev-vm.rb" "$T/cinc/policyfiles/dev-vm2.rb"
+cp "$T/cinc/policyfiles/dev-vm.lock.json" "$T/cinc/policyfiles/dev-vm2.lock.json"
+POLICY=dev-vm2 run_ami; check "POLICY=dev-vm2 builds" "$?"
+check "...and pin-check checked dev-vm2's files" \
+  "$(grep -qF 'pin-check POLICYFILE=cinc/policyfiles/dev-vm2.rb LOCKFILE=cinc/policyfiles/dev-vm2.lock.json' "$T/make.log"; echo $?)"
+check "...and names the AMI after it" "$(grep -q 'policy_name=dev-vm2 ' "$T/packer.log"; echo $?)"
+rm -f "$T/cinc/policyfiles/dev-vm2."*
+{ cat "$T/scrub.orig"; echo 'DEV_VM_IMAGE_SCRUB'; echo 'true'; } > "$IMG/files/dev-vm-image-scrub"
+run_ami; check "a scrub holding its own heredoc terminator → refuses, packer never runs" \
+  "$([ $? -ne 0 ] && grep -q 'terminator' "$T/out" && [ ! -s "$T/packer.log" ]; echo $?)"
+{ cat "$T/scrub.orig"; printf 'true'; } > "$IMG/files/dev-vm-image-scrub"
+run_ami; check "a scrub with no trailing newline → refuses, packer never runs" \
+  "$([ $? -ne 0 ] && grep -q 'newline' "$T/out" && [ ! -s "$T/packer.log" ]; echo $?)"
+cp "$T/scrub.orig" "$IMG/files/dev-vm-image-scrub"
 POLICY=nope run_ami; check "a policy with no policyfile → refuses" "$([ $? -ne 0 ] && grep -q 'nope' "$T/out"; echo $?)"
 POLICY='../x' run_ami; check "a malformed policy name → refuses" "$([ $? -ne 0 ] && [ ! -s "$T/packer.log" ]; echo $?)"
 PACKER_RC=1 run_ami; check "packer fails → fails" "$([ $? -ne 0 ]; echo $?)"
@@ -205,6 +231,10 @@ if [ -d "$MOD/.terraform" ] \
   echo "       real bootstrap + scrub, gzip -9: $size bytes (EC2 takes 16384)"
   check "the real user data fits EC2's 16 KB" "$([ "$size" -le 16384 ]; echo $?)"
   check "...and it is the module's script" "$(zcat "$T/ud.gz" | grep -q 'DEV_VM_POLICY_FETCH'; echo $?)"
+elif [ -n "${CI:-}" ]; then
+  # CI's terraform job runs `terraform init` in vms/modules/ec2 before the
+  # script tests; a SKIP there means the measurement silently stopped.
+  check "the real-size check runs in CI ($MOD initialised)" 1
 else
   echo "  SKIP the real-size check: $MOD is not initialised (terraform init there first)"
 fi
