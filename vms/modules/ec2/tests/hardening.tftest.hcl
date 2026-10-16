@@ -136,6 +136,18 @@ run "boundary_denies_every_launch_path" {
   }
 }
 
+run "bootstrap_user_data_output_is_the_rendered_script" {
+  command = plan
+  assert {
+    condition     = output.bootstrap_user_data == local.user_data_script
+    error_message = "bootstrap_user_data must be exactly what instances boot with; make ami appends to it."
+  }
+  assert {
+    condition     = startswith(output.bootstrap_user_data, "#!/bin/bash\n")
+    error_message = "bootstrap_user_data must be the plain script, not the gzipped form."
+  }
+}
+
 run "boundary_denies_asset_routes_found_in_review" {
   command = plan
 
