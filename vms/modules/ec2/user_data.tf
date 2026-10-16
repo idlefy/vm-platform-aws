@@ -47,14 +47,19 @@ rm -f /etc/sudoers.d/90-cloud-init-users
 #    them and do not duplicate. Appends, in order, onto the boot-empty OUTPUT
 #    chain — positional -I would fail when the EIC rule is skipped. This
 #    script's own IMDS calls run as root, which stays allowed.
-iptables -A OUTPUT -d 169.254.169.254 -m owner --uid-owner 0 -j ACCEPT
+#
+#    Each append is guarded by -C: a prebuilt image carries base::imds's
+#    rules.v4, netfilter-persistent restores it before this runs, and a bare -A
+#    would stack a second copy of every rule on every boot from that image.
+imds_rule() { iptables -C OUTPUT "$@" 2>/dev/null || iptables -A OUTPUT "$@"; }
+imds_rule -d 169.254.169.254 -m owner --uid-owner 0 -j ACCEPT
 eic_uid=$(id -u ec2-instance-connect 2>/dev/null || true)
 if [ -n "$eic_uid" ]; then
-  iptables -A OUTPUT -d 169.254.169.254 -m owner --uid-owner "$eic_uid" -j ACCEPT
+  imds_rule -d 169.254.169.254 -m owner --uid-owner "$eic_uid" -j ACCEPT
 else
   echo "WARNING: no ec2-instance-connect user in this image; EIC admin SSH waits for the first converge"
 fi
-iptables -A OUTPUT -d 169.254.169.254 -j DROP
+imds_rule -d 169.254.169.254 -j DROP
 
 # 3. Everything this script downloads goes here, never /tmp. The developer can
 #    SSH in during first boot, and a predictable /tmp path is one they can
@@ -127,10 +132,17 @@ fi
 # SHA256 comes from the .deb.metadata.json sidecar next to the package.
 CINC_VERSION="19.3.14"
 CINC_SHA256="c710cc8bf953fa56b7a4b0b726d9fcb9cb5bad2dc8caec4eaa439c4626f9aebf"
-curl -fsSL "https://downloads.cinc.sh/files/stable/cinc/$${CINC_VERSION}/ubuntu/24.04/cinc_$${CINC_VERSION}-1_amd64.deb" \
-  -o "$STAGE/cinc.deb"
-echo "$${CINC_SHA256}  $STAGE/cinc.deb" | sha256sum -c -
-dpkg -i "$STAGE/cinc.deb"
+# Skipped when the pinned version is already installed: an image built from this
+# script has it baked in, and a VM launched from that image should not need the
+# download (or the network path to it) to boot.
+if [ "$(dpkg-query -W -f='$${Version}' cinc 2>/dev/null || true)" = "$${CINC_VERSION}-1" ]; then
+  echo "cinc $${CINC_VERSION} already installed (prebuilt image)"
+else
+  curl -fsSL "https://downloads.cinc.sh/files/stable/cinc/$${CINC_VERSION}/ubuntu/24.04/cinc_$${CINC_VERSION}-1_amd64.deb" \
+    -o "$STAGE/cinc.deb"
+  echo "$${CINC_SHA256}  $STAGE/cinc.deb" | sha256sum -c -
+  dpkg -i "$STAGE/cinc.deb"
+fi
 
 # ---- policy delivery ----------------------------------------------------------
 # No CINC server: dev-vm-policy-fetch reads a signed envelope from the tenant's

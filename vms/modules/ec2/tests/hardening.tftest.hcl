@@ -148,6 +148,18 @@ run "bootstrap_user_data_output_is_the_rendered_script" {
   }
 }
 
+run "bootstrap_is_idempotent_on_a_prebuilt_image" {
+  command = plan
+  assert {
+    condition     = strcontains(local.user_data_script, "dpkg-query -W -f='$${Version}' cinc")
+    error_message = "the CINC download must be skipped when the pinned version is installed (prebuilt image)."
+  }
+  assert {
+    condition     = strcontains(local.user_data_script, "iptables -C OUTPUT \"$@\" 2>/dev/null || iptables -A OUTPUT \"$@\"") && !strcontains(local.user_data_script, "iptables -A OUTPUT -d 169.254.169.254")
+    error_message = "every IMDS iptables -A needs an iptables -C guard: a prebuilt image restores rules.v4 before the bootstrap runs."
+  }
+}
+
 run "boundary_denies_asset_routes_found_in_review" {
   command = plan
 
