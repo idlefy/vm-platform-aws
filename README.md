@@ -35,12 +35,12 @@ This repository deploys nothing. It publishes a CINC cookbook (`cinc/cookbooks/b
 ```bash
 git clone https://github.com/idlefy/vm-platform-aws.git
 cd vm-platform-aws
-claude
+claude          # or codex; GET-STARTED.md creates your tenant repository
 ```
 
 [`GET-STARTED.md`](GET-STARTED.md) checks your tools, asks where the tenant repository should live, and creates it from `tenant-skeleton/`. Inside the new repository its `SETUP.md` takes over — open it with Claude Code or Codex there; it collects the values, resolves the pin, and stops before anything is applied.
 
-Without Claude Code:
+Manual setup, without Claude Code or Codex:
 
 1. Create a private repository and copy the **contents** of `tenant-skeleton/` into its root — the `Makefile` has to land at the top level (`cp -r vm-platform-aws/tenant-skeleton/. <your-tenant>/`).
 2. `make prepare PLATFORM_TAG=vX.Y.Z` — materialises the config files and pins the modules to that release. The current tag is the one on the release badge above, or `git tag --list 'v*' --sort=-v:refname | head -1`.
