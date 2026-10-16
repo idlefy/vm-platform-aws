@@ -362,18 +362,17 @@ resource "aws_iam_policy" "identity_boundary" {
           # under its original creation date.
           "ec2:RegisterImage",
           "ec2:CopyImage",
-          "ec2:ImportImage",
-          "ec2:CreateRestoreImageTask",
-          "ec2:CreateStoreImageTask",
-          "ec2:ExportImage",
           "ec2:DeregisterImage",
-          "ec2:EnableImage",
-          "ec2:ImportSnapshot",
+          "ec2:ExportImage",
           "ec2:DeleteSnapshot",
-          "ec2:DisableImage",
-          "ec2:EnableImageDeprecation",
-          "ec2:RestoreImageFromRecycleBin",
-          "ec2:RestoreSnapshotFromRecycleBin",
+          # Families (see below): a VM imports nothing; the restore and store
+          # image tasks; enable/disable of an image, its deprecation, block
+          # public access and deregistration protection; and the recycle bin.
+          "ec2:Import*",
+          "ec2:Create*ImageTask",
+          "ec2:Enable*Image*",
+          "ec2:Disable*Image*",
+          "ec2:Restore*FromRecycleBin",
           "ec2:CreateSnapshot",
           "ec2:CreateSnapshots",
           "ec2:CopySnapshot",

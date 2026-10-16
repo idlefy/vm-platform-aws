@@ -214,16 +214,37 @@ run "boundary_denies_asset_routes_found_in_review" {
     error_message = "The identity boundary's Deny statement must cover the EBS direct-read, fleet-network, termination and console-output routes (first external review, H1/H2)."
   }
 
+  # Glob-matched, like the sibling-route test below: the image routes are
+  # partly wildcard families, so contains() on the literal list would miss them.
   assert {
-    condition = alltrue([for a in [
-      "ec2:RegisterImage", "ec2:CopyImage", "ec2:CreateImage", "ec2:ImportImage",
-      "ec2:CreateRestoreImageTask", "ec2:CreateStoreImageTask", "ec2:ExportImage",
-      "ec2:ModifyImageAttribute", "ec2:DeregisterImage", "ec2:EnableImage",
-      "ec2:ImportSnapshot", "ec2:CopySnapshot", "ec2:ModifySnapshotAttribute", "ec2:DeleteSnapshot",
-      "ec2:DisableImage", "ec2:EnableImageDeprecation", "ec2:RestoreImageFromRecycleBin", "ec2:RestoreSnapshotFromRecycleBin",
-      ] : contains(flatten([for st in jsondecode(aws_iam_policy.identity_boundary["vm"].policy).Statement : st.Action if st.Effect == "Deny"]), a)
+    condition = alltrue([
+      for action in [
+        "ec2:RegisterImage", "ec2:CopyImage", "ec2:CreateImage", "ec2:ImportImage",
+        "ec2:CreateRestoreImageTask", "ec2:CreateStoreImageTask", "ec2:ExportImage",
+        "ec2:ModifyImageAttribute", "ec2:DeregisterImage", "ec2:EnableImage",
+        "ec2:ImportSnapshot", "ec2:CopySnapshot", "ec2:ModifySnapshotAttribute", "ec2:DeleteSnapshot",
+        "ec2:DisableImage", "ec2:EnableImageDeprecation", "ec2:DisableImageDeprecation",
+        "ec2:DisableImageBlockPublicAccess", "ec2:DisableImageDeregistrationProtection",
+        "ec2:RestoreImageFromRecycleBin", "ec2:RestoreSnapshotFromRecycleBin",
+        ] : anytrue([
+          for st in jsondecode(aws_iam_policy.identity_boundary["vm"].policy).Statement :
+          st.Effect == "Deny" && anytrue([
+            for p in flatten([st.Action]) : can(regex("^${replace(p, "*", ".*")}$", action))
+          ])
+      ])
     ])
-    error_message = "With ami_owners = [\"self\"], anyone who can register or copy an image under the name pattern chooses what the next VM boots, and anyone who can store, export or share one reads it. Every image route must be denied (AGENTS.md trap 1)."
+    error_message = "With ami_owners = [\"self\"], anyone who can register or copy an image under the name pattern chooses what the next VM boots, anyone who can store, export or share one reads it, and anyone who can disable, deprecate or hide one rolls the fleet back. Every image route must be denied (AGENTS.md trap 1)."
+  }
+
+  # Resolving the newest image is a read the data source needs.
+  assert {
+    condition = !anytrue([
+      for st in jsondecode(aws_iam_policy.identity_boundary["vm"].policy).Statement :
+      st.Effect == "Deny" && anytrue([
+        for p in flatten([st.Action]) : can(regex("^${replace(p, "*", ".*")}$", "ec2:DescribeImages"))
+      ])
+    ])
+    error_message = "A deny wildcard matches ec2:DescribeImages, which the AMI lookup needs."
   }
 
   assert {
@@ -428,10 +449,9 @@ run "kms_bucket_adds_decrypt_and_key_denies" {
   # IAM refuses a managed policy over 6,144 characters (whitespace excluded;
   # jsonencode emits none). The boundary is the longest document this module
   # writes and grows with every deny entry; this run has the most statements,
-  # and the 1,300 left over is for the Allow list a VM's bundles declare
-  # (was 1,500 until the image routes took the boundary to 4,652).
+  # and the 1,500 left over is for the Allow list a VM's bundles declare.
   assert {
-    condition     = length(aws_iam_policy.identity_boundary["vm"].policy) < 6144 - 1300
+    condition     = length(aws_iam_policy.identity_boundary["vm"].policy) < 6144 - 1500
     error_message = "The identity boundary is too close to IAM's 6,144-character managed-policy limit: ${length(aws_iam_policy.identity_boundary["vm"].policy)} characters."
   }
 
