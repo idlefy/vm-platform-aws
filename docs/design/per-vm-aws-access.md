@@ -1,6 +1,8 @@
 # Per-VM scoped AWS access — phase A: per-VM identity and same-account grants
 
 > Design record, written during development; identifiers anonymised. Numbers are as measured.
+>
+> Historical: this record predates [serverless policy delivery](serverless-policy-delivery.md) (2.0.0). Where it mentions a CINC server, a validator key, `knife` or `infra/`, those are gone; the rest stands.
 
 **Status:** Design — pending user review
 **Date:** 2026-07-28

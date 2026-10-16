@@ -30,9 +30,11 @@ variables {
 
   security_group_rules    = {}
   route53_zone_id         = "Z00000000000000000TEST"
-  cinc_ssm_parameter_name = "/test/cinc-validator"
   loki_ssm_parameter_name = "/test/loki-token"
-  cinc_server_url         = "https://cinc.test.invalid/organizations/test"
+  policy_bucket           = "tenant-policies"
+  policy_bucket_owner     = "123456789012"
+  policy_bucket_region    = "eu-central-1"
+  policy_signers          = ["ops namespaces=\"dev-vm-policy-staging,dev-vm-policy-production\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMkEu+CUWYGvccB0PoBw6SX1d6kJOSy2vALB7cAntO+E"]
   ssh_key_pairs           = { "dev" = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITEST dev@test" }
 
   instances      = {}
@@ -155,16 +157,10 @@ run "unknown_policy_group_is_rejected" {
 # A bare "/" passes startswith() and fails the same way, which is why the check
 # is a regex.
 
-run "cinc_parameter_without_leading_slash_is_rejected" {
+run "loki_parameter_without_leading_slash_is_rejected" {
   command = plan
-  variables { cinc_ssm_parameter_name = "developer-vms/cinc/validator" }
-  expect_failures = [var.cinc_ssm_parameter_name]
-}
-
-run "cinc_parameter_of_bare_slash_is_rejected" {
-  command = plan
-  variables { cinc_ssm_parameter_name = "/" }
-  expect_failures = [var.cinc_ssm_parameter_name]
+  variables { loki_ssm_parameter_name = "developer-vms/observability/loki-token" }
+  expect_failures = [var.loki_ssm_parameter_name]
 }
 
 run "loki_parameter_of_bare_slash_is_rejected" {
@@ -176,9 +172,182 @@ run "loki_parameter_of_bare_slash_is_rejected" {
 run "minimal_valid_parameter_names_plan" {
   command = plan
   variables {
-    cinc_ssm_parameter_name = "/c"
     loki_ssm_parameter_name = "/l"
   }
+}
+
+# --- infrastructure namespaces need an explicit flag --------------------------
+# In these namespaces the boundary's deny list is the only control, and four
+# security-review passes kept finding routes it did not cover. A bundle that
+# declares one is a reviewed decision, made visible by infrastructure_access.
+
+run "s3_without_the_flag_is_rejected" {
+  command = plan
+  variables {
+    access_bundles = { "b" = { description = "media", allowed_actions = ["s3:*"] } }
+  }
+  expect_failures = [var.access_bundles]
+}
+
+run "a_single_ec2_action_without_the_flag_is_rejected" {
+  command = plan
+  variables {
+    access_bundles = { "b" = { description = "ip", allowed_actions = ["logs:*", "ec2:AssociateAddress"] } }
+  }
+  expect_failures = [var.access_bundles]
+}
+
+run "route53_family_without_the_flag_is_rejected" {
+  command = plan
+  variables {
+    access_bundles = { "b" = { description = "dns", allowed_actions = ["route53profiles:*"] } }
+  }
+  expect_failures = [var.access_bundles]
+}
+
+# IAM matches service prefixes case-insensitively and expands wildcards in
+# them, so "EC2:*" or "e*2:*" means ec2 to AWS. The two namespace lists compare
+# exact strings and stay complete only because the shape validation refuses
+# both spellings. These pin that.
+run "an_uppercase_prefix_cannot_dodge_the_flag" {
+  command = plan
+  variables {
+    access_bundles = { "b" = { description = "ip", allowed_actions = ["EC2:AssociateAddress"] } }
+  }
+  expect_failures = [var.access_bundles]
+}
+
+run "a_wildcard_prefix_cannot_dodge_the_flag" {
+  command = plan
+  variables {
+    access_bundles = { "b" = { description = "media", allowed_actions = ["s*:GetObject"] } }
+  }
+  expect_failures = [var.access_bundles]
+}
+
+run "an_uppercase_prefix_cannot_dodge_the_iam_refusal" {
+  command = plan
+  variables {
+    access_bundles = { "b" = { description = "roles", allowed_actions = ["IAM:PassRole"] } }
+  }
+  expect_failures = [var.access_bundles]
+}
+
+run "s3_with_the_flag_plans" {
+  command = plan
+  variables {
+    access_bundles = { "b" = { description = "media", allowed_actions = ["s3:*"], infrastructure_access = true } }
+  }
+}
+
+run "an_application_namespace_needs_no_flag" {
+  command = plan
+  variables {
+    access_bundles = { "b" = { description = "logs", allowed_actions = ["logs:*", "sqs:SendMessage"] } }
+  }
+}
+
+# --- policy delivery ----------------------------------------------------------
+# Each of these lands in an S3 key, an IAM resource ARN, policy.conf or the
+# signers file a VM trusts. A wrong shape is refused here rather than at first
+# boot, where it surfaces as a VM that never converges.
+
+run "policy_bucket_with_uppercase_is_rejected" {
+  command = plan
+  variables { policy_bucket = "Tenant-Policies" }
+  expect_failures = [var.policy_bucket]
+}
+
+run "policy_bucket_owner_must_be_an_account_id" {
+  command = plan
+  variables { policy_bucket_owner = "12345" }
+  expect_failures = [var.policy_bucket_owner]
+}
+
+run "policy_bucket_region_must_be_a_region" {
+  command = plan
+  variables { policy_bucket_region = "europe" }
+  expect_failures = [var.policy_bucket_region]
+}
+
+run "policy_prefix_with_a_trailing_slash_is_rejected" {
+  command = plan
+  variables { policy_prefix = "dev-vm-policies/" }
+  expect_failures = [var.policy_prefix]
+}
+
+run "policy_prefix_with_a_wildcard_is_rejected" {
+  command = plan
+  variables { policy_prefix = "dev-vm-*" }
+  expect_failures = [var.policy_prefix]
+}
+
+run "nested_policy_prefix_plans" {
+  command = plan
+  variables { policy_prefix = "fleet/dev-vm-policies" }
+}
+
+run "kms_alias_is_rejected" {
+  command = plan
+  variables { policy_kms_key_arn = "arn:aws:kms:eu-central-1:123456789012:alias/policy" }
+  expect_failures = [var.policy_kms_key_arn]
+}
+
+run "empty_signers_are_rejected" {
+  command = plan
+  variables { policy_signers = [] }
+  expect_failures = [var.policy_signers]
+}
+
+run "signer_without_namespaces_is_rejected" {
+  command = plan
+  variables { policy_signers = ["ops ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMkEu+CUWYGvccB0PoBw6SX1d6kJOSy2vALB7cAntO+E"] }
+  expect_failures = [var.policy_signers]
+}
+
+run "cert_authority_signer_is_rejected" {
+  command = plan
+  variables { policy_signers = ["ops cert-authority,namespaces=\"dev-vm-policy-production\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMkEu+CUWYGvccB0PoBw6SX1d6kJOSy2vALB7cAntO+E"] }
+  expect_failures = [var.policy_signers]
+}
+
+run "signer_with_a_tab_is_rejected" {
+  command = plan
+  variables { policy_signers = ["ops namespaces=\"dev-vm-policy-production\"\tssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMkEu+CUWYGvccB0PoBw6SX1d6kJOSy2vALB7cAntO+E"] }
+  expect_failures = [var.policy_signers]
+}
+
+run "signer_with_a_newline_is_rejected" {
+  command = plan
+  variables { policy_signers = ["ops namespaces=\"dev-vm-policy-production\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMkEu+CUWYGvccB0PoBw6SX1d6kJOSy2vALB7cAntO+E\nPOLICY_SIGNERS"] }
+  expect_failures = [var.policy_signers]
+}
+
+run "signer_with_an_expiry_plans" {
+  command = plan
+  variables { policy_signers = ["ops namespaces=\"dev-vm-policy-production\",valid-before=\"20271231\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMkEu+CUWYGvccB0PoBw6SX1d6kJOSy2vALB7cAntO+E"] }
+}
+
+run "negative_min_serial_is_rejected" {
+  command = plan
+  variables { policy_min_serial = -1 }
+  expect_failures = [var.policy_min_serial]
+}
+
+run "policy_name_with_a_wildcard_is_rejected" {
+  command = plan
+  variables {
+    instances = {
+      "vm" = {
+        instance_type  = "t3.micro"
+        volume_size_gb = 20
+        fqdn           = "vm.test.invalid"
+        key_name       = "dev"
+        policy_name    = "dev-*"
+      }
+    }
+  }
+  expect_failures = [var.instances]
 }
 
 # --- log_shipping and loki_ssm_parameter_name are one decision ---------------

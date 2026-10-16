@@ -1,6 +1,8 @@
 # Optional log shipping — design
 
 > Design record, written during development; identifiers anonymised. Numbers are as measured.
+>
+> Historical: this record predates [serverless policy delivery](serverless-policy-delivery.md) (2.0.0). Where it mentions a CINC server, a validator key, `knife` or `infra/`, those are gone; the rest stands.
 
 **Date:** 2026-09-05
 **Status:** approved in conversation (scope, switch shape, off-path behaviour); technical decisions delegated to the implementer; revised after an adversarial architect review (4 blocking, 9 important, 5 minor findings — all incorporated below). Not yet implemented.

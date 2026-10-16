@@ -28,9 +28,9 @@ above_code=$(awk '
   infence           { print }
 ' "$SKILL" 2>/dev/null)
 # No file ⇒ no evidence of safety: make every command check fail rather than pass vacuously.
-[ -f "$SKILL" ] || above_code='terraform apply make push make promote make prepare ansible-playbook'
+[ -f "$SKILL" ] || above_code='terraform apply make push make promote make prepare'
 
-for cmd in 'terraform apply' 'make push' 'make promote' 'make prepare' 'ansible-playbook'; do
+for cmd in 'terraform apply' 'make push' 'make promote' 'make prepare'; do
   check "no executable '$cmd' above Hard limits" "$(printf '%s\n' "$above_code" | grep -q -- "$cmd"; [ $? -ne 0 ]; echo $?)"
 done
 

@@ -17,9 +17,46 @@ variable "route53_zone_id" {
   type        = string
 }
 
-variable "cinc_ssm_parameter_name" {
-  description = "SSM parameter holding the CINC validation key (SecureString). Created once per region."
+# ---- policy delivery: a bucket you own, signed envelopes, no CINC server ----
+# See the ec2 module's variables of the same names for the shapes they must
+# have; the module refuses anything else at plan time.
+
+variable "policy_bucket" {
+  description = "Your S3 bucket for policy archives and signed envelopes. The platform never creates it."
   type        = string
+}
+
+variable "policy_bucket_owner" {
+  description = "12-digit ID of the account that owns policy_bucket."
+  type        = string
+}
+
+variable "policy_bucket_region" {
+  description = "Region of policy_bucket. One bucket serves every region of the fleet."
+  type        = string
+}
+
+variable "policy_prefix" {
+  description = "Key prefix inside policy_bucket. No leading or trailing slash."
+  type        = string
+  default     = "dev-vm-policies"
+}
+
+variable "policy_kms_key_arn" {
+  description = "KMS key ARN if policy_bucket uses SSE-KMS; null for SSE-S3."
+  type        = string
+  default     = null
+}
+
+variable "policy_signers" {
+  description = "allowed_signers lines a new VM trusts at first boot. Twin of `default['base']['policy']['signers']` in cinc/policyfiles/dev-vm.rb; `cd cinc && make preflight` checks the two agree."
+  type        = list(string)
+}
+
+variable "policy_min_serial" {
+  description = "The lowest envelope serial a VM accepts, written at its first boot: it binds VMs created after it is raised. Raise it to a security fix's serial."
+  type        = number
+  default     = 0
 }
 
 variable "log_shipping" {
@@ -43,18 +80,14 @@ variable "idlefy_managed" {
   default     = true
 }
 
-variable "cinc_server_url" {
-  description = "Full CINC server URL including the org path (e.g. https://cinc.example.com/organizations/myorg)."
-  type        = string
-}
-
 
 variable "access_bundles" {
   description = "Named permission bundles referenced by instances[*].aws_access. Phase A: same-account managed policies only."
   type = map(object({
-    description     = string
-    policy_arns     = optional(list(string), [])
-    allowed_actions = list(string)
+    description           = string
+    policy_arns           = optional(list(string), [])
+    allowed_actions       = list(string)
+    infrastructure_access = optional(bool, false)
   }))
   default = {}
 }

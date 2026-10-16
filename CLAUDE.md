@@ -19,30 +19,24 @@ what a change to the platform needs.
 There is no deployable `vms/` root here on purpose: two copies of it would drift
 and nothing would catch it. `vms/` holds `modules/` and `README.md`.
 
-Root `infra/` is the one exception, and it is a copy, not a second root: it is
-byte-identical to `tenant-skeleton/infra/`, and the skeleton's is the
-authoritative one. Nothing here consumes it — no script, test, Makefile target
-or workflow references it — so what it does is make the Ansible control plane
-(the CINC-server role, its templates, the two `group_vars` examples) readable
-alongside the cookbook and the modules instead of only inside the skeleton. It
-is a **reading copy**, and it is not gated: `test-skeleton-sync.sh` covers only
-the five shared `scripts/`, so the two can drift and nothing will say so. Edit
-`tenant-skeleton/infra/` and `cp` across, never the reverse; never
-`terraform apply` or `ansible-playbook` from it (hard rule 6); and if you delete
-it, delete it deliberately rather than as tidying — a reader who has been told
-the Ansible half exists will look for it here.
+There is no CINC server either, here or in a tenant. Policy reaches VMs as
+signed archives in a bucket the tenant owns: `scripts/policy-publish.sh` signs
+and publishes, `vms/modules/ec2/files/dev-vm-policy-fetch` verifies and
+converges. The protocol, its threat model and what was measured on live VMs
+are in `docs/design/serverless-policy-delivery.md`.
 
 ## Verify your own edits
 
 ```bash
 make boundary-check                                    # modules stay inside themselves
-( cd vms/modules/ec2          && terraform test )      # 27 runs
+( cd vms/modules/ec2          && terraform test )      # 53 runs
 ( cd vms/modules/fleet-guards && terraform test )      # 5 runs
 make smoke                                             # the skeleton against this tree
 for t in test/test-release-gate.sh test/test-resolve-pin.sh test/test-boundary-check.sh \
          test/test-placeholder-check.sh test/test-prepare.sh test/test-pin-to-worktree.sh \
-         test/test-preflight.sh test/test-skeleton-sync.sh test/test-get-started-skill.sh; do "$t"; done
-( cd cinc && make lint && make test && make test-broker && make test-loki-token )
+         test/test-preflight.sh test/test-skeleton-sync.sh test/test-fetch-sync.sh \
+         test/test-policy-publish.sh test/test-get-started-skill.sh; do "$t"; done
+( cd cinc && make lint && make test && make test-broker && make test-loki-token && make test-policy-fetch )
 make test-pin-check                                    # root target; needs chef
 mkdocs build --strict
 ```
@@ -71,16 +65,22 @@ challenge one is to reproduce it.
 6. Never echo a secret's value — SSM is not encrypted at rest from where you sit.
 7. The Falco sudo exclusion and the Tailscale sudoers grant are one change.
 8. Root never writes under `/home/ubuntu` — stage under `/usr/share/dev-vm/home`, copy as `ubuntu`.
+9. A signature commits to bytes; compare an archive's contents before signing its hash.
 
 **A deny entry in the permissions boundary must cover every route to the asset,
 not the API that happens to name it.** The list blocks the snapshot path to a VM's
 root volume *and separately* `StopInstances` → `DetachVolume` → `AttachVolume`,
 because those three calls reach the same disk and need no `iam:PassRole`. Eight
-omissions of exactly this shape have been found so far, each by a reviewer rather
-than by a test — the latest three (EBS direct-read of snapshots, fleet network
-mutation, console output) by an outside reviewer of `v1.0.0`; see
-`docs/design/first-external-review.md` §3. When you add an entry, enumerate
-multi-call paths to the thing you are protecting.
+omissions of exactly this shape were found before serverless delivery, each by a
+reviewer rather than by a test — three of them (EBS direct-read of snapshots,
+fleet network mutation, console output) by an outside reviewer of `v1.0.0`; see
+`docs/design/first-external-review.md` §3. The policy bucket then took four
+more review rounds of the same kind (VPC endpoints, IMDS, region-wide egress,
+private hosted zones that re-point S3's name) before the deny list gave way to
+a structural rule: a bundle naming an infrastructure namespace needs
+`infrastructure_access = true`. When you add an entry, enumerate multi-call
+paths to the thing you are protecting — including every route that changes
+where a name resolves or a packet goes.
 
 **Alloy's version pin and its unattended-upgrades blacklist are one change.**
 `base::alloy` pins `alloy` to an exact version and `base::unattended_upgrades`
@@ -186,11 +186,12 @@ boundary that holds is privilege: the `execute … user 'ubuntu'` copies in
 `claude_code.rb`, `docker.rb` and `traefik.rb` are the pattern, and
 `spec/recipes/default_spec.rb` fails any recipe that adds a root writer there.
 
-**Never echo a secret's value.** The CINC validator key is reachable via
-`aws ssm get-parameter --with-decryption` from a workstation holding these
-credentials. Report exit status; never the value. Hard
-rule 4 covers `vault.yml` — this covers SSM, which is not encrypted at rest from
-your point of view.
+**Never echo a secret's value.** A tenant's Loki token is reachable via
+`aws ssm get-parameter --with-decryption` from a workstation holding its
+credentials. Report exit status; never the value. SSM is not encrypted at rest
+from your point of view. Signing keys never enter this flow as values at all:
+`ssh-keygen -Y sign` reads them from disk, the agent or a hardware token, and
+nothing here should ever print, copy or `cat` a private key.
 
 **The Falco sudo exclusion and the Tailscale sudoers grant are one change, and
 the grant must never ship first.** `base::sudoers` permits `/usr/bin/tailscale
@@ -228,6 +229,24 @@ silences probing that sudoers itself refuses. Read the exact `proc.args` off a
 real detection rather than guessing it here; an exclusion that does not match is
 indistinguishable from no exclusion until someone is paged.
 
+**A signature commits to bytes, not to where they came from — compare an
+archive's contents before signing its hash.** `make push` stores each archive
+once, under its `revision_id`, and that id is in the committed lock, so it is
+no secret. The first publisher hashed whatever sat at
+`archives/<revision_id>.tgz` and signed the hash. Anyone able to write the
+bucket — no signing key needed — could store that object first, with the
+genuine lock inside and a recipe of their own, and the next honest push would
+have signed it. `promote` had the same hole one step later: a stolen
+staging-only key could re-sign staging over such an archive, and the
+operator's production key would carry it into production, since revision and
+hash both matched. Found by review, 2026-10-15. `policy-publish.sh` now
+compares the stored archive's paths, types, file contents and link targets
+with a fresh export of the lock before any signature, reading it with
+`tarfile` and never extracting it. An export is not byte-reproducible (mtimes
+vary), so the hash alone can never be the check. If you touch the publisher,
+`plant_archive` in `test/test-policy-publish.sh` is the case that must keep
+failing.
+
 ## Release
 
 Two tag streams, cut by `make release`, which refuses a dirty tree and a HEAD
@@ -235,8 +254,8 @@ that consumers cannot reach:
 
 | Stream | Publishes | Gates | Lockstep |
 |---|---|---|---|
-| `base-X.Y.Z` | `cinc/cookbooks/base/**` | `cookstyle`, `chefspec`, `test-broker`, `test-loki-token` | `metadata.rb` must say `X.Y.Z`, byte for byte |
-| `vX.Y.Z` | `vms/modules/**` + `tenant-skeleton/**` | `boundary-check`, `test-skeleton-sync`, `smoke` | none — the module carries no version string |
+| `base-X.Y.Z` | `cinc/cookbooks/base/**` | `cookstyle`, `chefspec`, `test-broker`, `test-loki-token`, `test-policy-fetch`, `test-fetch-sync` | `metadata.rb` must say `X.Y.Z`, byte for byte |
+| `vX.Y.Z` | `vms/modules/**` + `tenant-skeleton/**` | `boundary-check`, `test-skeleton-sync`, `test-fetch-sync`, `test-policy-publish`, `smoke` | none — the module carries no version string |
 
 ```bash
 make release TAG=base-1.0.0
@@ -268,16 +287,12 @@ Never override without explicit user instruction in the current conversation.
 2. **Never change a published module's inputs without updating
    `tenant-skeleton/` in the same commit.** The interface is a contract now, and
    `make smoke` is what turns that from a hope into a rule.
-3. **Never read `infra/ansible/group_vars/all/vault.yml` contents** — including
-   through `tenant-skeleton/`. Encrypted or not, the contents are secrets that
-   must not enter conversation history.
-4. **Never echo a secret's value.** Report exit status instead. The CINC
-   validator key is reachable via `aws ssm get-parameter --with-decryption` from
-   a workstation holding these credentials.
-5. **Never use `git push --force` on `main`** without the user explicitly saying
+3. **Never echo a secret's value.** Report exit status instead. A tenant's
+   Loki token is reachable via `aws ssm get-parameter --with-decryption` from a
+   workstation holding its credentials.
+4. **Never use `git push --force` on `main`** without the user explicitly saying
    "force push", and never force-push a tag at all.
-6. **Never `terraform apply` from this repository.** There is nothing here to
-   apply (root `infra/` is a copy of the skeleton's, not a deployment) — if you
-   are holding a tenant's state, you are on the wrong clone.
-7. **Use the Makefile, not raw `chef` / `knife` / `git tag`.** Each target
-   encodes a gate that the raw command skips.
+5. **Never `terraform apply` from this repository.** There is nothing here to
+   apply — if you are holding a tenant's state, you are on the wrong clone.
+6. **Use the Makefile, not raw `chef` / `git tag`.** Each target encodes a gate
+   that the raw command skips.

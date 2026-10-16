@@ -20,8 +20,8 @@ default uid of the Loki datasource on a Grafana Cloud stack. On a stack where it
 was renamed, or on self-hosted Grafana, replace that uid (`grep -rn
 grafanacloud-logs .`) with your datasource's before applying.
 
-These are **not** applied by Terraform, on purpose. The `vms/` and `infra/`
-roots use one AWS credential each; wiring Grafana into them would put a Grafana
+These are **not** applied by Terraform, on purpose. The `vms/` root uses one
+AWS credential; wiring Grafana into them would put a Grafana
 admin token into Terraform state, which is stored in S3 and read by everyone who
 can plan. Apply them with a short-lived token instead:
 

@@ -38,6 +38,16 @@ check "warns about placeholders" "$(echo "$OUT" | grep -q 'still carries pin pla
 check "no 'fatal:' leaks" "$(echo "$OUT" | grep -q 'fatal:' && echo 1 || echo 0)"
 teardown
 
+echo "== prepare materialises no CINC-server config: there is no server =="
+setup
+OUT=$( cd "$TEN" && make prepare 2>&1 )
+check "exit 0" "$?"
+check "no cinc/.chef/knife.rb" "$([ ! -e "$TEN/cinc/.chef/knife.rb" ] && echo 0 || echo 1)"
+check "no infra/ tree shipped or created" "$([ ! -e "$TEN/infra" ] && echo 0 || echo 1)"
+check "both vms/ templates materialised" \
+  "$([ -f "$TEN/vms/tenant.auto.tfvars" ] && [ -f "$TEN/vms/backend.hcl" ] && echo 0 || echo 1)"
+teardown
+
 echo "== a pinned tree with a seeded module cache does not warn =="
 setup
 sed -i -e 's/__PLATFORM_TAG__/v9.9.9/g' \

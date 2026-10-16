@@ -7,28 +7,39 @@ inside it. Nothing in it is a copy of the platform: the CINC cookbook and the
 two Terraform modules are pinned artifacts fetched from their tags, so the only
 files you edit are configuration.
 
-Tenant-specific values live in gitignored files with checked-in `.example`
-templates, plus two files you create yourself and one that is already in git.
+Tenant-specific values live in two gitignored files with checked-in `.example`
+templates, plus the policyfile, which is already in git. There is no server to
+build: policy reaches the VMs as signed archives in an S3 bucket you own.
 Sections 1–5 are the deploy path, in order. Section 7 is the Grafana Cloud
 token; a tenant that does not ship logs skips it entirely, and §4 is where that
-decision is made.
+decision is made. Section 8 is day-two policy delivery: rotating a signing key,
+pinning a floor after a security fix, and recovering a VM that refuses every
+envelope.
 
 ## Prerequisites
 
-- AWS account with permissions for EC2, VPC, IAM, Route53, SSM, S3
+- AWS account with permissions for EC2, VPC, IAM, Route53, SSM, S3 (and KMS,
+  if the policy bucket uses SSE-KMS)
 - AWS CLI profile configured locally (any name — you reference it below)
-- Route53 hosted zone you control (e.g., `infra.example.com`)
+- Route53 hosted zone you control (e.g., `example.com`)
 - Workstation tools: Terraform ≥1.5 (≥1.7 to run `terraform test`, which needs
-  `mock_provider`), CINC Workstation, Ansible, AWS CLI v2, `python3`, `curl`.
-  `scripts/preflight.sh` and both Makefiles shell out to `python3`; the CINC
-  Workstation package supplies `chef`, `knife` and `cinc-client`. The version
-  this was built against is pinned in
+  `mock_provider`), CINC Workstation, AWS CLI v2, OpenSSH ≥ 8.1 (for
+  `ssh-keygen -Y sign`), `python3`, `curl`. `scripts/preflight.sh`,
+  `scripts/policy-publish.sh` and both Makefiles shell out to `python3`; the
+  CINC Workstation package supplies `chef`. The version this was built against
+  is pinned in
   [`cinc/README.md` § Prerequisites](https://github.com/idlefy/vm-platform-aws/blob/main/cinc/README.md#prerequisites).
+- An **ed25519** SSH key to sign policy with — `ssh-ed25519`, or
+  `sk-ssh-ed25519@openssh.com` on a hardware token. `make push` uses
+  `~/.ssh/id_ed25519` unless `SIGNING_KEY` names another; a `.pub` path signs
+  through `ssh-agent`. Its public half goes into the tenant config in §2 and §4.
 - A GNU userland: the Makefiles and `scripts/` use `sed -i` without a suffix
-  argument, and §5 uses `shred`, which macOS lacks. On macOS install
-  `coreutils` and `gnu-sed` and put their `gnubin` directories first on `PATH`.
+  argument. On macOS install `coreutils` and `gnu-sed` and put their `gnubin`
+  directories first on `PATH`.
 
-## 1. Create the Terraform state bucket
+## 1. Create the two buckets
+
+### The Terraform state bucket
 
 One-time, outside of Terraform. Pick any name; you reference it in the backend
 configs. Create it in the region your `backend.hcl` names — the bucket holds
@@ -51,9 +62,88 @@ Outside `us-east-1`, `create-bucket` also needs
 `--create-bucket-configuration LocationConstraint="$REGION"`; the API rejects
 the call without it.
 
+### The policy bucket
+
+`make push` writes each policy's archive and its signed envelopes here, and
+every VM reads from it every 30 minutes. A dedicated bucket is recommended:
+developers' VMs are denied every write to it, not only under the prefix. Any
+bucket works, in this account or another, SSE-S3 or SSE-KMS. Versioning keeps
+the history of every envelope, which is what an investigation reads.
+
+```bash
+PBUCKET=<your-team>-dev-vm-policies
+PREGION=<a region your organisation allows>
+
+aws s3api create-bucket --bucket "$PBUCKET" --region "$PREGION" --profile "$PROFILE"
+aws s3api put-bucket-versioning --bucket "$PBUCKET" \
+  --versioning-configuration Status=Enabled --profile "$PROFILE"
+aws s3api put-public-access-block --bucket "$PBUCKET" --profile "$PROFILE" \
+  --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+aws s3api put-bucket-ownership-controls --bucket "$PBUCKET" --profile "$PROFILE" \
+  --ownership-controls 'Rules=[{ObjectOwnership=BucketOwnerEnforced}]'
+```
+
+Three things the bucket must allow, none of which Terraform can see:
+
+- **Its region must be reachable.** An organisation may allowlist regions with
+  an SCP, and every VM's fetch goes to the bucket's regional endpoint, so a
+  denied region means no VM ever converges. `make preflight` checks this.
+- **No VPC-endpoint-only policy.** The VMs sit in public subnets and reach S3
+  over the internet; a bucket policy conditioned on `aws:SourceVpce` locks
+  them out.
+- **Writes are the operators', reads the VMs'.** Each VM's bootstrap role,
+  `dev-vm-boot-<vm>-<region>`, gets `s3:GetObject` on
+  `<prefix>/<policy_name>/*` from the module; nothing on a VM can write here,
+  and the identity boundary denies the routes around that. Whoever runs
+  `make push` needs `s3:GetObject` and `s3:PutObject` on `<prefix>/*`, and
+  `s3:ListBucket` for `make preflight`.
+
+**A bucket in another account** needs a bucket policy that lets this account's
+bootstrap roles read. A role ARN in `Principal` cannot carry a wildcard, so the
+principal is the tenant account and the condition names the roles:
+
+```json
+{
+  "Sid": "DevVmBootstrapRead",
+  "Effect": "Allow",
+  "Principal": { "AWS": "arn:aws:iam::<tenant-account>:root" },
+  "Action": "s3:GetObject",
+  "Resource": "arn:aws:s3:::<bucket>/<prefix>/*",
+  "Condition": {
+    "StringLike": { "aws:PrincipalArn": "arn:aws:iam::<tenant-account>:role/dev-vm-boot-*" }
+  }
+}
+```
+
+The operators who run `make push` need a statement of the same shape for
+`s3:GetObject`, `s3:PutObject` and `s3:ListBucket`, naming their own role.
+
+**An SSE-KMS bucket** also needs the key to allow decryption. Set
+`policy_kms_key_arn` in §2, which grants `kms:Decrypt` on the identity side, and
+add this to the key policy:
+
+```json
+{
+  "Sid": "DevVmBootstrapDecrypt",
+  "Effect": "Allow",
+  "Principal": { "AWS": "arn:aws:iam::<tenant-account>:root" },
+  "Action": "kms:Decrypt",
+  "Resource": "*",
+  "Condition": {
+    "StringLike": { "aws:PrincipalArn": "arn:aws:iam::<tenant-account>:role/dev-vm-boot-*" },
+    "StringEquals": { "kms:ViaService": "s3.<bucket-region>.amazonaws.com" }
+  }
+}
+```
+
+Operators additionally need `kms:GenerateDataKey` and `kms:Decrypt` on the key
+to write and read back. `make preflight` cannot read either policy from the
+tenant account, so for these two cases it prints a reminder rather than a
+check; the first staging VM is the real test.
+
 ## 2. Fill in the tenant files
 
-`make prepare` copies six `.example` files to their real names. It never
+`make prepare` copies the two `.example` files to their real names. It never
 overwrites, so a re-run after adding a template is safe:
 
 ```bash
@@ -62,40 +152,24 @@ make prepare PLATFORM_TAG=vX.Y.Z
 
 | File | Where it comes from | What it holds |
 |---|---|---|
-| `vms/tenant.auto.tfvars` | `make prepare` | AWS profile, Route53 zone, CINC server URL, SSM parameter names, `log_shipping`, `idlefy_managed` |
+| `vms/tenant.auto.tfvars` | `make prepare` | AWS profile, Route53 zone, the policy bucket (§1), its owner, region and optional KMS key, `policy_signers`, the Loki parameter name, `log_shipping`, `idlefy_managed` |
 | `vms/backend.hcl` | `make prepare` | S3 bucket / key / profile for the `vms` Terraform state |
-| `infra/tenant.auto.tfvars` | `make prepare` | AWS profile, account name, Route53 zone, CINC FQDN, SSH keys |
-| `infra/backend.hcl` | `make prepare` | S3 bucket / key / profile for the `infra` Terraform state |
-| `infra/ansible/group_vars/all/tenant.yml` | `make prepare` | CINC org name, admin e-mail, server FQDN (Ansible-side) |
-| `cinc/.chef/knife.rb` | `make prepare` | Knife identity: `chef_server_url`, `node_name`, path to the admin client key |
-| `infra/ansible/group_vars/all/vault.yml` | **by hand**, from its `.example` — below | `vault_cinc_admin_password`, encrypted with `ansible-vault` |
-| `~/.vault_pass` | **by hand** — below | The password that opens `vault.yml`. `infra/ansible/ansible.cfg` names this path in `vault_password_file`; every playbook run reads it |
-| `infra/ansible/inventory.yml` | **by hand**, from `inventory.yml.tpl` — §5 step 2 | The CINC server's address. It cannot exist until Terraform has created the server |
-| `cinc/.chef/admin.pem` | **fetched from the CINC server** — §5 step 4 | The knife admin client key |
-| `cinc/policyfiles/dev-vm.rb` | **already in git** — §4 | The cookbook pin and this tenant's cookbook attributes |
+| `cinc/policyfiles/dev-vm.rb` | **already in git** — §4 | The cookbook pin and this tenant's cookbook attributes, including the signers set |
 
-Only the first six are `cp`-and-edit; each has inline comments explaining its
-values. The rest are covered where they become possible — the two vault files
-now, the inventory and `admin.pem` in §5, the policyfile in §4.
+Both templates carry inline comments explaining their values.
+`policy_signers` takes one line per key that may sign policy:
 
-Create the vault files now, since §5 cannot run without them:
-
-```bash
-cp infra/ansible/group_vars/all/vault.yml.example \
-   infra/ansible/group_vars/all/vault.yml
-
-printf '%s' '<a strong vault password>' > ~/.vault_pass && chmod 600 ~/.vault_pass
-
-# Encrypt the CINC admin password and paste the block it prints over the
-# vault_cinc_admin_password: line in vault.yml.
-echo -n '<a strong CINC admin password>' | ansible-vault encrypt_string \
-  --stdin-name 'vault_cinc_admin_password'
+```hcl
+policy_signers = [
+  "you@example.com namespaces=\"dev-vm-policy-staging,dev-vm-policy-production\" ssh-ed25519 AAAA...",
+]
 ```
 
-Both are gitignored — `vault.yml` too, even though it is encrypted, because an
-in-place `ansible-vault decrypt` would otherwise make the cleartext
-committable. Confirm with
-`git check-ignore infra/ansible/group_vars/all/vault.yml`.
+The principal is a name for the key; the namespaces say which groups it may
+sign for — give a CI key `dev-vm-policy-staging` alone, and it can never publish
+to production; the last two fields are the first two of the `.pub` file.
+Exactly one space between fields. This is what a VM trusts at its first boot;
+§4 sets what it trusts from then on, and the two must be the same set.
 
 ## 3. Per-developer VM definitions
 
@@ -122,8 +196,8 @@ identity with no permissions, which is the intended starting point. See
 ## 4. Fill in the policyfile
 
 `cinc/policyfiles/dev-vm.rb` is checked into the skeleton rather than
-materialised from an `.example`, so `make prepare` cannot fill it in. It carries
-five `REPLACE_ME` values, and they are not equally forgiving:
+materialised from an `.example`, so `make prepare` cannot fill it in. Its
+`REPLACE_ME` values are not equally forgiving:
 
 | What | How to set it | If you leave it |
 |---|---|---|
@@ -132,6 +206,7 @@ five `REPLACE_ME` values, and they are not equally forgiving:
 | `default['base']['loki']['username']` | the numeric stack user ID from the same panel — not an e-mail address | same |
 | `default['base']['traefik']['acme_email']` | the address Let's Encrypt registers for expiry notices | **nothing catches it.** The VM registers `REPLACE_ME` with Let's Encrypt |
 | `default['base']['traefik']['domain_root']` | the DNS suffix of the `fqdn`s you wrote in §3 | **nothing catches it.** Every published hostname becomes `<vm>.ec2.<region>.REPLACE_ME`, and no certificate is ever issued |
+| `default['base']['policy']['signers']` | the same lines as `policy_signers` in §2, in Ruby quoting | `make push` refuses: your key is not in the set the revision installs |
 
 The two Traefik rows are the dangerous ones. `base::alloy` refuses an empty or
 `REPLACE_ME` `url`/`username` at converge, but `base::traefik` interpolates its
@@ -140,7 +215,7 @@ where the value is finally used, which is the shape of failure this whole
 document exists to prevent.
 
 ```bash
-$EDITOR cinc/policyfiles/dev-vm.rb        # the four attributes
+$EDITOR cinc/policyfiles/dev-vm.rb        # the attributes above, all but the tag
 make bump-cookbook TAG=base-X.Y.Z         # sets the tag and re-locks, both at once
 ./scripts/placeholder-check.sh --config   # must exit 1 — nothing left to fill in
 ```
@@ -168,112 +243,64 @@ live in the platform repository, not here.
 
 ## 5. Deploy
 
-Ten steps, in this order. Steps 4 and 5 are the two Terraform cannot do for you
-and that nothing downstream will remind you about.
+Six steps, in this order. The order is not cosmetic: a VM converges only from a
+signed envelope for its own group, so a production VM created before the first
+`make promote` has nothing to verify and fails closed.
 
 ```bash
-# 1. Shared infra: the CINC server
-cd infra
-terraform init -backend-config=backend.hcl
-terraform plan && terraform apply
+# 1. If this tenant ships logs: do §7 steps 1-4 now (the Grafana Cloud token).
+#    make promote in step 4 runs preflight, which fails without it.
 ```
 
 ```bash
-# 2. Write the Ansible inventory from the address Terraform just printed
-terraform output -json security_vms          # note the CINC server's address
-cd ansible
-cp inventory.yml.tpl inventory.yml
-$EDITOR inventory.yml                        # replace <CINC_IP>
+# 2. Check what Terraform cannot: the bucket is reachable, the Loki token
+#    authenticates. Nothing is published yet, so expect two warnings about
+#    staging.json and production.json and no failures.
+cd vms && terraform init -backend-config=backend.hcl && cd ..
+cd cinc && make preflight
 ```
 
 ```bash
-# 3. Build the CINC server. -i is required: ansible.cfg sets no inventory
-#    and the play targets `hosts: cinc`.
-ansible-playbook -i inventory.yml playbooks/cinc-server.yml
-cd ../..
-```
-
-The role asserts `vault_cinc_admin_password` on its first task, so a missing
-`vault.yml` or `~/.vault_pass` fails immediately rather than halfway through a
-server build. It finishes by printing the paths of the two keys it created:
-`/etc/cinc-project/admin.pem` and `/etc/cinc-project/<org>-validator.pem`.
-
-```bash
-# 4. Fetch the knife admin key from the server (it is root-owned, mode 0600).
-#    Create the destination 0600 first: a redirect under umask 022 would
-#    otherwise create it world-readable for the instant before chmod.
-install -m 0600 /dev/null cinc/.chef/admin.pem
-ssh ubuntu@<CINC_IP> 'sudo cat /etc/cinc-project/admin.pem' > cinc/.chef/admin.pem
-```
-
-```bash
-# 5. Put the CINC validator key in SSM — ONCE PER REGION you deploy into.
-#    SSM is region-scoped, and Terraform never creates this parameter: it
-#    manages only the IAM grant that names it.
-f="$(mktemp)"                      # 0600 already, unpredictable name
-ssh ubuntu@<CINC_IP> 'sudo cat /etc/cinc-project/<org>-validator.pem' > "$f"
-
-aws ssm put-parameter \
-  --name "<cinc_ssm_parameter_name from vms/tenant.auto.tfvars>" \
-  --type SecureString \
-  --value "file://$f" \
-  --region <region> \
-  --profile <profile>
-
-shred -u "$f"
-```
-
-Full reference, including what the IAM grant does and does not cover:
-[`vms/README.md` § "CINC validation key in SSM"](https://github.com/idlefy/vm-platform-aws/blob/main/vms/README.md#cinc-validation-key-in-ssm).
-Skip a region here and every VM in it boots, fails to fetch the key and never
-converges — three minutes after `apply` reported success.
-
-```bash
-# 6. If this tenant ships logs: do §7 steps 1-4 now (the Grafana Cloud token).
-#    make promote in step 9 runs preflight, which fails without it.
-```
-
-```bash
-# 7. Push the policy to the staging policy group
-cd cinc && make push
+# 3. Publish the policy to staging: pin-check, chef install from the lock,
+#    export, store the archive, sign and write staging.json.
+make push
 cd ..
 ```
 
 ```bash
-# 8. Create one staging VM and let it converge.
+# 4. Create one staging VM and let it converge.
 #    Add an entry to vms/instances.auto.tfvars with policy_group = "staging".
 cd vms
-terraform init -backend-config=backend.hcl
 terraform plan && terraform apply
-# wait ~3 minutes, then SSH in via EC2 Instance Connect and confirm the converge
+# wait ~3 minutes, then SSH in via EC2 Instance Connect and confirm the converge:
+#   sudo systemctl status cinc-client     (as admin)
 cd ..
 ```
 
 ```bash
-# 9. Promote to production
-cd cinc && make preflight && make promote
+# 5. Promote to production
+cd cinc && make promote
 cd ..
 ```
 
 ```bash
-# 10. Add the rest of the fleet to vms/instances.auto.tfvars
+# 6. Add the rest of the fleet to vms/instances.auto.tfvars
 cd vms && terraform plan && terraform apply
 ```
 
-Each VM auto-bootstraps in ~3 minutes after `apply`: installs CINC, fetches the
-validation key from SSM, registers with the CINC server, runs the first
-converge.
+Each VM auto-bootstraps in ~3 minutes after `apply`: installs CINC, writes the
+policy settings and the signers it trusts, fetches its group's envelope,
+verifies it, and runs the first converge in local mode.
 
-A VM that has not registered with the CINC server five minutes after `apply`
-failed its bootstrap. It fails **closed**: the cloud image's `NOPASSWD` grant
-for `ubuntu` is removed first and is never restored, so the developer can
-still SSH in as `ubuntu`, but without sudo nobody can read
-`/var/log/user-data.log` — it is root-owned and `0600`. The bootstrap writes
-that log to the serial console instead. Pass `--latest`: on Nitro instance
-types, the call without it returns the early-boot snapshot, not the log —
-and `tail` alone would show the post-boot SSH banner and login prompt rather
-than the bootstrap failure, so grab everything from the `BOOTSTRAP FAILED`
-marker on:
+A VM that has not converged five minutes after `apply` failed its bootstrap. It
+fails **closed**: the cloud image's `NOPASSWD` grant for `ubuntu` is removed
+first and is never restored, so the developer can still SSH in as `ubuntu`, but
+without sudo nobody can read `/var/log/user-data.log` — it is root-owned and
+`0600`. The bootstrap writes that log to the serial console instead. Pass
+`--latest`: on Nitro instance types, the call without it returns the
+early-boot snapshot, not the log — and `tail` alone would show the post-boot
+SSH banner and login prompt rather than the bootstrap failure, so grab
+everything from the `BOOTSTRAP FAILED` marker on:
 
 ```bash
 aws ec2 get-console-output --latest --instance-id <id> --region <region> --profile <profile> --output text | sed -n '/BOOTSTRAP FAILED/,$p'
@@ -285,27 +312,29 @@ underneath, the failure is in `cinc-client`'s own converge log
 mirrored to the console — reading it needs sudo, which is gone, so treat
 the instance as unrecoverable and replace it.
 
-Fix the cause (a validator key missing in that region, a policy group that does
-not exist, a network that cannot reach the CINC server) and replace the
-instance — the bootstrap only runs on first boot:
+Fix the cause — no envelope for the VM's group yet, a bucket or key policy that
+does not let the bootstrap role read, `policy_signers` that no longer verify
+what is published — and replace the instance; the bootstrap only runs on first
+boot:
 
 ```bash
 cd vms && terraform apply -replace='module.ec2["<region>"].aws_instance.this["<vm>"]'
 ```
 
-Steps 6–9 are in that order, rather than one `make push && make promote`,
+Steps 3–5 are in that order, rather than one `make push && make promote`,
 because `promote` enforces three things and each of them can stop you. It runs
-`preflight` first, which fails on a Loki parameter missing in any region. It
-then refuses unless the staging policy group already carries the revision in
-the committed lock — which is what step 8 is for. Finally it asks for a typed
-`yes`. `make promote PREFLIGHT=skip` bypasses the first check only, and prints
-what it is giving up; `pin-check` and the revision check still run and still
-refuse. Use it when you know why preflight is failing and have decided to
+`preflight` first, which fails on a Loki parameter missing in any region or an
+envelope that does not verify. It then refuses unless `staging.json` verifies,
+carries the revision in the committed lock, and points at an archive that holds
+what that lock exports — which is what step 4 is for. Finally it asks for a
+typed `yes`. `make promote PREFLIGHT=skip` bypasses the first check only, and
+prints what it is giving up; `pin-check` and the staging check still run and
+still refuse. Use it when you know why preflight is failing and have decided to
 proceed anyway — not to get past a missing token, which is the failure it exists
 to catch.
 
 If you are not shipping logs at all, you set both halves of the switch off in
-§4, preflight skips every Loki check, and step 6 does not apply.
+§4, preflight skips every Loki check, and step 1 does not apply.
 
 ## 6. Scrub your own names before sharing the repository
 
@@ -339,11 +368,8 @@ four settings that turn shipping off, are in §4; `cd cinc && make preflight`
 fails if the two halves disagree.
 
 Terraform grants the VM's IAM role read access to a specific SSM parameter
-*name* (`vms/modules/ec2/iam.tf`, via `loki_ssm_parameter_name`), but — exactly
-like the CINC validator key, hand-created per region in §5 step 5 and described
-in
-[`vms/README.md` § "CINC validation key in SSM"](https://github.com/idlefy/vm-platform-aws/blob/main/vms/README.md#cinc-validation-key-in-ssm) —
-it does not create the parameter or put a value into it. A Grafana Cloud push
+*name* (`vms/modules/ec2/iam.tf`, via `loki_ssm_parameter_name`), but it does
+not create the parameter or put a value into it. A Grafana Cloud push
 token is a secret, and a secret Terraform creates is a secret that lands in
 Terraform state. This step is therefore manual, every time, including on
 rotation.
@@ -490,8 +516,9 @@ disagree, so the two are edited together and *applied* apart:
 4. In `vms/tenant.auto.tfvars` set `log_shipping = false` and
    `loki_ssm_parameter_name = null`, but **do not apply yet**.
 5. `cd cinc && make promote`. Preflight now sees both halves agree.
-6. Wait until every VM has converged past the teardown (`knife status`, or the
-   Alloy unit gone on each VM), then `cd vms && terraform apply`.
+6. Wait until every VM has converged past the teardown (the Alloy unit gone on
+   each VM, or `make preflight` and one converge interval), then
+   `cd vms && terraform apply`.
 
 Applying Terraform before step 6 removes the IAM grant while Alloy is still
 installed; the token script leaves an existing token untouched when its fetch
@@ -499,25 +526,88 @@ is denied, so the fleet keeps shipping on its last token while the tenant
 believes shipping is off. Turning it on is the mirror: Terraform first, then
 steps 1–3 with `enabled = true`.
 
+## 8. Policy delivery, day two
+
+The protocol and its threat model are in
+[`docs/design/serverless-policy-delivery.md`](design/serverless-policy-delivery.md).
+What an operator does with it:
+
+**Publishing is `make push` and `make promote`, nothing else.** Never write an
+envelope by hand or put objects under the policy prefix with `aws s3`. The
+publisher's checks — the lock matches the policyfile, the stored archive holds
+what the lock exports, the serial counts up, the write is conditional on what
+was read — exist only in that path.
+
+**Rolling back** is a push of the old lock: check out the earlier
+`cinc/policyfiles/dev-vm.rb` **and** its `dev-vm.lock.json` together
+(`pin-check` refuses one without the other), `make push`, verify,
+`make promote`. It
+gets a new serial, so a rollback is an ordinary publish, never a replay.
+
+**Rotating a signing key** takes two revisions, because a VM refuses a signers
+set that drops the key that signed it:
+
+1. Add the new key's line to `default['base']['policy']['signers']`,
+   `make bump-cookbook`, then `make push` and `make promote` signed with the
+   **old** key. Every VM now trusts both.
+2. Remove the old line, re-lock, then `make push` and `make promote` with
+   `SIGNING_KEY` pointing at the **new** key. Set `policy_signers` in
+   `vms/tenant.auto.tfvars` to the new set and `terraform apply`.
+
+Between the two, `make preflight` warns that `policy_signers` differs from the
+set production installs, and a VM created in that window fails closed. Finish
+the rotation before creating VMs.
+
+**After a security fix**, raise `policy_min_serial` in
+`vms/tenant.auto.tfvars` to the serial of the envelope that carries the fix
+(`make push` and `make promote` print it as they write) and `terraform apply`. From
+then on no VM you create accepts anything older, even a validly signed envelope
+someone replays from the bucket's history. Running VMs are not reached, because
+the floor is written at first boot. Each of them refuses anything older from
+the moment it converges the fix, through its own `last-serial`. To be sure,
+check `/var/lib/dev-vm/policy/status` on each VM, or recreate the ones that
+have not converged it.
+
+**If the bucket is unreachable**, running VMs keep converging their last good
+revision; `cinc-client.service` fails from the third consecutive run and, with
+shipping on, the *converge failed* alert fires. New VMs fail closed. Nothing
+needs doing on the VMs once the bucket is back.
+
+**Break-glass: a VM that rejects every envelope.** A serial published far in
+the future (by a mistaken or compromised signer) or a signers set nobody holds a
+key for leaves a VM refusing everything the bucket can offer. It is recovered on
+the VM: SSH in as `admin` through EC2 Instance Connect, which has root, and
+delete the stored serial so the next run compares against the signers file
+alone:
+
+```bash
+sudo rm /var/lib/dev-vm/policy/last-serial
+sudo systemctl start cinc-client
+```
+
+Fix the cause in the bucket first — publish a correct envelope with
+`make push` / `make promote` — or the VM records the bad serial again. If the
+signers file itself is wrong, recreating the VM with corrected
+`policy_signers` is the clean path.
+
 ## Defaults you may want to change
 
 These are the template's starting values, not leftovers. Each is a deliberate
 default a tenant is expected to review:
 
-- **SSM parameter convention** — `/developer-vms/cinc/...` and
-  `/developer-vms/observability/...` in the `.example` files, and the derived
-  form the `tenant-setup` skill generates. Change it in `tenant.auto.tfvars` to
+- **SSM parameter convention** — `/developer-vms/observability/...` in the
+  `.example` file, and the form the `tenant-setup` skill generates. Change it in `tenant.auto.tfvars` to
   whatever naming scheme you prefer; the Loki one must stay byte-identical to
   the policyfile attribute.
 - **VPC CIDR `10.8.0.0/16`** in `vms/config.tf` — change if you peer with
   existing networks; otherwise leave as-is.
-- **`environment = "dev"`** in `vms/config.tf` and `infra/config.tf` — single
+- **`environment = "dev"`** in `vms/config.tf` — single
   environment by design; promote to a variable if you need multiple.
 - **Region list** in `vms/config.tf` — the skeleton ships three (`us-east-1`,
   `eu-north-1`, `eu-central-1`), and `vms/instances.auto.tfvars` starts with
   entries for the first two. Add one with `cd cinc && make add-region
-  REGION=<region>`, which writes the HCL and reminds you of the two per-region
-  SSM secrets; remove one by deleting its entry from `local.regions`. There is
+  REGION=<region>`, which writes the HCL and reminds you of the Loki token's
+  per-region SSM parameter; remove one by deleting its entry from `local.regions`. There is
   a single unaliased provider driven by one `for_each`, so there are no provider
   or module blocks to add. Note that an organisation may allowlist regions with
   an SCP, and a denied region reports `opt-in-not-required` exactly like an

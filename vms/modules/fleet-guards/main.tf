@@ -4,12 +4,11 @@
 #
 # What breaks is not Terraform. IAM role names carry the region, so they do not
 # collide, and each VM gets its own instance — the plan looks entirely reasonable.
-# The collision is downstream: user_data writes `node_name "$INSTANCE_NAME"` from
-# the unqualified Name tag, so two same-named VMs register as ONE CINC node and
-# then overwrite each other's attributes every 30 minutes. `make node-delete
-# NODE=<name>` cannot say which one it means, and outputs.instance_ids merges the
-# regional maps, so one of the two silently disappears from every consumer that
-# resolves a VM by name.
+# The collision is downstream: user_data writes NODE_NAME from the unqualified
+# Name tag, and node_name is the Loki `instance` label, so two same-named VMs
+# ship into one stream and every alert grouped by instance treats them as one
+# machine. outputs.instance_ids merges the regional maps, so one of the two
+# silently disappears from every consumer that resolves a VM by name.
 locals {
   all_vm_names = flatten([for region, vms in var.instances : keys(vms)])
 

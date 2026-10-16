@@ -5,11 +5,7 @@
 # module ?ref= under vms/. cinc/Makefile calls it as `$(MAKE) -C .. pin-check`.
 
 TEMPLATES := vms/tenant.auto.tfvars \
-             vms/backend.hcl \
-             infra/tenant.auto.tfvars \
-             infra/backend.hcl \
-             infra/ansible/group_vars/all/tenant.yml \
-             cinc/.chef/knife.rb
+             vms/backend.hcl
 
 .PHONY: help prepare pin-check bump-cookbook
 
@@ -21,8 +17,6 @@ help: ## Show this help
 # Overwriting would eat a tenant's real backend config, which is untracked and
 # therefore unrecoverable from git.
 #
-# cinc/.chef/admin.pem is deliberately NOT here: it is a credential fetched from
-# the CINC server, and .gitignore already keeps it out of the repo.
 # PLATFORM_TAG resolves the skeleton's pin placeholders. Omitted, prepare only
 # materialises config and says what is left to do — which is what a re-run on an
 # already-pinned tenant should do.
@@ -30,7 +24,7 @@ help: ## Show this help
 # There is deliberately no PLATFORM_SOURCE branch here. The spec suggested one so
 # the upstream smoke test could invoke prepare non-interactively; the gate calls
 # scripts/pin-to-worktree.sh directly instead. Routing it through prepare would
-# make the gate depend on all six .example templates existing in the throwaway
+# make the gate depend on both .example templates existing in the throwaway
 # copy, and would materialise a tenant's config in a directory that is deleted
 # seconds later — for a caller that wants only the pin resolved. A branch no
 # caller takes is a branch no test covers.

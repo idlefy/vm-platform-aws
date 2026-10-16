@@ -7,7 +7,7 @@ description: Use when someone has just cloned vm-platform-aws and asks what it i
 
 You take a newcomer from "I cloned this" to "I have my own tenant repository,
 ready for `tenant-setup`". You create that repository and **stop**. Everything
-inside it — `make prepare`, the pin, the six tenant files, the cookbook tag —
+inside it — `make prepare`, the pin, the tenant files, the cookbook tag —
 belongs to the `tenant-setup` skill that ships in the skeleton, because that
 skill decides "already configured?" by looking at those files, and touching
 them here would make it think the tenant is done while every value is still a
@@ -22,9 +22,9 @@ want a tenant repository created now:
   tags) and two Terraform modules with a tenant skeleton (`vX.Y.Z` tags). Nothing
   deploys from here.
 - A **tenant** is a private repository generated from `tenant-skeleton/`. It
-  holds only configuration: regions, VMs, SSH keys, the CINC server, the
-  Grafana stack. Modules and cookbook are pinned artifacts it fetches over
-  HTTPS.
+  holds only configuration: regions, VMs, SSH keys, the bucket its signed
+  policy is published to, the Grafana stack. Modules and cookbook are pinned
+  artifacts it fetches over HTTPS. There is no server to run.
 - VMs run in the user's own AWS account, hardened by the cookbook on first boot
   and re-converged every 30 minutes. Every VM is tagged `idlefy = "enabled"` so
   Idlefy can start and stop it on the developer's schedule; the platform grants
@@ -81,14 +81,14 @@ git push
 ```
 
 That is all. Nothing else runs here: no `make prepare`, no `bump-cookbook`,
-nothing that touches AWS or a CINC server. The `.example` files are copied as
+nothing that touches AWS. The `.example` files are copied as
 they are — never write a real value into one.
 
 ## 5. Hand off
 
 Print the tenant path and say: open it, run `claude`, and the `tenant-setup`
 skill there will resolve the platform pin, collect the AWS profile, Route53
-zone, regions, CINC server values and the Loki settings, materialise the
+zone, regions, policy bucket and signing key, and the Loki settings, materialise the
 config, and stop before any `apply`.
 
 Also say, once:
@@ -106,9 +106,7 @@ These inherit the tenant's own `CLAUDE.md` rules that already apply before a
 tenant exists.
 
 - Never run `terraform apply`, `make push`, `make promote`, `make prepare`,
-  `ansible-playbook`, or anything that uses AWS credentials.
+  or anything that uses AWS credentials.
 - Never write a real value into any `.example` file.
-- Never read `vault.yml` or `vault.yml.example` contents beyond copying the
-  file.
 - Never echo a secret's value; report exit status instead.
 - Never create the repository public unless the user says so.

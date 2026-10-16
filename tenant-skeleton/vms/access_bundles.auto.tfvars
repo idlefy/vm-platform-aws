@@ -21,6 +21,14 @@
 #
 # The literal "*" is rejected at plan time. If a bundle genuinely needs a service
 # that looks dangerous, that is a conversation, not a config change.
+#
+# `infrastructure_access = true` is required for a bundle that names ec2, ebs,
+# s3, s3-object-lambda, kms, ssm, account, route53, route53resolver,
+# route53profiles, servicediscovery, network-firewall, autoscaling, batch or
+# imagebuilder. In those services the platform's deny list is the only thing
+# between the developer and the fleet's DNS, IMDS, network and policy bucket,
+# and that list cannot be complete. Setting the flag is the reviewer saying
+# they have read the bundle's policies with that in mind.
 # ============================================================================
 
 # --- Example ---
@@ -31,6 +39,7 @@
 #     description     = "RW on s3://example-media/dev-prefix/* — owned by the team that owns the bucket"
 #     policy_arns     = ["arn:aws:iam::111122223333:policy/s3-media-dev"]
 #     allowed_actions = ["s3:*"]
+#     infrastructure_access = true   # s3: the policy must not reach the policy bucket
 #   }
 #
 #   # A bundle may carry more than one policy, and allowed_actions is the union of
@@ -44,6 +53,7 @@
 #       "arn:aws:iam::111122223333:policy/athena-results-rw",
 #     ]
 #     allowed_actions = ["athena:*", "glue:Get*", "s3:*", "kms:Decrypt"]
+#     infrastructure_access = true   # s3 and kms
 #   }
 # }
 #

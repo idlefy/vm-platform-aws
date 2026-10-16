@@ -1,11 +1,10 @@
 POLICYFILES_DIR := policyfiles
 COOKBOOKS_DIR   := cookbooks
-KNIFE_CONFIG    := ./.chef/knife.rb
 
 POLICYFILES := $(wildcard $(POLICYFILES_DIR)/*.rb)
 LOCKFILES   := $(POLICYFILES:.rb=.lock.json)
 
-.PHONY: help lint test test-broker test-loki-token preflight add-region install push promote clean node-delete ssh
+.PHONY: help lint test test-broker test-loki-token test-policy-fetch preflight add-region install push promote clean ssh
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -43,6 +42,16 @@ test-loki-token: ## Run the Loki token script test (stubs aws, no AWS account ne
 	@test/test-loki-token.sh
 	@echo "✓ Token script tests passed"
 
+# The script under test lives in vms/modules/ec2/files/ — user_data installs it
+# at first boot, before any converge exists to deliver it — and the cookbook
+# carries a byte-identical copy that test-fetch-sync.sh holds equal. It gates
+# the cookbook stream because a revision that ships a broken copy breaks every
+# converge after it.
+test-policy-fetch: ## Run the policy delivery script test (stubs aws and cinc-client; needs ssh-keygen >= 8.1)
+	@echo "==> Testing dev-vm-policy-fetch..."
+	@../test/test-policy-fetch.sh
+	@echo "✓ Policy delivery tests passed"
+
 # `chef update`, NOT `chef install`. The base cookbook is a local path
 # (policyfiles/dev-vm.rb uses `path: '../cookbooks/base'`), so its content changes
 # in every cookbook commit. `chef install` honours an existing lockfile and prints
@@ -62,15 +71,14 @@ install: ## Re-resolve policyfiles and rewrite lockfiles
 #
 # These deployed a fleet from this repository, which is what the fork model
 # did. This repository publishes artifacts: there is no `vms/` root here (only
-# `vms/modules/`), no `.chef/knife.rb`, and no CINC organisation, so preflight,
-# add-region and ssh fail on a path that is not here. `promote` was worse than
-# broken — it carries none of the gates the tenant Makefile grew (no pin-check,
-# no preflight, no refusal when staging does not already carry the revision),
-# so with a knife.rb present it would push straight to production ungated.
+# `vms/modules/`) and no policy bucket, so preflight, add-region and ssh fail
+# on a path that is not here. `promote` was worse than broken when it existed:
+# it carried none of the gates the tenant Makefile grew (no pin-check, no
+# preflight, no refusal when staging does not already carry the revision).
 #
 # The gated versions live in tenant-skeleton/cinc/Makefile and reach a tenant
 # through `make prepare`. Run them from the tenant repository.
-DEPLOY_TARGETS := preflight add-region push promote node-delete ssh
+DEPLOY_TARGETS := preflight add-region push promote ssh
 
 $(DEPLOY_TARGETS):
 	@echo "'make $@' is a tenant operation and does not live in the platform repository."

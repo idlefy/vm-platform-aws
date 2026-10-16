@@ -196,7 +196,7 @@
         "id": 3,
         "type": "stat",
         "title": "Converge failures",
-        "description": "A failed converge is invisible on an OSS CINC server, so the VM stops tracking its own security settings while continuing to look healthy.",
+        "description": "With no CINC server, nothing central sees a failed converge, so the VM stops tracking its own security settings while continuing to look healthy.",
         "gridPos": {
           "h": 4,
           "w": 4,

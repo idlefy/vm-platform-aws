@@ -1,6 +1,8 @@
 # Developer VM log shipping — design
 
 > Design record, written during development; identifiers anonymised. Numbers are as measured.
+>
+> Historical: this record predates [serverless policy delivery](serverless-policy-delivery.md) (2.0.0). Where it mentions a CINC server, a validator key, `knife` or `infra/`, those are gone; the rest stands.
 
 **Status:** approved for planning (revised after architecture review)
 **Date:** 2026-08-04

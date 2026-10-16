@@ -19,14 +19,13 @@ Never override without explicit user instruction in the current conversation.
 1. **Never `terraform apply` without showing the plan first** and getting explicit user approval. Same for `terraform destroy`.
 2. **Never run `make promote` without `make push` + staging verification first.**
 3. **Never manual-ops on VMs** (`apt-get`, `systemctl`, file edits). If something's wrong, fix the CINC recipe and re-converge. Manual edits get reverted on the next 30-min run anyway.
-4. **Never read `infra/ansible/group_vars/all/vault.yml` contents.** It's encrypted with `ansible-vault` — even decrypted, the contents are secrets that should not appear in conversation history.
-5. **Never use `git push --force` on `main`** without the user explicitly saying "force push".
-6. **Use the Makefile, not raw `chef` / `knife` commands.** The Makefile encodes the lint + install + push flow correctly.
-7. **Run `terraform plan` before recommending anything destructive** — your model of state may be stale.
-8. **Never echo a secret's value.** The CINC validator key is reachable via
+4. **Never use `git push --force` on `main`** without the user explicitly saying "force push".
+5. **Use the Makefile, not raw `chef`, `aws s3` or `ssh-keygen -Y sign`.** `make push` and `make promote` encode the gates — pin-check, install from the lock, the archive check, the conditional writes — and a hand-written envelope skips every one of them.
+6. **Run `terraform plan` before recommending anything destructive** — your model of state may be stale.
+7. **Never echo a secret's value.** The Loki token is reachable via
    `aws ssm get-parameter --with-decryption` from a workstation holding these
-   credentials. Report exit status; never the value. Rule 4 covers `vault.yml`;
-   this covers SSM, which is not encrypted at rest from your point of view.
+   credentials. Report exit status; never the value. SSM is not encrypted at
+   rest from your point of view.
 
 ---
 
@@ -35,7 +34,7 @@ Never override without explicit user instruction in the current conversation.
 1. Edit `vms/instances.auto.tfvars`: add an entry under the region, plus the developer's SSH key. Optionally set `aws_access = ["<bundle>", …]` to grant AWS permissions — bundle names must already exist in `vms/access_bundles.auto.tfvars`.
 2. Run `cd vms && terraform plan` and show the user the plan.
 3. Only `apply` after the user approves.
-4. The VM auto-bootstraps via `user_data` — wait ~3 minutes, then SSH via EC2 Instance Connect to verify CINC ran.
+4. The VM auto-bootstraps via `user_data` — wait ~3 minutes, then SSH via EC2 Instance Connect to verify the first converge (`sudo systemctl status cinc-client`). A VM whose group has no envelope yet — a production VM before the first `make promote` — fails closed by design; see *Policy delivery*.
 
 Every VM is tagged `idlefy = "enabled"` by default (`idlefy_managed` in
 `vms/tenant.auto.tfvars`), which is what lets Idlefy find it and stop/start it.
@@ -55,14 +54,11 @@ and a namespace wrongly added to it silently widens the ceiling.
 
 ### Delete a VM
 
-All three steps are required — Terraform doesn't know about CINC state:
-
 1. Remove the entry from `vms/instances.auto.tfvars`.
 2. `cd vms && terraform plan` (verify only the target VM is destroyed) → `terraform apply`.
-3. `cd cinc && make node-delete NODE=<name>` — removes the node and its client from CINC.
-4. **If the developer ever ran `sudo tailscale login` on it, remove the node from
-   the tailnet too.** Terraform does not know about it and `make node-delete` does
-   not touch it, so `terraform destroy` leaves an authorised node registered under
+3. **If the developer ever ran `sudo tailscale login` on it, remove the node from
+   the tailnet too.** Terraform does not know about it, so `terraform destroy`
+   leaves an authorised node registered under
    a named person until its key expires. VM names are reused by convention here,
    so the next VM with the same hostname joins as `<name>-1` while the stale one
    still holds the original name. Removal is done by the device's owner or a
@@ -109,9 +105,9 @@ The cookbook is not here. To adopt a published release:
 make bump-cookbook TAG=base-X.Y.Z   # rewrites the policyfile pin and the lock
 git diff                            # review both files before committing
 cd cinc
-make push       # → staging policy group (gated by pin-check)
-# wait for a staging VM to converge, or `sudo cinc-client` on it
-make promote    # → production
+make push       # → staging.json (gated by pin-check; signs with ~/.ssh/id_ed25519)
+# wait for a staging VM to converge, or `sudo systemctl start cinc-client` on it
+make promote    # → production.json
 ```
 
 `make promote` requires interactive `yes`; don't bypass it.
@@ -219,10 +215,10 @@ known-good rule catches — reading `/etc/sudoers` trips `Read sensitive file
 untrusted`.
 
 
-**A test VM is not cleaned up by `terraform destroy` alone.** Follow all four
-steps in *Delete a VM*, including `make node-delete`, or the CINC node lingers
-and the next VM reusing that name inherits stale registration. A VM that was ever
-logged into the tailnet needs step 4 as well.
+**A test VM that was ever logged into the tailnet is not cleaned up by
+`terraform destroy` alone.** Step 3 of *Delete a VM* is the part nothing
+automates: the node stays registered under the developer's name, and the next
+VM reusing that hostname joins as `<name>-1`.
 
 
 **Every `tailscale login` discards the current profile before contacting the
@@ -263,22 +259,51 @@ region; that is the module's input guard for `log_shipping` /
 
 ## Per-region secrets
 
-Two SSM parameters must exist as `SecureString` in **every** region
-`config.tf` configures, and Terraform manages neither — it manages only the IAM
-grant that *names* them, so a missing or misnamed parameter applies clean and
-fails later, at first boot or at first log push:
+With `log_shipping = true`, one SSM parameter must exist as `SecureString` in
+**every** region `config.tf` configures: `loki_ssm_parameter_name`, placed by
+hand from the Grafana Cloud token. Terraform manages only the IAM grant that
+*names* it, so a missing or misnamed parameter applies clean, and the VM then
+converges and ships no logs while reporting healthy.
 
-| Parameter | Created by | Failure if absent |
-|---|---|---|
-| `cinc_ssm_parameter_name` | by hand, from `/etc/cinc-project/<org>-validator.pem` on the CINC server (the Ansible role creates it there) | the VM never converges, three minutes after apply reported success |
-| `loki_ssm_parameter_name` | by hand, from the Grafana Cloud token — only when `log_shipping = true` | the VM converges and ships no logs while reporting healthy |
+The region count is not fixed: adding a region means creating the parameter in
+it. Policy delivery needs nothing per region. `cd cinc && make preflight` is
+what proves the parameter exists, that the token still authenticates, and that
+every `policy_arns` entry resolves — read-only, and it ingests nothing.
 
-The region count is not fixed: adding a region means creating both parameters in
-it. `cd cinc && make preflight` is what proves they exist, that the Loki token
-still authenticates, and that every `policy_arns` entry resolves — read-only,
-and it ingests nothing.
+Never print the value. Report exit status instead.
 
-Never print either value. Report exit status instead.
+---
+
+## Policy delivery
+
+There is no CINC server. `make push` exports each policy from its lock, stores
+the archive once under its `revision_id` in the tenant's bucket, and writes a
+signed `staging.json`; `make promote` writes a new `production.json` for the
+same revision, signed for production. Every 30 minutes each VM fetches its
+group's envelope, verifies the signature against the keys it trusts, and
+converges in local mode. The design and its evidence are in the pinned
+upstream, `docs/design/serverless-policy-delivery.md`.
+
+**A production VM created before the first `make promote` fails closed.**
+There is no `production.json` for it to verify, so it keeps developer sudo
+revoked and puts its log on the serial console. Push, verify a staging VM,
+promote — then create production VMs.
+
+**The signers set has two twins, and a VM created while they differ fails
+closed.** `policy_signers` in `vms/tenant.auto.tfvars` is what a new VM trusts
+at first boot; `default['base']['policy']['signers']` in the policyfile is what
+every converged VM trusts from then on. `make preflight` warns while they
+differ. Rotate in two revisions: add the new key and push and promote with the
+old one; then remove the old key in a revision signed with the new one, and
+update `policy_signers` to match. The converge refuses a set that drops the
+key that signed it.
+
+**A VM that rejects every envelope** (a serial stuck in the future, or a
+signers set nobody holds a key for) is recovered on the VM, not from the
+bucket: the runbook's break-glass procedure deletes
+`/var/lib/dev-vm/policy/last-serial` as `admin`. It is the one exception to
+hard rule 3, and only on the user's explicit instruction. Never hand-write an envelope
+or put objects into the bucket outside `make push` / `make promote`.
 
 ---
 

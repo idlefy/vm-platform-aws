@@ -4,7 +4,7 @@
 # This file is auto-loaded by Terraform (.auto.tfvars) and IS checked into git
 # — it's the team's running ledger of who has a VM where.
 #
-# Per-tenant globals (Route53, AWS profile, CINC URL) live in tenant.auto.tfvars
+# Per-tenant globals (Route53, AWS profile, policy bucket) live in tenant.auto.tfvars
 # (gitignored). VPC/subnets/SG/regions are in config.tf.
 # ============================================================================
 
@@ -22,12 +22,12 @@
 #                                                            #   Set this to hold a VM on an older release; running VMs
 #                                                            #   ignore AMI changes (lifecycle.ignore_changes) and are
 #                                                            #   never recreated by a new default.
-#       policy_group   = "production"                        # Optional: CINC policy group, defaults to "production"
+#       policy_group   = "production"                        # Optional: policy group, defaults to "production"
 #                                                            #   Set to "staging" for a test VM so it converges against
 #                                                            #   what `make push` published, before `make promote` puts
 #                                                            #   that revision on the whole fleet. Only read at first
 #                                                            #   boot — changing it later needs a rebuild.
-#       policy_name    = "dev-vm"                            # Optional: CINC policyfile name, defaults to "dev-vm"
+#       policy_name    = "dev-vm"                            # Optional: policyfile name, defaults to "dev-vm"
 #                                                            #   One policyfile per VM (CINC design — not composable like roles).
 #                                                            #   Available policies: dev-vm
 #                                                            #   To add a new policy: create cinc/policyfiles/<name>.rb, then make push + promote

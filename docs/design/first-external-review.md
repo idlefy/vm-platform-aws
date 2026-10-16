@@ -1,6 +1,8 @@
 # First external review — design
 
 > Design record, written during development; identifiers anonymised. Numbers are as measured.
+>
+> Historical: this record predates [serverless policy delivery](serverless-policy-delivery.md) (2.0.0). Where it mentions a CINC server, a validator key, `knife` or `infra/`, those are gone; the rest stands.
 
 **Date:** 2026-09-09
 **Status:** approved by the maintainer (fix everything the review found, or refute it with a measurement). Implemented as two pull requests, one per tag stream.

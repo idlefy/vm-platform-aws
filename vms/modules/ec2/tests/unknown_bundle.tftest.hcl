@@ -28,9 +28,11 @@ variables {
 
   security_group_rules    = {}
   route53_zone_id         = "Z00000000000000000TEST"
-  cinc_ssm_parameter_name = "/test/cinc-validator"
   loki_ssm_parameter_name = "/test/loki-token"
-  cinc_server_url         = "https://cinc.test.invalid/organizations/test"
+  policy_bucket           = "tenant-policies"
+  policy_bucket_owner     = "123456789012"
+  policy_bucket_region    = "eu-central-1"
+  policy_signers          = ["ops namespaces=\"dev-vm-policy-staging,dev-vm-policy-production\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMkEu+CUWYGvccB0PoBw6SX1d6kJOSy2vALB7cAntO+E"]
   ssh_key_pairs           = { "dev" = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITEST dev@test" }
 }
 
@@ -51,9 +53,10 @@ run "unknown_bundle_name_stops_the_plan" {
     }
     access_bundles = {
       "s3-media-dev" = {
-        description     = "correctly spelled"
-        policy_arns     = []
-        allowed_actions = ["s3:*"]
+        description           = "correctly spelled"
+        policy_arns           = []
+        allowed_actions       = ["s3:*"]
+        infrastructure_access = true
       }
     }
   }
@@ -79,9 +82,10 @@ run "correctly_spelled_bundle_plans" {
     }
     access_bundles = {
       "s3-media-dev" = {
-        description     = "correctly spelled"
-        policy_arns     = ["arn:aws:iam::111122223333:policy/s3-media-dev"]
-        allowed_actions = ["s3:*"]
+        description           = "correctly spelled"
+        policy_arns           = ["arn:aws:iam::111122223333:policy/s3-media-dev"]
+        allowed_actions       = ["s3:*"]
+        infrastructure_access = true
       }
     }
   }

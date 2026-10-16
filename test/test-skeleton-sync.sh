@@ -23,7 +23,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PASS=0
 FAIL=0
 
-SHIPPED="resolve-pin.sh pin-check.sh preflight.sh add-region.sh placeholder-check.sh"
+SHIPPED="resolve-pin.sh pin-check.sh preflight.sh add-region.sh placeholder-check.sh policy-publish.sh"
 
 check() {
   if [ "$2" = "0" ]; then PASS=$((PASS+1)); echo "  ok   $1"

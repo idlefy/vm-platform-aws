@@ -22,7 +22,7 @@ output "regions" {
 }
 
 # Flat VM-name -> instance-id across all regions. VM names are unique fleet-wide
-# (they become IAM role names and CINC node names), so flattening cannot collide,
+# (they become IAM role names and node names), so flattening cannot collide,
 # and it saves every caller from having to know which region a VM is in — both
 # `make ssh` and the node-deletion flow start from a name.
 output "instance_ids" {

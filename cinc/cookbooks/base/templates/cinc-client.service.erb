@@ -1,5 +1,5 @@
 [Unit]
-Description=CINC Client periodic run
+Description=CINC Client periodic run (policy from S3, local mode)
 After=network-online.target
 Wants=network-online.target
 
@@ -9,7 +9,13 @@ Type=oneshot
 # the client anyway. Without it a bad pin or a network blip would stop the VM
 # converging at all — and converging is how the pin gets corrected.
 ExecStartPre=-/usr/local/sbin/cinc-client-upgrade
-ExecStart=/usr/bin/cinc-client
+# Fetches and verifies this VM's signed policy envelope, then runs cinc-client
+# in local mode. Written by user_data, never by this cookbook.
+ExecStart=/usr/local/sbin/dev-vm-policy-run
+# The dashboard's error panel and the converge alerts read this identifier;
+# without it the script's lines and the converge output would arrive as
+# dev-vm-policy-run instead.
+SyslogIdentifier=cinc-client
 Nice=10
 IOSchedulingClass=idle
 
