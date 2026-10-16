@@ -3,7 +3,7 @@ POLICYFILES_DIR := policyfiles
 POLICYFILES := $(wildcard $(POLICYFILES_DIR)/*.rb)
 LOCKFILES   := $(POLICYFILES:.rb=.lock.json)
 
-.PHONY: help preflight add-region push promote clean ssh
+.PHONY: help preflight add-region push promote ami clean ssh
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -118,6 +118,11 @@ promote: ## Promote staging policies to production (preflight + staging revision
 	done
 	@echo ""
 	@echo "✓ Policies promoted to production"
+
+# Builds a private AMI from the promoted production revision. Talks to AWS
+# (EC2, IAM for Packer's temporary role) — not read-only. See ../IMAGE.md.
+ami: ## Build the fleet image from production (usage: make ami [POLICY=dev-vm])
+	@POLICY=$(or $(POLICY),dev-vm) ../scripts/ami-build.sh
 
 # `USER` is exported by every login shell and make imports the environment as
 # variables, so `$(or $(USER),admin)` resolved to the operator's own login name

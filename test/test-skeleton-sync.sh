@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The skeleton ships copies of four scripts. This proves the copies have not
+# The skeleton ships copies of several scripts. This proves the copies have not
 # drifted from the originals.
 #
 # It exists because they had. tenant-skeleton/scripts/resolve-pin.sh was copied
@@ -24,7 +24,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PASS=0
 FAIL=0
 
-SHIPPED="resolve-pin.sh pin-check.sh preflight.sh add-region.sh placeholder-check.sh policy-publish.sh"
+SHIPPED="resolve-pin.sh pin-check.sh preflight.sh add-region.sh placeholder-check.sh policy-publish.sh ami-build.sh"
 
 check() {
   if [ "$2" = "0" ]; then PASS=$((PASS+1)); echo "  ok   $1"
