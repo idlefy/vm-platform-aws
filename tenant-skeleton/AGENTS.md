@@ -10,6 +10,9 @@ checkout, which `terraform init` has already placed at
 `local.platform_pin.sha` names. When something below says *why*, that is
 where the long form is.
 
+**Agent guides.** A fresh clone whose configuration is not filled in yet →
+follow [`SETUP.md`](SETUP.md).
+
 ---
 
 ## Hard rules

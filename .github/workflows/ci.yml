@@ -69,7 +69,7 @@ jobs:
                    test/test-prepare.sh \
                    test/test-pin-to-worktree.sh \
                    test/test-preflight.sh \
-                   test/test-get-started-skill.sh; do
+                   test/test-get-started.sh; do
             echo "=== $t"
             "$t"
           done

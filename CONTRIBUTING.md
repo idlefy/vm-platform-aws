@@ -19,7 +19,7 @@ make boundary-check                                    # modules stay inside the
 make smoke                                             # the skeleton against this tree
 for t in test/test-release-gate.sh test/test-resolve-pin.sh test/test-boundary-check.sh \
          test/test-placeholder-check.sh test/test-prepare.sh test/test-pin-to-worktree.sh \
-         test/test-preflight.sh test/test-skeleton-sync.sh test/test-get-started-skill.sh; do "$t"; done
+         test/test-preflight.sh test/test-skeleton-sync.sh test/test-get-started.sh; do "$t"; done
 ( cd cinc && make lint && make test && make test-broker && make test-loki-token )
 make test-pin-check                                    # root target; needs chef
 mkdocs build --strict

@@ -47,6 +47,17 @@ for f in $SHIPPED; do
   fi
 done
 
+echo "== agent guides: one AGENTS.md per tree, guides as plain root files =="
+for tree in "$ROOT" "$ROOT/tenant-skeleton"; do
+  rel=${tree#"$ROOT"}; rel=${rel#/}; rel=${rel:-.}
+  check "$rel/AGENTS.md exists" "$([ -f "$tree/AGENTS.md" ]; echo $?)"
+  check "$rel has no CLAUDE.md (it would shadow AGENTS.md)" "$([ ! -e "$tree/CLAUDE.md" ]; echo $?)"
+  check "$rel has no .claude/skills" "$([ ! -e "$tree/.claude/skills" ]; echo $?)"
+done
+check "tenant-skeleton/SETUP.md exists" "$([ -f "$ROOT/tenant-skeleton/SETUP.md" ]; echo $?)"
+check "the skeleton's AGENTS.md points at SETUP.md" \
+  "$(grep -q 'SETUP.md' "$ROOT/tenant-skeleton/AGENTS.md" 2>/dev/null; echo $?)"
+
 echo "== the guard itself notices a drift =="
 # Without this, a comparison that always succeeded would make every check above
 # pass while proving nothing.

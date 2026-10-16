@@ -1,9 +1,7 @@
----
-name: tenant-setup
-description: Use when this repository has just been cloned and its tenant configuration is not yet filled in — walks through collecting values, materialising config, resolving the platform pin, and verifying, without deploying anything.
----
-
 # Tenant setup
+
+Follow this when this repository has just been cloned and its tenant
+configuration is not yet filled in. It deploys nothing.
 
 Take a fresh clone to "deployable": one `terraform apply` for the VMs, and a
 `make push` / `make promote` for the policy they converge. You write config and
@@ -32,7 +30,7 @@ esac
 
 All `OK`, `PIN resolved` and `POLICY filled in` → this repository is
 configured. Stop and say so; the operator wants day-to-day work, which
-`CLAUDE.md` covers.
+`AGENTS.md` covers.
 
 `PIN could not be checked` is neither of those: do not proceed to setup and do
 not re-run `make prepare PLATFORM_TAG=…` — report it. Re-running setup against
