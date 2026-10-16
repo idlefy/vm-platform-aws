@@ -20,6 +20,9 @@ mkdir -p "$T/bin"
 for c in systemctl journalctl cloud-init fstrim poweroff; do
   printf '#!/usr/bin/env bash\necho "%s $*" >> "$SHIM_LOG"\n' "$c" > "$T/bin/$c"; chmod +x "$T/bin/$c"
 done
+# `systemctl is-enabled` answers "nothing enabled" unless SHIM_ENABLED=0.
+# shellcheck disable=SC2016
+printf '[ "$1" = is-enabled ] && exit "${SHIM_ENABLED:-1}"\nexit 0\n' >> "$T/bin/systemctl"
 
 build_root() {  # build_root DIR STATUS_LINE
   local r=$1 verb path
@@ -55,12 +58,29 @@ for u in cinc-client.timer aws-vm-credentials.timer alloy; do
 done
 lineno() { grep -n "$1" "$T/log" | head -1 | cut -d: -f1; }
 dis=$(lineno 'systemctl disable'); cln=$(lineno 'cloud-init clean')
-for u in user@1000.service snap.amazon-ssm-agent.amazon-ssm-agent.service containerd fail2ban rsyslog falco-modern-bpf tailscaled; do
+for u in user@1000.service snap.amazon-ssm-agent.amazon-ssm-agent.service containerd fail2ban rsyslog falco-modern-bpf tailscaled \
+         syslog.socket systemd-update-utmp systemd-random-seed; do
   stp=$(lineno "systemctl stop $u"); [ -n "$stp" ] || stp=0
   check "stops $u after disable and before cloud-init clean" "$(rc between "$stp" "${dis:-0}" "${cln:-0}")"
 done
+# A converge the timer queued behind the bootstrap's own runs the moment the
+# lock frees, and re-enables the timers (measured on the first live build).
+tst=$(lineno 'systemctl stop cinc-client.timer'); svc=$(lineno 'systemctl stop .*cinc-client.service')
+check "stops cinc-client.timer, then cinc-client.service, then disables" \
+  "$(rc between "${svc:-0}" "${tst:-0}" "${dis:-0}")"
+sock=$(lineno 'systemctl stop syslog.socket'); rsl=$(lineno 'systemctl stop rsyslog')
+check "stops syslog.socket before rsyslog, so nothing re-activates it" "$(rc between "${sock:-0}" 0 "${rsl:-0}")"
+rlq=$(lineno 'journalctl --relinquish-var')
+check "moves journald off /var before cloud-init clean" "$(rc between "${rlq:-0}" "${dis:-0}" "${cln:-0}")"
+check "checks the timers are off before powering off" "$(grep -q 'systemctl is-enabled' "$T/log"; echo $?)"
 check "cleans cloud-init with the machine id" "$(grep -q 'cloud-init clean --logs --machine-id' "$T/log"; echo $?)"
 check "powers off last" "$(tail -1 "$T/log" | grep -q '^poweroff'; echo $?)"
+
+echo "== a unit still enabled at the end means no image =="
+: > "$T/log"; build_root "$R" "2026-10-16T00:00:00Z ok $REV"
+SHIM_ENABLED=0 run_scrub "$R"; got=$?
+check "a timer re-enabled behind the scrub → exit 70" "$(rc [ "$got" = 70 ])"
+check "  …and does not power off" "$(rc [ -z "$(grep '^poweroff' "$T/log")" ])"
 
 echo "== it refuses anything but ok for the expected revision =="
 for st in "2026-10-16T00:00:00Z converge-failed $REV" \

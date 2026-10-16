@@ -36,18 +36,32 @@ echo "$REV" > "$R/etc/dev-vm/image-revision"
 chmod 0644 "$R/etc/dev-vm/image-revision"
 
 # Re-enabled by the first converge on every VM ([:enable, :start] in their recipes).
-systemctl disable --now cinc-client.timer aws-vm-credentials.timer alloy
+# The bootstrap's converge starts cinc-client.timer, which is past its
+# OnBootSec by then and queues a second converge behind the lock; that one
+# starts the moment the lock frees and re-enabled both timers 13 s into the
+# first live build's scrub. So: timers, then the services they start, then
+# disable. The check before poweroff below is what makes this load-bearing.
+TIMERS=(cinc-client.timer aws-vm-credentials.timer)
+systemctl stop "${TIMERS[@]}"
+systemctl stop cinc-client.service aws-vm-credentials.service
+systemctl disable --now "${TIMERS[@]}" alloy
 # Stop what writes state before its state is removed. Rootless docker and
 # traefik live under user@1000.
 # One unit at a time: one that is missing or will not stop must not abort the
 # image build.
+# syslog.socket goes before rsyslog, or journald's next forwarded line
+# re-activates it. systemd-update-utmp and systemd-random-seed write on stop
+# (a shutdown record in wtmp, a fresh seed), so they are stopped here, before
+# the lists below remove what they wrote, rather than at poweroff, after.
 for u in user@1000.service falco-modern-bpf tailscaled \
-         snap.amazon-ssm-agent.amazon-ssm-agent.service containerd fail2ban rsyslog; do
+         snap.amazon-ssm-agent.amazon-ssm-agent.service containerd fail2ban \
+         syslog.socket rsyslog systemd-update-utmp systemd-random-seed; do
   systemctl stop "$u" || log "note: $u not stopped"
 done
-# Flush what journald still holds in memory or in the active file.
+# journald keeps writing /var/log/journal until poweroff; send it to /run so
+# the files removed below stay removed.
 journalctl --rotate || true
-journalctl --vacuum-time=1s || true
+journalctl --relinquish-var || true
 
 # Entries are quoted so a glob is expanded below, under $R, not here.
 REMOVE=(
@@ -124,6 +138,13 @@ for g in "${REMOVE[@]}"; do
 done
 for p in "${EMPTY[@]}"; do
   if [ -e "$R$p" ]; then : > "$R$p"; fi
+done
+
+for u in "${TIMERS[@]}" alloy; do
+  if systemctl is-enabled --quiet "$u"; then
+    log "internal error: $u was re-enabled behind the scrub; no image will be taken"
+    exit 70
+  fi
 done
 
 cloud-init clean --logs --machine-id
