@@ -64,7 +64,8 @@ end
 # authentication, and the one permitted command is NOPASSWD already. But it is
 # user-scoped, not command-scoped: any FUTURE sudoers entry for ubuntu written with
 # PASSWD would silently become passwordless. Adding a second entry for ubuntu means
-# revisiting this line.
+# revisiting this line — revisited 2026-10-22 for the second entry
+# (51-idlefy-share, below): both are NOPASSWD, so it still widens nothing.
 #
 # The narrowness of the command spec rests on three distro defaults. Record them,
 # because the guarantee dies if they change: `env_reset` (re-initialises HOME,
@@ -96,6 +97,29 @@ file '/etc/sudoers.d/50-tailscale-login' do
   group 'root'
   mode '0440'
   verify 'visudo -cf %{path}'
+end
+
+# The second grant, solo profile only: `idlefy-share <port>|off` publishes one
+# 127.0.0.1 port through Tailscale Funnel (installed by base::share_helper). The
+# `*` is deliberate — the helper refuses every argv but one port or "off" and
+# passes nothing else on, so the script, not this line, is the argument check.
+# No Defaults line here: 50-tailscale-login's user-scoped `!authenticate`
+# already covers ubuntu, and this entry is NOPASSWD as well.
+#
+# Same Falco coupling as the grant above (AGENTS.md trap 7): a policy that turns
+# share_helper.enabled on must carry the matching base::falco exclusion or not
+# run base::falco at all. Written when enabled, deleted when not, from this one
+# resource, so a fleet that never enables it converges the file away.
+file '/etc/sudoers.d/51-idlefy-share' do
+  content <<~SUDOERS
+    # Managed by CINC — base::sudoers. Do not edit on the VM.
+    ubuntu ALL=(root) NOPASSWD: /usr/local/sbin/idlefy-share *
+  SUDOERS
+  owner 'root'
+  group 'root'
+  mode '0440'
+  verify 'visudo -cf %{path}'
+  action node['base']['share_helper']['enabled'] ? :create : :delete
 end
 
 # The lxd group is an Ubuntu cloud-image default and is root-equivalent the moment

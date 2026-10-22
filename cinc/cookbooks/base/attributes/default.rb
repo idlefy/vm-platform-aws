@@ -29,3 +29,16 @@ default['base']['policy']['signers'] = []
 # deliberately NOT in this list: SSH is opened unconditionally by its own
 # resources, so no value here can lock admins out.
 default['base']['firewall']['public_web_ports'] = [80, 443]
+
+# Install /usr/local/sbin/idlefy-share and grant it to ubuntu
+# (/etc/sudoers.d/51-idlefy-share, `ubuntu ALL=(root) NOPASSWD:
+# /usr/local/sbin/idlefy-share *`). That lets the developer — or the agent
+# working as them — publish one 127.0.0.1 port to the internet through
+# Tailscale Funnel. base::sudoers writes the grant when true and deletes it
+# when false; base::share_helper installs the script and is included only by
+# base::solo, which sets this to true.
+#
+# Must stay false on any policy that runs base::falco without a matching
+# exclusion for `sudo idlefy-share`: the grant and the Falco exclusion are one
+# change (AGENTS.md trap 7), and without it every share pages someone.
+default['base']['share_helper']['enabled'] = false

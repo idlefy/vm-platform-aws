@@ -1,0 +1,43 @@
+#!/bin/bash
+# idlefy-share — publish ONE local port to the internet through Tailscale Funnel,
+# or turn the share off. The only command (besides `tailscale login`) that
+# ubuntu may run as root; sudoers grants it with `*`, so THIS FILE is the whole
+# control: one argument, a port or "off", nothing else is ever passed on.
+#
+#   sudo idlefy-share <port 1024-65535>   reset any share, then funnel
+#                                          http://127.0.0.1:<port> on public 443
+#   sudo idlefy-share off                 reset (remove the share)
+#   anything else                          usage on stderr, exit 64, no tailscale call
+#
+# Tailscale's own output passes through unchanged — the public URL, or its
+# instructions to enable Funnel in the admin console — and its exit status is
+# this script's. One share at a time: every share starts with a reset. The VM
+# must have joined a tailnet first (`sudo tailscale login`), and the tailnet
+# owner must have enabled Funnel once.
+#
+# Threat model: "the agent on this VM can publish a local port". That is the
+# capability granted, deliberately, and nothing narrower is claimed:
+#   - There is no TTY check. One would be bypassable with `script -c`, and the
+#     agent can already open outbound tunnels of its own without root.
+#   - ANY listener on 127.0.0.1 can be published, root-owned ones included. The
+#     port number is the only check; what listens behind it is not inspected.
+#   - A path or URL argument is refused, never forwarded: Funnel run as root
+#     can serve a filesystem path, which would publish any file on the box.
+#
+# The environment is not an input: PATH is pinned, LC_ALL=C makes the regex and
+# the numeric comparisons locale-independent, and the tailscale binary is an
+# absolute path.
+set -euo pipefail
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL=C
+umask 022
+TAILSCALE=/usr/bin/tailscale
+usage() { echo 'usage: idlefy-share <port 1024-65535> | off' >&2; exit 64; }
+[ "$#" -eq 1 ] || usage
+case "$1" in
+  off) exec "$TAILSCALE" funnel reset ;;
+  *) [[ $1 =~ ^[1-9][0-9]{3,4}$ ]] || usage
+     port=$((10#$1)); [ "$port" -ge 1024 ] && [ "$port" -le 65535 ] || usage
+     "$TAILSCALE" funnel reset >/dev/null 2>&1 || true   # one share at a time; nothing configured is not an error
+     exec "$TAILSCALE" funnel --bg "http://127.0.0.1:$port" ;;
+esac

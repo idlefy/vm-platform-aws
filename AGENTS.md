@@ -40,7 +40,7 @@ for t in test/test-release-gate.sh test/test-resolve-pin.sh test/test-boundary-c
          test/test-preflight.sh test/test-skeleton-sync.sh test/test-fetch-sync.sh \
          test/test-policy-publish.sh test/test-get-started.sh \
          test/test-image-template.sh test/test-image-scrub.sh test/test-ami-build.sh; do "$t"; done
-( cd cinc && make lint && make test && make test-broker && make test-loki-token && make test-policy-fetch )
+( cd cinc && make lint && make test && make test-broker && make test-loki-token && make test-share-helper && make test-policy-fetch )
 make test-pin-check                                    # root target; needs chef
 mkdocs build --strict
 ```
@@ -258,7 +258,7 @@ that consumers cannot reach:
 
 | Stream | Publishes | Gates | Lockstep |
 |---|---|---|---|
-| `base-X.Y.Z` | `cinc/cookbooks/base/**` | `cookstyle`, `chefspec`, `test-broker`, `test-loki-token`, `test-policy-fetch`, `test-fetch-sync` | `metadata.rb` must say `X.Y.Z`, byte for byte |
+| `base-X.Y.Z` | `cinc/cookbooks/base/**` | `cookstyle`, `chefspec`, `test-broker`, `test-loki-token`, `test-share-helper`, `test-policy-fetch`, `test-fetch-sync` | `metadata.rb` must say `X.Y.Z`, byte for byte |
 | `vX.Y.Z` | `vms/modules/**` + `tenant-skeleton/**` + `image/**` | `boundary-check`, `test-skeleton-sync`, `test-fetch-sync`, `test-policy-publish`, `test-image-template`, `test-image-scrub`, `test-ami-build`, `smoke` | none — the module carries no version string |
 
 ```bash

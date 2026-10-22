@@ -462,6 +462,7 @@ make lint       # Run cookstyle linter
 make test       # ChefSpec unit tests
 make test-broker      # Credential broker, against a stubbed aws — no AWS needed
 make test-loki-token  # Loki token script, likewise stubbed
+make test-share-helper  # idlefy-share helper, against a stubbed tailscale
 make install    # Re-resolve policyfiles and rewrite lockfiles (local development)
 make clean      # Remove lockfiles
 ```

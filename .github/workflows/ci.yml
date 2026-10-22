@@ -117,6 +117,10 @@ jobs:
         working-directory: cinc
         run: make test-loki-token
 
+      - name: test-share-helper
+        working-directory: cinc
+        run: make test-share-helper
+
       - name: test-policy-fetch
         working-directory: cinc
         run: make test-policy-fetch

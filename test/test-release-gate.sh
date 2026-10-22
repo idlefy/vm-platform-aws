@@ -72,6 +72,8 @@ test-broker:
 	@true
 test-loki-token:
 	@true
+test-share-helper:
+	@true
 test-policy-fetch:
 	@true
 STUB
