@@ -45,7 +45,15 @@ Traefik, no Falco, no Alloy and no SSM agent. No `v` release.
   policy with the same accepts as v4 (plus ICMPv6 and DHCPv6 replies), and
   `fd00:ec2::254`, IMDS over IPv6, becomes reachable only by root and the
   Instance Connect uid, as `169.254.169.254` already was. Rules are saved to
-  `/etc/iptables/rules.v6`.
+  `/etc/iptables/rules.v6`. The v6 default policies are set after every v6
+  accept, so a converge that fails midway cannot leave v6 at `DROP` without
+  them.
+- **Fleet-visible:** the SSH and `public_web_ports` guards, v4 and v6, match
+  the whole `--dport N -j ACCEPT` token. The old `dport 22.*ACCEPT` was
+  satisfied by a rule for 2222 (and 80 by 8080), silently skipping the real
+  port. Rules the old guards created still match, so a converged VM adds
+  nothing. Removing a port from `public_web_ports` does not close it on a
+  converged VM.
 - New gate: `make test-share-helper` (stubs `tailscale`; no tailnet needed),
   part of the `base` stream.
 

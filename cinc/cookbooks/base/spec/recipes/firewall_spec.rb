@@ -1,5 +1,7 @@
 # cinc/cookbooks/base/spec/recipes/firewall_spec.rb
 require 'chefspec'
+require 'open3'
+require 'tmpdir'
 
 describe 'base::firewall' do
   def converge(ports = nil)
@@ -44,5 +46,60 @@ describe 'base::firewall' do
     expect(chef_run).to run_execute('ip6tables-allow-ssh').with(command: 'ip6tables -A INPUT -p tcp --dport 22 -j ACCEPT')
     expect(chef_run.execute('ip6tables-allow-ssh')).to notify('execute[save-ip6tables]').to(:run).delayed
     expect(chef_run.execute('save-ip6tables').command).to eq('mkdir -p /etc/iptables && ip6tables-save > /etc/iptables/rules.v6')
+  end
+
+  # A converge that dies midway must never leave v6 at INPUT DROP with none of
+  # its accepts in place: the policies come after the last accept.
+  it 'sets the ip6tables default policies only after every v6 accept' do
+    names = converge.resource_collection.all_resources.map(&:name)
+    accepts = names.each_index.select { |i| names[i].start_with?('ip6tables-allow-') }
+    expect(accepts).not_to be_empty
+    %w(ip6tables-default-drop-input ip6tables-default-accept-output).each do |policy|
+      expect(names.index(policy)).to be > accepts.max
+    end
+    expect(names.index('ip6tables-default-drop-input')).to be < names.index('save-ip6tables')
+  end
+
+  # Each port guard runs for real against a fake iptables/ip6tables that prints
+  # a given rule set. The old guards (`dport 22.*ACCEPT`) were satisfied by a
+  # 2222 rule, so 22 was silently never opened; same for 80 vs 8080.
+  context 'port guards match the whole --dport N -j ACCEPT token' do
+    let(:chef_run) { converge }
+
+    def guard_holds?(resource_name, rules)
+      guard = chef_run.execute(resource_name).not_if.first.command
+      Dir.mktmpdir do |dir|
+        File.write(File.join(dir, 'rules'), rules)
+        %w(iptables ip6tables iptables-save ip6tables-save).each do |bin|
+          path = File.join(dir, bin)
+          File.write(path, "#!/bin/sh\ncat '#{dir}/rules'\n")
+          File.chmod(0o755, path)
+        end
+        _out, status = Open3.capture2e({ 'PATH' => "#{dir}:/usr/bin:/bin" }, '/bin/sh', '-c', guard)
+        status.success?
+      end
+    end
+
+    lookalikes = <<~RULES
+      -P INPUT DROP
+      -A INPUT -p tcp -m tcp --dport 2222 -j ACCEPT
+      -A INPUT -p tcp -m tcp --dport 8080 -j ACCEPT
+      -A INPUT -p tcp -m tcp --dport 4443 -j ACCEPT
+      -A INPUT -p tcp -m tcp --dport 1443 -j ACCEPT
+    RULES
+
+    { 22 => 'ssh', 80 => 'tcp-80', 443 => 'tcp-443' }.each do |port, suffix|
+      %w(iptables ip6tables).each do |family|
+        name = "#{family}-allow-#{suffix}"
+
+        it "#{name}: a look-alike port does not suppress it" do
+          expect(guard_holds?(name, lookalikes)).to be(false)
+        end
+
+        it "#{name}: its own rule does" do
+          expect(guard_holds?(name, lookalikes + "-A INPUT -p tcp -m tcp --dport #{port} -j ACCEPT\n")).to be(true)
+        end
+      end
+    end
   end
 end

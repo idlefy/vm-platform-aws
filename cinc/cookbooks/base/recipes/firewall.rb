@@ -122,20 +122,26 @@ execute 'iptables-allow-tailscale' do
 end
 
 # Allow SSH (port 22)
+#
+# Port guards here and below match the whole `--dport N -j ACCEPT` token of the
+# `-S` rendering (`-A INPUT -p tcp -m tcp --dport 22 -j ACCEPT`). The old
+# `dport 22.*ACCEPT` was satisfied by a rule for 2222 (and `dport 80.*` by
+# 8080), which silently skipped opening the real port. The rules the old
+# guards created render the same way, so a converged VM adds nothing.
 execute 'iptables-allow-ssh' do
   command 'iptables -A INPUT -p tcp --dport 22 -j ACCEPT'
-  not_if 'iptables-save | grep -q "dport 22.*ACCEPT"'
+  not_if "iptables -S INPUT | grep -qF -- '--dport 22 -j ACCEPT'"
   notifies :run, 'execute[save-iptables]', :delayed
 end
 
 # Public web ports, node['base']['firewall']['public_web_ports'] — [80, 443]
 # for the fleet (Traefik), [] for solo. These replace the old hard-coded
-# iptables-allow-http / iptables-allow-https; the guard is unchanged, so a VM
-# that already carries those rules recognises them and adds nothing.
+# iptables-allow-http / iptables-allow-https; the guard matches the rules those
+# created, so a VM that already carries them recognises them and adds nothing.
 node['base']['firewall']['public_web_ports'].each do |port|
   execute "iptables-allow-tcp-#{port}" do
     command "iptables -A INPUT -p tcp --dport #{port} -j ACCEPT"
-    not_if "iptables-save | grep -q \"dport #{port}.*ACCEPT\""
+    not_if "iptables -S INPUT | grep -qF -- '--dport #{port} -j ACCEPT'"
     notifies :run, 'execute[save-iptables]', :delayed
   end
 end
@@ -170,18 +176,6 @@ end
 #   only from a link-local source (fe80::/10) and only from server port 547:
 #   a DHCPv6 server on a link is always link-local, so nothing off-link can
 #   use this hole.
-
-execute 'ip6tables-default-drop-input' do
-  command 'ip6tables -P INPUT DROP'
-  not_if 'ip6tables -S | grep -q "\\-P INPUT DROP"'
-  notifies :run, 'execute[save-ip6tables]', :delayed
-end
-
-execute 'ip6tables-default-accept-output' do
-  command 'ip6tables -P OUTPUT ACCEPT'
-  not_if 'ip6tables -S | grep -q "\\-P OUTPUT ACCEPT"'
-  notifies :run, 'execute[save-ip6tables]', :delayed
-end
 
 # Guard anchored the same way as iptables-allow-established: `-S` renders the
 # state list as RELATED,ESTABLISHED, chain name first.
@@ -222,16 +216,33 @@ end
 
 execute 'ip6tables-allow-ssh' do
   command 'ip6tables -A INPUT -p tcp --dport 22 -j ACCEPT'
-  not_if 'ip6tables-save | grep -q "dport 22.*ACCEPT"'
+  not_if "ip6tables -S INPUT | grep -qF -- '--dport 22 -j ACCEPT'"
   notifies :run, 'execute[save-ip6tables]', :delayed
 end
 
 node['base']['firewall']['public_web_ports'].each do |port|
   execute "ip6tables-allow-tcp-#{port}" do
     command "ip6tables -A INPUT -p tcp --dport #{port} -j ACCEPT"
-    not_if "ip6tables-save | grep -q \"dport #{port}.*ACCEPT\""
+    not_if "ip6tables -S INPUT | grep -qF -- '--dport #{port} -j ACCEPT'"
     notifies :run, 'execute[save-ip6tables]', :delayed
   end
+end
+
+# The default policies come LAST, after every v6 accept above: a converge that
+# fails midway must never leave v6 at INPUT DROP without its DHCPv6, ICMPv6 and
+# SSH accepts — that would lose the address at lease expiry and the admin path
+# with it. (Until this first converge, v6 INPUT was ACCEPT, so appending the
+# accepts before the DROP opens nothing new.)
+execute 'ip6tables-default-drop-input' do
+  command 'ip6tables -P INPUT DROP'
+  not_if 'ip6tables -S | grep -q "\\-P INPUT DROP"'
+  notifies :run, 'execute[save-ip6tables]', :delayed
+end
+
+execute 'ip6tables-default-accept-output' do
+  command 'ip6tables -P OUTPUT ACCEPT'
+  not_if 'ip6tables -S | grep -q "\\-P OUTPUT ACCEPT"'
+  notifies :run, 'execute[save-ip6tables]', :delayed
 end
 
 execute 'save-ip6tables' do

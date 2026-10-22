@@ -41,6 +41,15 @@ describe 'base::hardened_firstboot' do
     }
   end
 
+  # A root script on every boot takes nothing from its environment: a fixed
+  # interpreter path, and PATH pinned before any command runs.
+  it 'runs under /bin/bash with PATH pinned at the top' do
+    lines = script_source.lines.map(&:chomp)
+    expect(lines.first).to eq('#!/bin/bash')
+    first = lines.drop(1).find { |l| !l.strip.empty? && !l.start_with?('#') }
+    expect(first).to eq('export PATH=/usr/sbin:/usr/bin:/sbin:/bin')
+  end
+
   it 'installs the firstboot script root-owned and executable' do
     expect(chef_run).to create_cookbook_file('/usr/local/sbin/idlefy-hardened-firstboot')
       .with(source: 'idlefy-hardened-firstboot', owner: 'root', group: 'root', mode: '0755')
@@ -72,6 +81,7 @@ describe 'base::hardened_firstboot' do
     expect(content).to be_a(String)
     expect(content).to include('After=cloud-init.service cloud-init-network.service')
     expect(content).to include('Before=ssh.service systemd-user-sessions.service')
+    expect(content).to include('Before=shutdown.target')
     expect(content).to include('Type=oneshot')
     expect(content).to include('RemainAfterExit=yes')
     expect(content).to include('ExecStart=/usr/local/sbin/idlefy-hardened-firstboot')

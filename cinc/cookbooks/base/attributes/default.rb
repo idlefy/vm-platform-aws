@@ -30,6 +30,10 @@ default['base']['policy']['signers'] = []
 # `default` of [] would leave [80, 443] in place. 22 is
 # deliberately NOT in this list: SSH is opened unconditionally by its own
 # resources, so no value here can lock admins out.
+#
+# Additive only: removing a port from this list does NOT close it on a VM that
+# has already converged with it — base::firewall only ever appends accepts.
+# Delete the rule by hand (iptables and ip6tables) and re-save rules.v4/v6.
 default['base']['firewall']['public_web_ports'] = [80, 443]
 
 # Install /usr/local/sbin/idlefy-share and grant it to ubuntu

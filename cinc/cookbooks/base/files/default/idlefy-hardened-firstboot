@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Managed by CINC — base::hardened_firstboot. Do not edit on the VM.
 #
 # Backstop for /etc/cloud/cloud.cfg.d/90-idlefy-hardened.cfg. Runs as root on
@@ -16,6 +16,11 @@
 # directory at the path) must not skip the group strip, and a failed group
 # lookup must not hide a fragment removal. Each failure is recorded and the
 # script exits non-zero at the end, so the unit shows failed.
+#
+# A root script on every boot: a fixed interpreter path, and PATH pinned
+# before any command runs, so nothing in the inherited environment picks the
+# rm, id or gpasswd that runs.
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 shopt -s lastpipe
 set -euo pipefail
 rm -f /etc/sudoers.d/90-cloud-init-users /etc/sudoers.d/ubuntu /etc/sudoers.d/ubuntu-debug --verbose \

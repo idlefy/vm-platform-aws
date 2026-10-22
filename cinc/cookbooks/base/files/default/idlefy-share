@@ -15,6 +15,10 @@
 # must have joined a tailnet first (`sudo tailscale login`), and the tailnet
 # owner must have enabled Funnel once.
 #
+# A share is `--bg`: tailscaled keeps it, across reboots too, until
+# `idlefy-share off`. And `off` is `tailscale funnel reset`, which removes ALL
+# serve and funnel config on the VM, not only what this script set up.
+#
 # Threat model: "the agent on this VM can publish a local port". That is the
 # capability granted, deliberately, and nothing narrower is claimed:
 #   - There is no TTY check. One would be bypassable with `script -c`, and the
@@ -24,9 +28,12 @@
 #   - A path or URL argument is refused, never forwarded: Funnel run as root
 #     can serve a filesystem path, which would publish any file on the box.
 #
-# The environment is not an input: PATH is pinned, LC_ALL=C makes the regex and
-# the numeric comparisons locale-independent, and the tailscale binary is an
-# absolute path.
+# The environment is not an input. This relies on sudo's distro-default
+# env_reset (and on the grant not being SETENV, so `sudo -E` / `sudo VAR=x`
+# are refused): the caller's variables do not pass through, beyond the small
+# env_keep set sudo itself vets. On top of that PATH is pinned, LC_ALL=C makes
+# the regex and the numeric comparisons locale-independent, and the tailscale
+# binary is an absolute path.
 set -euo pipefail
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export LC_ALL=C

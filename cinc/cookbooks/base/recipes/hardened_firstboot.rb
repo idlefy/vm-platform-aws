@@ -59,6 +59,7 @@ systemd_unit 'idlefy-hardened-firstboot.service' do
     Before=ssh.service systemd-user-sessions.service
     DefaultDependencies=no
     Conflicts=shutdown.target
+    Before=shutdown.target
 
     [Service]
     Type=oneshot

@@ -22,7 +22,7 @@ SOLO_FORBIDDEN_SERVICES = %w(cinc-client alloy falco-modern-bpf aws-vm-credentia
 SOLO_FORBIDDEN_TEXT = /dev-vm-policy-fetch|cinc-client|--operator/.freeze
 
 def solo_resource_text(r)
-  %i(command content).map { |m| r.respond_to?(m) ? r.public_send(m).to_s : '' }.join("\n")
+  %i(command content code).map { |m| r.respond_to?(m) ? r.public_send(m).to_s : '' }.join("\n")
 end
 
 RSpec.shared_examples 'solo: public web ports closed' do
@@ -97,9 +97,15 @@ describe 'base::solo' do
         expect(offenders.map(&:to_s)).to eq([])
       end
 
-      it 'mentions no policy fetch, cinc-client or Tailscale operator in any command or content' do
+      it 'mentions no policy fetch, cinc-client or Tailscale operator in any command, content or code' do
         offenders = resources.select { |r| solo_resource_text(r).match?(SOLO_FORBIDDEN_TEXT) }
         expect(offenders.map(&:to_s)).to eq([])
+      end
+
+      # bash/script resources carry their shell in `code`, not `command`.
+      it 'scans the code of script resources too' do
+        script = Struct.new(:code).new('cinc-client -z')
+        expect(solo_resource_text(script)).to match(SOLO_FORBIDDEN_TEXT)
       end
     end
 
