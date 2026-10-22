@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Managed by CINC — base::hardened_firstboot. Do not edit on the VM.
+#
+# Backstop for /etc/cloud/cloud.cfg.d/90-idlefy-hardened.cfg. Runs as root on
+# every boot, after cloud-init and before ssh, and strips any sudo cloud-init
+# (or anything else) handed to ubuntu. A clean boot logs "nothing to remove";
+# any "removed" line in the journal means the cfg override did not hold.
+#
+# The rm is the first command and depends on nothing: under `set -e` a lookup
+# that failed before it would leave the sudo rule in place. --verbose sits
+# after the operands (GNU option permutation) so the line still starts with
+# the rm itself; it prints one "removed '<path>'" line per file it actually
+# removed. lastpipe runs the while loop in this shell, so `removed` survives.
+shopt -s lastpipe
+set -euo pipefail
+rm -f /etc/sudoers.d/90-cloud-init-users /etc/sudoers.d/ubuntu /etc/sudoers.d/ubuntu-debug --verbose \
+  | while IFS= read -r line; do
+      echo "idlefy-hardened-firstboot: $line"
+      removed=1
+    done
+
+# One lookup, then a pattern match. No id-into-grep pipeline: a quiet grep
+# closes the pipe early, the writer dies of SIGPIPE, and pipefail turns that
+# into exit 141.
+groups=" $(id -nG ubuntu) "
+for g in sudo admin adm lxd; do
+  if [[ $groups == *" $g "* ]]; then
+    gpasswd -d ubuntu "$g" >/dev/null
+    echo "idlefy-hardened-firstboot: removed ubuntu from group $g"
+    removed=1
+  fi
+done
+
+if [[ -z ${removed-} ]]; then
+  echo 'idlefy-hardened-firstboot: nothing to remove'
+fi
