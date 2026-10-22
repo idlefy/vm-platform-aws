@@ -10,14 +10,26 @@ describe 'base::no_ssm_agent' do
     ChefSpec::SoloRunner.new(platform: 'ubuntu', version: '24.04').converge(described_recipe)
   end
 
-  before do
-    stub_command('snap list amazon-ssm-agent').and_return(true)
+  context 'when the snap is installed' do
+    before do
+      stub_command('snap list amazon-ssm-agent').and_return(true)
+    end
+
+    it_behaves_like 'root never writes under /home/ubuntu'
+
+    it 'waits for snapd seeding, then purges the snap' do
+      expect(chef_run).to run_execute('remove-amazon-ssm-agent-snap')
+        .with(command: 'snap wait system seed.loaded && snap remove --purge amazon-ssm-agent')
+    end
   end
 
-  it_behaves_like 'root never writes under /home/ubuntu'
+  context 'when the snap is absent' do
+    before do
+      stub_command('snap list amazon-ssm-agent').and_return(false)
+    end
 
-  it 'purges the snap when it is installed' do
-    expect(chef_run).to run_execute('remove-amazon-ssm-agent-snap')
-      .with(command: 'snap remove --purge amazon-ssm-agent')
+    it 'does nothing' do
+      expect(chef_run).not_to run_execute('remove-amazon-ssm-agent-snap')
+    end
   end
 end

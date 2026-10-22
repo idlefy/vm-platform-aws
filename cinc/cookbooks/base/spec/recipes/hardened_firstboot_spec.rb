@@ -27,7 +27,7 @@ describe 'base::hardened_firstboot' do
 
   it 'makes the default user ubuntu, locked and sudo-less' do
     expect(chef_run).to render_file(cfg).with_content { |content|
-      expect(content).to match(/^\s+sudo: false$/)
+      expect(content).to match(/^\s+sudo: null$/)
       expect(content).to match(/^\s+name: ubuntu$/)
       expect(content).to match(/^\s+lock_passwd: true$/)
     }

@@ -12,7 +12,10 @@
 #   1. /etc/cloud/cloud.cfg.d/90-idlefy-hardened.cfg makes the default user
 #      sudo-less at the source. cloud.cfg.d is merged in lexical order, so
 #      this file sorts before 90_dpkg.cfg ('-' < '_'); 90_dpkg.cfg sets only
-#      datasource_list and cannot undo default_user.
+#      datasource_list and cannot undo default_user. `sudo: null`, not
+#      `false`: on Noble's cloud-init `false` is deprecated and logs a warning
+#      that leaves `cloud-init status` degraded (exit 2) on every instance;
+#      null merges to None and writes no rule.
 #   2. idlefy-hardened-firstboot.service, a root oneshot after cloud-init and
 #      before ssh, deletes the sudoers fragments and strips sudo/admin/adm/lxd
 #      from ubuntu on every boot, and logs whether it had anything to do.
@@ -36,7 +39,7 @@ file '/etc/cloud/cloud.cfg.d/90-idlefy-hardened.cfg' do
         lock_passwd: true
         gecos: Ubuntu
         groups: [cdrom, dialout, plugdev]
-        sudo: false
+        sudo: null
         shell: /bin/bash
   CFG
 end

@@ -11,26 +11,43 @@
 # after the operands (GNU option permutation) so the line still starts with
 # the rm itself; it prints one "removed '<path>'" line per file it actually
 # removed. lastpipe runs the while loop in this shell, so `removed` survives.
+#
+# The two halves are independent: a failed rm (read-only fs, I/O error, a
+# directory at the path) must not skip the group strip, and a failed group
+# lookup must not hide a fragment removal. Each failure is recorded and the
+# script exits non-zero at the end, so the unit shows failed.
 shopt -s lastpipe
 set -euo pipefail
 rm -f /etc/sudoers.d/90-cloud-init-users /etc/sudoers.d/ubuntu /etc/sudoers.d/ubuntu-debug --verbose \
   | while IFS= read -r line; do
       echo "idlefy-hardened-firstboot: $line"
       removed=1
-    done
+    done \
+  || { echo 'idlefy-hardened-firstboot: FAILED to remove the sudoers fragments' >&2; failed=1; }
 
 # One lookup, then a pattern match. No id-into-grep pipeline: a quiet grep
 # closes the pipe early, the writer dies of SIGPIPE, and pipefail turns that
 # into exit 141.
-groups=" $(id -nG ubuntu) "
-for g in sudo admin adm lxd; do
-  if [[ $groups == *" $g "* ]]; then
-    gpasswd -d ubuntu "$g" >/dev/null
-    echo "idlefy-hardened-firstboot: removed ubuntu from group $g"
-    removed=1
-  fi
-done
+if groups=" $(id -nG ubuntu) "; then
+  for g in sudo admin adm lxd; do
+    if [[ $groups == *" $g "* ]]; then
+      if gpasswd -d ubuntu "$g" >/dev/null; then
+        echo "idlefy-hardened-firstboot: removed ubuntu from group $g"
+        removed=1
+      else
+        echo "idlefy-hardened-firstboot: FAILED to remove ubuntu from group $g" >&2
+        failed=1
+      fi
+    fi
+  done
+else
+  echo 'idlefy-hardened-firstboot: FAILED to read the groups of ubuntu' >&2
+  failed=1
+fi
 
+if [[ -n ${failed-} ]]; then
+  exit 1
+fi
 if [[ -z ${removed-} ]]; then
   echo 'idlefy-hardened-firstboot: nothing to remove'
 fi
