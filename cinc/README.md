@@ -56,7 +56,7 @@ entries are ordered deliberately — see the comment above `include_recipe
 
 | User | Auth method | Sudo | Purpose |
 |------|-------------|------|---------|
-| **ubuntu** | Static SSH key (AWS key pair) | One command: `/usr/bin/tailscale login` | Developer daily work |
+| **ubuntu** | Static SSH key (AWS key pair) | Two commands: `/usr/bin/tailscale login`, and on the `solo` policy `/usr/local/sbin/idlefy-share` | Developer daily work |
 | **admin** | EC2 Instance Connect (ephemeral 60s keys) | Full NOPASSWD | DevOps/lead admin access |
 | **root** | SSH disabled (PermitRootLogin no) | N/A | Only via `sudo su -` from admin |
 
@@ -88,9 +88,51 @@ plane, so if you re-run it and then abandon the browser step, the VM is left
 logged out with no way back except finishing a fresh login. Re-run it only when
 you intend to complete it.
 
+#### idlefy-share
+
+On the `solo` policy only (`base.share_helper.enabled`, installed by
+`base::share_helper`, granted by `/etc/sudoers.d/51-idlefy-share`), `ubuntu` has
+a second sudo command: publish one local port to the internet through Tailscale
+Funnel, or stop.
+
+```bash
+sudo idlefy-share 8000   # https://<node>.<tailnet>.ts.net/ -> http://127.0.0.1:8000
+sudo idlefy-share off    # stop sharing
+```
+
+- `<port>` must match `^[1-9][0-9]{3,4}$` and lie in 1024–65535. The helper runs
+  `/usr/bin/tailscale funnel reset` (a failure there is tolerated — nothing may
+  be configured yet), then `/usr/bin/tailscale funnel --bg
+  http://127.0.0.1:<port>`. The public side is always port 443, and there is one
+  share at a time: every share starts with that reset.
+- `off` runs `/usr/bin/tailscale funnel reset`.
+- Anything else — no argument, two, `080`, `3000x`, a path, a URL — prints
+  `usage: idlefy-share <port 1024-65535> | off` to stderr and exits **64**
+  without calling `tailscale`. A path is refused, never forwarded: Funnel run as
+  root can serve a filesystem path, which would publish any file on the box.
+- Tailscale's output passes through unchanged — the public URL, or its
+  instructions — and its exit status is the helper's.
+- **A share stays on, across reboots too, until `sudo idlefy-share off`.** And
+  `off` resets *all* Tailscale serve and Funnel configuration on the VM, not only
+  what the helper set up.
+
+Before the first share the VM must have joined a tailnet (`sudo tailscale
+login`, above), and the tailnet's owner must have enabled Funnel once in the
+Tailscale admin console; until then `tailscale` prints the instructions to do
+that instead of a URL.
+
+What is granted, stated plainly: the agent working as `ubuntu` can publish any
+listener on `127.0.0.1`, root-owned ones included — the port number is the only
+check. There is no TTY check: one would be bypassable with `script -c`, and the
+agent can already open outbound tunnels of its own without root. The script,
+not the sudoers line (which grants it with `*`), is the argument check; its
+tests are `make test-share-helper`.
+
 ### IMDS protection
 
-EC2 metadata service (169.254.169.254) is blocked via iptables for all users except:
+The EC2 metadata service — `169.254.169.254` over IPv4 (iptables) and
+`fd00:ec2::254` over IPv6 (ip6tables) — is **not reachable by `ubuntu` or its
+containers**. On both, OUTPUT lets two uids through and drops everyone else:
 - **root** (uid 0) — cinc-client, user_data bootstrap, SSM access
 - **ec2-instance-connect** — fetches ephemeral SSH keys. `recipes/imds.rb`
   resolves the uid at converge time rather than hard-coding it, because it is
@@ -533,6 +575,7 @@ Published with this cookbook:
 | Policy | Run list | Use case |
 |--------|----------|----------|
 | `dev-vm` | `base::default` (SSH, firewall, sysctl, Docker, GPU auto-detect, credential broker, Falco, Alloy when `base.loki.enabled`) | General developer VM |
+| `solo` | `base::solo` (`base::default` without `cinc_client`, `aws_access`, `traefik`, `falco`, `alloy`, `nvidia_docker`; plus `hardened_firstboot`, `share_helper`, `no_ssm_agent`; no public web ports) | A single developer's box with an AI agent; no fleet services; Idlefy's public image |
 
 ## Policy assignment
 

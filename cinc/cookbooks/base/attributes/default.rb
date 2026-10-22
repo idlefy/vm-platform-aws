@@ -25,7 +25,9 @@ default['base']['policy']['signers'] = []
 # and ip6tables, one `iptables-allow-tcp-<port>` / `ip6tables-allow-tcp-<port>`
 # resource each. [80, 443] is what the fleet has always opened, for Traefik.
 # The solo Policyfile sets it to [], because its run_list has no Traefik and
-# nothing else should be reachable from the internet but SSH. 22 is
+# nothing else should be reachable from the internet but SSH — as an
+# `override`: Chef unions arrays across default levels, so a Policyfile
+# `default` of [] would leave [80, 443] in place. 22 is
 # deliberately NOT in this list: SSH is opened unconditionally by its own
 # resources, so no value here can lock admins out.
 default['base']['firewall']['public_web_ports'] = [80, 443]

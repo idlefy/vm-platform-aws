@@ -53,8 +53,8 @@ The [runbook](https://idlefy.github.io/vm-platform-aws/runbook/) takes it from t
 
 | Control | How | Design record |
 |---|---|---|
-| Firewall | iptables, default-drop inbound; IMDS (`169.254.169.254`) reachable only by `root` and the Instance Connect uid | |
-| SSH | `ubuntu` with a static key and `sudo` on exactly one command; `admin` via EC2 Instance Connect with 60-second keys; root login off; fail2ban | |
+| Firewall | iptables and ip6tables, default-drop inbound; IMDS (`169.254.169.254` and `fd00:ec2::254`) not reachable by `ubuntu` or its containers — only `root` and the Instance Connect uid pass | |
+| SSH | `ubuntu` with a static key and `sudo` on exactly one command (two on the `solo` policy, which adds `idlefy-share`); `admin` via EC2 Instance Connect with 60-second keys; root login off; fail2ban | |
 | Sudo audit | every verdict reaches Loki on a path that bypasses the collector's rate limiter, so a developer cannot bury their own escalation under their own log flood; Falco is the authoritative detector | [sudo-audit-alerting](docs/design/sudo-audit-alerting.md) |
 | Runtime detection | Falco with a small measured ruleset — four rules: `AWS credentials file written under a home directory`, `Instance metadata service contacted by a non-root process`, `Denied access to the VM credential store`, `Developer user invoked sudo` | [sudo-audit-alerting](docs/design/sudo-audit-alerting.md) |
 | AWS credentials | one IAM identity role per VM with a permissions boundary derived from its access bundles; a root-owned broker publishes short-lived STS credentials to tmpfs (`0750` directory, `0640` file, both `root:ubuntu`) and re-verifies the directory every run | [per-vm-aws-access](docs/design/per-vm-aws-access.md) |

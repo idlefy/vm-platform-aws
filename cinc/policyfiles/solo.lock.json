@@ -1,0 +1,64 @@
+{
+  "revision_id": "a1890bc98ddcc2d1fa71e339228192060bc0ebd59591fc61f3ec3f5c77be1e01",
+  "name": "solo",
+  "run_list": [
+    "recipe[base::solo]"
+  ],
+  "included_policy_locks": [
+
+  ],
+  "cookbook_locks": {
+    "base": {
+      "version": "2.2.0",
+      "identifier": "03db03afec393b53c9677323d3556903b137fbdc",
+      "dotted_decimal_identifier": "1085233813010747.23583869217526613.115464579054556",
+      "source": "../cookbooks/base",
+      "cache_key": null,
+      "scm_info": {
+        "scm": "git",
+        "remote": "https://github.com/idlefy/vm-platform-aws.git",
+        "revision": "41ef95c6996f33dbee2151763a1ca5b41af4f6ae",
+        "working_tree_clean": false,
+        "published": false,
+        "synchronized_remote_branches": [
+
+        ]
+      },
+      "source_options": {
+        "path": "../cookbooks/base"
+      }
+    }
+  },
+  "default_attributes": {
+    "base": {
+      "loki": {
+        "enabled": false
+      },
+      "share_helper": {
+        "enabled": true
+      }
+    }
+  },
+  "override_attributes": {
+    "base": {
+      "firewall": {
+        "public_web_ports": [
+
+        ]
+      }
+    }
+  },
+  "solution_dependencies": {
+    "Policyfile": [
+      [
+        "base",
+        ">= 0.0.0"
+      ]
+    ],
+    "dependencies": {
+      "base (2.2.0)": [
+
+      ]
+    }
+  }
+}
