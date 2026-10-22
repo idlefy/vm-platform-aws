@@ -1,4 +1,5 @@
-# Block IMDS for all users except root and ec2-instance-connect
+# Block IMDS — `169.254.169.254` and `fd00:ec2::254`; not reachable by
+# `ubuntu` or its containers. Only root and ec2-instance-connect pass.
 # root: cinc-client, user_data bootstrap, SSM parameter access
 # ec2-instance-connect: fetches ephemeral SSH keys from IMDS for admin access
 # Must run AFTER firewall (installs iptables-persistent) and ssh (installs
@@ -17,6 +18,12 @@
 # (`-d 169.254.169.254/32 …`), so no rule can false-match another — and so
 # the identical rules user_data now appends at first boot are recognised
 # rather than duplicated.
+#
+# The v6 endpoint `fd00:ec2::254` (Nitro instances with the IPv6 IMDS
+# endpoint enabled) gets the same three rules on ip6tables, with the same
+# lazy command and block guards for the EIC uid, anchored on the
+# ip6tables-save rendering `-d fd00:ec2::254/128 …`. Without them, wherever
+# that endpoint is enabled, the v4 block is bypassed by asking over v6.
 #
 # A missing user at converge logs :error and skips the EIC resource only —
 # not a raise: base::imds runs fourth, and failing here would take sudoers,
@@ -58,5 +65,40 @@ end
 
 execute 'save-iptables-rules' do
   command 'mkdir -p /etc/iptables && iptables-save > /etc/iptables/rules.v4'
+  action :nothing
+end
+
+execute 'ip6tables-imds-allow-root' do
+  command 'ip6tables -I OUTPUT 1 -d fd00:ec2::254 -m owner --uid-owner 0 -j ACCEPT'
+  not_if 'ip6tables-save | grep -qF -- "-d fd00:ec2::254/128 -m owner --uid-owner 0 -j ACCEPT"'
+  notifies :run, 'execute[save-ip6tables-rules]', :immediately
+end
+
+execute 'ip6tables-imds-allow-eic' do
+  command lazy {
+    "ip6tables -I OUTPUT 2 -d fd00:ec2::254 -m owner --uid-owner #{eic_uid_lookup.call} -j ACCEPT"
+  }
+  only_if do
+    uid = eic_uid_lookup.call
+    if uid.empty?
+      Chef::Log.error('base::imds: no ec2-instance-connect user at converge — ' \
+                      'EIC IMDS v6 allow skipped this run; EIC recovers on the next converge')
+      false
+    else
+      rule = "-d fd00:ec2::254/128 -m owner --uid-owner #{uid} -j ACCEPT"
+      !shell_out("ip6tables-save | grep -qF -- '#{rule}'").exitstatus.zero?
+    end
+  end
+  notifies :run, 'execute[save-ip6tables-rules]', :immediately
+end
+
+execute 'ip6tables-imds-deny-all' do
+  command 'ip6tables -I OUTPUT 3 -d fd00:ec2::254 -j DROP'
+  not_if 'ip6tables-save | grep -qF -- "-d fd00:ec2::254/128 -j DROP"'
+  notifies :run, 'execute[save-ip6tables-rules]', :immediately
+end
+
+execute 'save-ip6tables-rules' do
+  command 'mkdir -p /etc/iptables && ip6tables-save > /etc/iptables/rules.v6'
   action :nothing
 end

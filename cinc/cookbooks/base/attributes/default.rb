@@ -20,3 +20,12 @@ default['base']['loki']['enabled'] = true
 # revision and dropping the old one in a later revision signed by the new key.
 # Design: docs/design/serverless-policy-delivery.md, "Trust".
 default['base']['policy']['signers'] = []
+
+# The TCP ports base::firewall opens to the world on INPUT, on both iptables
+# and ip6tables, one `iptables-allow-tcp-<port>` / `ip6tables-allow-tcp-<port>`
+# resource each. [80, 443] is what the fleet has always opened, for Traefik.
+# The solo Policyfile sets it to [], because its run_list has no Traefik and
+# nothing else should be reachable from the internet but SSH. 22 is
+# deliberately NOT in this list: SSH is opened unconditionally by its own
+# resources, so no value here can lock admins out.
+default['base']['firewall']['public_web_ports'] = [80, 443]
