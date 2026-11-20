@@ -1,0 +1,108 @@
+#!/bin/bash
+set -euo pipefail
+ARCHIVE_URL='__ARCHIVE_URL__'
+ARCHIVE_SHA256='__ARCHIVE_SHA256__'
+# The build-time user data of Idlefy's hardened public image (docs/design/ami-image.md).
+# Packer renders the two placeholders above — the solo Policyfile export
+# archive and its sha256 — and appends the scrub as the last line:
+#   /usr/local/sbin/dev-vm-image-scrub --profile solo <sha256>
+# This script converges base::solo once, in local mode, and leaves
+# /run/dev-vm/solo/status for the scrub to read. Nothing of the converge's own
+# state reaches the disk: it all lives under /run (tmpfs), and the scrub purges
+# CINC itself (law A1: nothing in the image takes instructions after launch).
+
+# The log is born 0600, as in the fleet's bootstrap (vms/modules/ec2/user_data.tf):
+# base::sudoers strips ubuntu from adm so converge output is not
+# developer-readable, and a 0644 copy in /var/log would walk around that.
+install -m 0600 /dev/null /var/log/user-data.log
+exec > /var/log/user-data.log 2>&1
+
+# A failed build is terminated by Packer with its disk; the serial console is
+# the only place its operator can read why.
+bootstrap_failed() {
+  {
+    echo "BOOTSTRAP FAILED: no image will be taken. Log follows."
+    tail -c 56000 /var/log/user-data.log
+  } > /dev/console 2>/dev/null || true
+}
+trap bootstrap_failed ERR
+
+# First, before anything reaches the network: the stock image's SSM agent would
+# register this build instance with SSM while the converge that removes it
+# (base::no_ssm_agent) is still minutes away. The scrub checks the snap is gone.
+snap stop --disable amazon-ssm-agent || true
+
+# The build instance is a VM too: drop cloud-init's NOPASSWD grant to ubuntu.
+rm -f /etc/sudoers.d/90-cloud-init-users
+
+# An unrendered file fails here, before any download.
+[[ $ARCHIVE_SHA256 =~ ^[0-9a-f]{64}$ ]] || { echo "ARCHIVE_SHA256 is not a sha256: '$ARCHIVE_SHA256'"; false; }
+
+W=/run/dev-vm/solo
+install -d -m 0700 /run/dev-vm "$W"
+
+# Install CINC (pinned version with SHA256 verification) — the same pin as the
+# fleet's bootstrap; test/test-image-scrub.sh holds the two equal.
+CINC_VERSION="19.3.14"
+CINC_SHA256="c710cc8bf953fa56b7a4b0b726d9fcb9cb5bad2dc8caec4eaa439c4626f9aebf"
+curl -fsSL --retry 5 --retry-all-errors \
+  "https://downloads.cinc.sh/files/stable/cinc/${CINC_VERSION}/ubuntu/24.04/cinc_${CINC_VERSION}-1_amd64.deb" \
+  -o "$W/cinc.deb"
+echo "${CINC_SHA256}  $W/cinc.deb" | sha256sum -c -
+dpkg -i "$W/cinc.deb"
+
+# The solo policy: a `chef export --archive` of cinc/policyfiles/solo.rb.
+curl -fsSL --retry 5 --retry-all-errors "$ARCHIVE_URL" -o "$W/solo.tgz"
+echo "${ARCHIVE_SHA256}  $W/solo.tgz" | sha256sum -c -
+
+# Members are vetted before tar sees the file, as dev-vm-policy-fetch does:
+# only regular files and directories, no absolute paths, no `..`. Ownership
+# never comes from the archive.
+python3 -I - "$W/solo.tgz" <<'EOF'
+import os, sys, tarfile
+with tarfile.open(sys.argv[1], "r:gz") as t:
+    for m in t.getmembers():
+        parts = [p for p in m.name.split("/") if p not in ("", ".")]
+        if os.path.isabs(m.name) or ".." in parts or not (m.isfile() or m.isdir()):
+            print(f"unsafe member: {m.name!r}", file=sys.stderr)
+            sys.exit(1)
+EOF
+install -d -m 0700 "$W/policy"
+tar --no-same-owner --no-same-permissions -xzf "$W/solo.tgz" -C "$W/policy"
+# The archive must be the solo policy: a fleet export converges a run list
+# that installs the very channels law A1 forbids.
+python3 -I - "$W/policy/Policyfile.lock.json" <<'EOF'
+import json, sys
+if json.load(open(sys.argv[1])).get("name") != "solo":
+    print("refusing: Policyfile.lock.json does not name the solo policy", file=sys.stderr)
+    sys.exit(1)
+EOF
+
+# The scrub writes image-revision here; no solo recipe is guaranteed to create it.
+install -d -m 0755 -o root -g root /etc/dev-vm
+
+# Local mode, as dev-vm-policy-fetch converges. listen false: local mode must
+# not open a port any local uid could reach mid-converge.
+cat > "$W/client.rb" <<CLIENT_RB
+local_mode true
+listen false
+chef_repo_path "$W/policy"
+cache_path "$W/policy/.cache"
+use_policyfile true
+policy_document_native_api true
+policy_name "solo"
+policy_group "local"
+node_name "idlefy-hardened-build"
+CLIENT_RB
+
+install -m 0600 /dev/null /var/log/cinc-first-run.log
+if ! cinc-client -z -c "$W/client.rb" >> /var/log/cinc-first-run.log 2>&1; then
+  echo "solo converge failed; last 40 lines of /var/log/cinc-first-run.log:"
+  tail -n 40 /var/log/cinc-first-run.log
+  bootstrap_failed
+  exit 1
+fi
+
+printf '%s ok %s\n' "$(date -u +%FT%TZ)" "$ARCHIVE_SHA256" > "$W/status"
+trap - ERR
+echo "solo converge complete"

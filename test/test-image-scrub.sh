@@ -25,7 +25,12 @@ done
 # real systemctl does ("Unit … does not exist", "not loaded").
 # shellcheck disable=SC2016
 cat >> "$T/bin/systemctl" <<'SHIM'
-[ "$1" = is-enabled ] && exit "${SHIM_ENABLED:-1}"
+# A unit named in SHIM_ENABLED_UNITS is enabled whatever SHIM_ENABLED says (the
+# solo profile requires its first-boot unit enabled, every other unit off).
+if [ "$1" = is-enabled ]; then
+  for u in ${SHIM_ENABLED_UNITS:-}; do [ "${*: -1}" = "$u" ] && exit 0; done
+  exit "${SHIM_ENABLED:-1}"
+fi
 # SHIM_FETCHED: the queued converge had fetched (and extracted) this other
 # revision when it was stopped — mid-converge, so status and last-serial are
 # still the bootstrap's.
@@ -38,8 +43,26 @@ exit 0
 SHIM
 # shellcheck disable=SC2016
 printf '[ -n "${SHIM_FAIL_CLOUDINIT:-}" ] && exit 1\nexit 0\n' >> "$T/bin/cloud-init"
+# The solo profile's shims. Each logs like the others, then answers from the
+# environment: by default a clean solo build (cinc purged and gone, sudoers
+# valid, ubuntu in no admin group, no SSM snap).
+# shellcheck disable=SC2016
+{
+  for c in dpkg dpkg-query visudo snap; do
+    printf '#!/usr/bin/env bash\necho "%s $*" >> "$SHIM_LOG"\n' "$c" > "$T/bin/$c"; chmod +x "$T/bin/$c"
+  done
+  # id logs only the call it answers: the scrub's own `id -u` (the non-root
+  # guard) must stay invisible to the fleet sections' "ran nothing" checks.
+  printf '#!/usr/bin/env bash\n' > "$T/bin/id"; chmod +x "$T/bin/id"
+  printf 'exit "${SHIM_DPKG_RC:-0}"\n' >> "$T/bin/dpkg"
+  printf '[ "${*: -1}" = cinc ] && [ -n "${SHIM_CINC_STILL_INSTALLED:-}" ] && exit 0\nexit 1\n' >> "$T/bin/dpkg-query"
+  printf '[ "$1" = -c ] && exit "${SHIM_VISUDO_RC:-0}"\nexit 0\n' >> "$T/bin/visudo"
+  printf '[ "$*" = "list amazon-ssm-agent" ] && [ -n "${SHIM_SSM_SNAP_PRESENT:-}" ] && exit 0\nexit 1\n' >> "$T/bin/snap"
+  # Anything but `id -nG ubuntu` is the real id (the non-root check runs id -u).
+  printf '[ "$*" = "-nG ubuntu" ] && { echo "id $*" >> "$SHIM_LOG"; echo "${SHIM_UBUNTU_GROUPS:-ubuntu docker}"; exit 0; }\nexec /usr/bin/id "$@"\n' >> "$T/bin/id"
+}
 
-build_root() {  # build_root DIR STATUS_LINE
+build_root() {  # build_root DIR STATUS_LINE [FIXTURE]
   local r=$1 verb path
   rm -rf "$r"; mkdir -p "$r"
   while read -r verb path _; do
@@ -47,15 +70,15 @@ build_root() {  # build_root DIR STATUS_LINE
     path=${path//<rev>/$REV}
     p="$r${path//\*/x}"            # a glob becomes one concrete match
     mkdir -p "$(dirname "$p")"; echo data > "$p"
-  done < <(grep -v '^\s*#' "$LIST")
+  done < <(grep -v '^\s*#' "${3:-$LIST}")
   mkdir -p "$r/var/lib/dev-vm/policy" "$r/etc/dev-vm"
   echo "$2" > "$r/var/lib/dev-vm/policy/status"
 }
 
-run_scrub() {  # run_scrub DIR → exit status
+run_scrub() {  # run_scrub DIR [PROFILE] → exit status
   : > "$T/console"
   SHIM_LOG="$T/log" PATH="$T/bin:$PATH" DEV_VM_IMAGE_ROOT="$1" DEV_VM_IMAGE_CONSOLE="$T/console" \
-    "$SCRUB" "$REV" >"$T/out" 2>&1
+    "$SCRUB" ${2:+--profile "$2"} "$REV" >"$T/out" 2>&1
 }
 
 echo "== a green build is scrubbed and powered off =="
@@ -94,6 +117,8 @@ check "moves journald off /var before cloud-init clean" "$(rc between "${rlq:-0}
 check "checks the timers are off before powering off" "$(grep -q 'systemctl is-enabled' "$T/log"; echo $?)"
 check "cleans cloud-init with the machine id" "$(grep -q 'cloud-init clean --logs --machine-id' "$T/log"; echo $?)"
 check "powers off last" "$(tail -1 "$T/log" | grep -q '^poweroff'; echo $?)"
+echo "== fleet mode never purges cinc or runs the solo checks =="
+check "no dpkg/visudo/snap/id in fleet mode" "$(! grep -qE '^(dpkg|dpkg-query|visudo|snap|id) ' "$T/log"; echo $?)"
 
 echo "== a unit still enabled at the end means no image =="
 : > "$T/log"; build_root "$R" "2026-10-16T00:00:00Z ok $REV"
@@ -158,6 +183,124 @@ echo "== the script's lists are the fixture's =="
 fx=$(grep -E '^(remove|empty) ' "$LIST" | awk '{print $1" "$2}' | sort)
 sc=$(awk '/^REMOVE=\(/{v="remove";next} /^EMPTY=\(/{v="empty";next} /^\)/{v="";next} v && $1 !~ /^#/ && NF {gsub(/"/,"",$1); print v" "$1}' "$SCRUB" 2>/dev/null | sort)
 check "REMOVE/EMPTY equal the fixture's remove/empty lines" "$([ -n "$fx" ] && [ "$fx" = "$sc" ]; echo $?)"
+
+# ---- solo profile: the hardened public image (base::solo) ----------------------
+LIST_SOLO="$ROOT/test/fixtures/image-scrub-paths-solo"
+# What base::solo leaves that the solo invariants read, in its real shape:
+# idlefy-share root:root 0755, and rules.v6 as ip6tables-save writes it (the
+# policy is a `:INPUT DROP` chain header, never a `-P` line).
+seed_solo() {  # seed_solo DIR
+  chmod 0755 "$1/usr/local/sbin/idlefy-share"
+  cat > "$1/etc/iptables/rules.v6" <<'V6'
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A OUTPUT -d fd00:ec2::254/128 -m owner --uid-owner 0 -j ACCEPT
+-A OUTPUT -d fd00:ec2::254/128 -j DROP
+COMMIT
+V6
+}
+SOLO_STATE="$R/var/lib/dev-vm/policy"
+FIRSTBOOT=idlefy-hardened-firstboot.service
+
+echo "== solo profile: a green build is scrubbed, cinc purged, powered off =="
+build_root "$R" "2026-11-01T00:00:00Z ok $REV" "$LIST_SOLO"; seed_solo "$R"; : > "$T/log"
+DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$FIRSTBOOT" run_scrub "$R" solo; check "exits 0" "$?"
+while read -r verb path _; do
+  p="$R${path//\*/x}"
+  case "$verb" in
+    remove) check "removed: $path" "$(rc [ ! -e "$p" ])" ;;
+    empty)  check "emptied: $path" "$(rc emptied "$p")" ;;
+    keep)   check "kept: $path"    "$(rc [ -s "$p" ])" ;;
+  esac
+done < <(grep -v '^\s*#' "$LIST_SOLO" | grep -E '^(remove|empty|keep) ')
+check "purges cinc" "$(grep -q '^dpkg --purge cinc$' "$T/log"; echo $?)"
+check "purge comes before cloud-init clean" "$(rc between "$(lineno 'dpkg --purge cinc')" 0 "$(lineno 'cloud-init clean')")"
+check "checks the first-boot unit is enabled" "$(grep -q "systemctl is-enabled --quiet $FIRSTBOOT" "$T/log"; echo $?)"
+check "checks sudoers with visudo -c" "$(grep -q '^visudo -c' "$T/log"; echo $?)"
+check "checks ubuntu's groups" "$(grep -q '^id -nG ubuntu' "$T/log"; echo $?)"
+check "checks the SSM snap is gone" "$(grep -q '^snap list amazon-ssm-agent' "$T/log"; echo $?)"
+check "checks cinc is gone after the purge" "$(rc between "$(lineno '^dpkg-query .*cinc')" "$(lineno 'dpkg --purge cinc')" "$(lineno 'cloud-init clean')")"
+check "records the sha" "$(grep -qx "$REV" "$R/etc/dev-vm/image-revision"; echo $?)"
+check "powers off last" "$(tail -1 "$T/log" | grep -q '^poweroff'; echo $?)"
+check "the status default is /run/dev-vm/solo" "$(grep -qF 'DEV_VM_POLICY_STATE:-/run/dev-vm/solo' "$SCRUB"; echo $?)"
+
+echo "== solo profile fails closed: every broken invariant → exit 70, console says which, no poweroff =="
+# solo_refuses "LABEL" "CONSOLE SUBSTRING" "MUTATION (run in the fresh root)" [VAR=VALUE…]
+solo_refuses() {
+  local label=$1 want=$2 mutate=$3 got; shift 3
+  build_root "$R" "2026-11-01T00:00:00Z ok $REV" "$LIST_SOLO"; seed_solo "$R"; : > "$T/log"
+  ( cd "$R" && eval "$mutate" )
+  ( export DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$FIRSTBOOT"
+    for kv in "$@"; do export "${kv?}"; done
+    run_scrub "$R" solo ); got=$?
+  check "$label → exit 70" "$(rc [ "$got" = 70 ])"
+  check "  …console names it ('$want')" "$(grep -qF -- "$want" "$T/console"; echo $?)"
+  check "  …no poweroff" "$(! grep -q '^poweroff' "$T/log"; echo $?)"
+  check "  …no cloud-init clean" "$(! grep -q 'cloud-init clean' "$T/log"; echo $?)"
+}
+solo_refuses "cinc purge fails"             "cinc purge failed"   ":" SHIM_DPKG_RC=1
+solo_refuses "cinc still installed"         "cinc still installed" ":" SHIM_CINC_STILL_INSTALLED=1
+solo_refuses "first-boot unit not enabled"  "idlefy-hardened-firstboot" ":" SHIM_ENABLED_UNITS=
+solo_refuses "no cloud-init override"       "90-idlefy-hardened.cfg" "rm etc/cloud/cloud.cfg.d/90-idlefy-hardened.cfg"
+solo_refuses "no tailscale grant"           "50-tailscale-login" "rm etc/sudoers.d/50-tailscale-login"
+solo_refuses "no share grant"               "51-idlefy-share"    "rm etc/sudoers.d/51-idlefy-share"
+solo_refuses "no share helper"              "idlefy-share"       "rm usr/local/sbin/idlefy-share"
+solo_refuses "share helper mode 0775"       "idlefy-share"       "chmod 0775 usr/local/sbin/idlefy-share"
+solo_refuses "visudo -c fails"              "visudo"             ":" SHIM_VISUDO_RC=1
+solo_refuses "cloud-init's sudo grant back" "90-cloud-init-users" "touch etc/sudoers.d/90-cloud-init-users"
+for g in sudo adm admin lxd; do
+  solo_refuses "ubuntu in $g"               "ubuntu is in"       ":" SHIM_UBUNTU_GROUPS="ubuntu $g docker"
+done
+solo_refuses "rules.v6 without INPUT DROP"  "rules.v6" "printf '%s\n' '*filter' ':INPUT ACCEPT [0:0]' '-A OUTPUT -d fd00:ec2::254/128 -j DROP' > etc/iptables/rules.v6"
+solo_refuses "rules.v6 without the IMDS drop" "rules.v6" "printf '%s\n' '*filter' ':INPUT DROP [0:0]' '-A OUTPUT -d fd00:ec2::254/128 -m owner --uid-owner 0 -j ACCEPT' > etc/iptables/rules.v6"
+solo_refuses "SSM snap still installed"     "amazon-ssm-agent"   ":" SHIM_SSM_SNAP_PRESENT=1
+solo_refuses "no /etc/dev-vm"               "/etc/dev-vm"        "rm -r etc/dev-vm"
+check "  …and no image-revision written" "$(rc [ ! -e "$R/etc/dev-vm/image-revision" ])"
+
+echo "== whole-word group match: lxd-installer is not lxd =="
+build_root "$R" "2026-11-01T00:00:00Z ok $REV" "$LIST_SOLO"; seed_solo "$R"; : > "$T/log"
+DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$FIRSTBOOT" SHIM_UBUNTU_GROUPS="ubuntu lxd-installer sudoers adm1" \
+  run_scrub "$R" solo; check "groups that only contain an admin group's name → exit 0" "$?"
+
+echo "== the solo status file is checked like the fleet's =="
+build_root "$R" "2026-11-01T00:00:00Z converge-failed $REV" "$LIST_SOLO"; seed_solo "$R"; : > "$T/log"
+DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$FIRSTBOOT" run_scrub "$R" solo; got=$?
+check "a failed solo converge → exit 65" "$(rc [ "$got" = 65 ])"
+check "  …and purges nothing" "$(! grep -q '^dpkg' "$T/log"; echo $?)"
+
+echo "== an unknown profile is an internal error =="
+: > "$T/log"
+SHIM_LOG="$T/log" PATH="$T/bin:$PATH" DEV_VM_IMAGE_ROOT="$R" DEV_VM_IMAGE_CONSOLE="$T/console" \
+  "$SCRUB" --profile nope "$REV" >/dev/null 2>&1; got=$?
+check "--profile nope → exit 70" "$(rc [ "$got" = 70 ])"
+check "  …and ran nothing" "$(rc [ ! -s "$T/log" ])"
+
+echo "== the solo lists are the solo fixture's =="
+fx=$(grep -E '^(remove|empty) ' "$LIST_SOLO" | awk '{print $1" "$2}' | sort)
+sc=$(awk '/^REMOVE_SOLO=\(/{v="remove";next} /^EMPTY_SOLO=\(/{v="empty";next} /^\)/{v="";next} v && $1 !~ /^#/ && NF {gsub(/"/,"",$1); print v" "$1}' "$SCRUB" 2>/dev/null | sort)
+check "REMOVE_SOLO/EMPTY_SOLO equal the solo fixture's remove/empty lines" "$([ -n "$fx" ] && [ "$fx" = "$sc" ]; echo $?)"
+
+# ---- bootstrap-solo: the build's user data ----------------------------------------
+BOOT="$ROOT/image/files/bootstrap-solo"
+UD="$ROOT/vms/modules/ec2/user_data.tf"
+echo "== bootstrap-solo: the contracts Packer and the scrub depend on =="
+check "parses (bash -n)" "$(bash -n "$BOOT" 2>/dev/null; echo $?)"
+for v in CINC_VERSION CINC_SHA256; do
+  a=$(grep -m1 -oE "^$v=\"[^\"]+\"" "$BOOT" 2>/dev/null); b=$(grep -m1 -oE "^$v=\"[^\"]+\"" "$UD")
+  check "$v equals the module's ($b)" "$([ -n "$a" ] && [ "$a" = "$b" ]; echo $?)"
+done
+for ph in __ARCHIVE_URL__ __ARCHIVE_SHA256__; do
+  check "exactly one $ph" "$(rc [ "$(grep -o "$ph" "$BOOT" 2>/dev/null | wc -l)" = 1 ])"
+done
+check "line 3 is the URL placeholder" "$(rc [ "$(sed -n 3p "$BOOT" 2>/dev/null)" = "ARCHIVE_URL='__ARCHIVE_URL__'" ])"
+check "line 4 is the sha placeholder" "$(rc [ "$(sed -n 4p "$BOOT" 2>/dev/null)" = "ARCHIVE_SHA256='__ARCHIVE_SHA256__'" ])"
+check "no DEV_VM_IMAGE_SCRUB line (Task 2b's heredoc terminator)" "$(! grep -qx 'DEV_VM_IMAGE_SCRUB' "$BOOT" 2>/dev/null && [ -f "$BOOT" ]; echo $?)"
+check "ends in a newline" "$([ -s "$BOOT" ] && [ "$(tail -c1 "$BOOT" | od -An -c | tr -d ' ')" = '\n' ]; echo $?)"
+check "stops the SSM agent before any download" \
+  "$(a=$(grep -n 'snap stop --disable amazon-ssm-agent' "$BOOT" | head -1 | cut -d: -f1); b=$(grep -n '^ *curl ' "$BOOT" | head -1 | cut -d: -f1); [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]; echo $?)"
+check "refuses an archive that is not the solo policy" "$(grep -qF '.get("name") != "solo"' "$BOOT" 2>/dev/null; echo $?)"
 
 echo; echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]
