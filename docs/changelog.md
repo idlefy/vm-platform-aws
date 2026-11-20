@@ -13,24 +13,41 @@ the cookbook does not. No base release: the image still converges
 - `bootstrap-solo` runs `apt-get update --error-on=any` before the converge.
   A stock image ships no apt lists, so the first package had no candidate
   version and the bootstrap failed. A list that fails to download fails the
-  bootstrap there, with the banner, instead of a warning.
+  bootstrap there, with the banner, instead of a warning. The banner now
+  starts on a new line even after an unterminated login prompt on the
+  serial console.
 - The solo scrub purges snapd. The hand-built image carried the build
   instance's snapd device key and serial, which every box from a public
-  image would have shared. The amazon-ssm-agent snap is now checked before
-  the purge. A purge's leftovers (`/var/lib/snapd`, `/snap`, `/var/snap`,
-  `/var/cache/snapd`, `/root/snap`, `/home/*/snap`) are removed. The image is
-  refused unless snapd, any SSM agent package and every snap or snapd unit
-  are gone, including user units, `/usr/bin/snap` and `/usr/lib/snapd/snapd`.
-  A `dpkg-query` that cannot answer refuses too. `apt-get clean` drops the
+  image would have shared. The device key files are shredded before the
+  purge (best effort). The amazon-ssm-agent snap is now checked before the
+  purge. A purge's leftovers (`/var/lib/snapd`, `/snap`, `/var/snap`,
+  `/var/cache/snapd`, `/root/snap`, `/home/*/snap`,
+  `/var/cache/apparmor/*/snap-confine*`) are removed. The image is refused
+  unless snapd, any SSM agent package, `/usr/bin/snap` and
+  `/usr/lib/snapd/snapd` are gone, and no file or link named like a snap or
+  SSM unit is left anywhere on the root filesystem (one `find / -xdev`,
+  not a list of unit directories). A `dpkg-query` that cannot answer
+  refuses, and so does a dpkg database that does not show `dpkg` itself
+  installed. `apt-get clean` drops the
   package cache (321 MB); the apt lists stay. To use a snap, the admin
   installs snapd.
 - The solo scrub zero-fills the free space of `/` as its last step, after
   every removal and after `cloud-init clean`: freed blocks of a public
   snapshot are readable, and EBS root volumes accept no discard, so a trim
-  frees nothing (measured). The image is refused unless the fill ended on a
-  full filesystem and its file is gone. This costs about two minutes of
-  build time and roughly 16 GB more snapshot storage per region. The fleet
-  scrub is unchanged; its `fstrim` has always been a no-op on EBS.
+  frees nothing (measured). This is defence in depth: the guarantee stays
+  that nothing secret is written to the build disk, and the design record
+  lists what the fill cannot reach (block slack, directory entries,
+  metadata, the ext4 journal, `/boot`). The fill writes with `O_DIRECT`
+  with ext4's reserved clusters set to 0 (and put back), then 4 KiB writes
+  for the last partial MiB. The image is refused unless both passes end on
+  a full filesystem, at most 1 MiB stays free, the fill file's fsync
+  succeeds and the file is gone. Before it, cloud-init's two open logs are
+  truncated, the user data's last line `exec`s the scrub, and the image is
+  refused while any process holds a deleted file of non-zero size on `/`.
+  Measured by hand: about 3 minutes more build time, and taking the
+  snapshot took 10–17 minutes instead of under 2; the snapshot storage
+  growth (roughly 16 GB per region) is an estimate. The fleet scrub is
+  unchanged; its `fstrim` has always been a no-op on EBS.
 - The build driver reads the build instance's serial console while Packer
   runs. On the bootstrap's `BOOTSTRAP FAILED` banner or a scrub refusal, as a
   whole line, it prints the console's tail and interrupts Packer, so the
@@ -40,15 +57,16 @@ the cookbook does not. No base release: the image still converges
   fatal. The watcher never outlives the driver. Packer runs in a process
   group of its own and is interrupted as a group: Packer 1.11.2's panicwrap
   wrapper drops a SIGINT sent to it alone. On INT, TERM or a failure the
-  driver passes SIGINT to that group and waits for Packer's clean-up before
-  it lists leftovers. A cancel no longer breaks the pipe Packer logs to.
+  driver passes SIGINT to that group (again every 10 s while it lives) and
+  waits for Packer's clean-up before it lists leftovers; a second signal
+  during that wait (Actions sends TERM 7.5 s after INT) is ignored and the
+  first exit status kept. A cancel no longer breaks the pipe Packer logs
+  to. A marker after an unterminated login prompt still counts.
 - The publish workflow's `build` step times out at 210 minutes, leaving the
   `leftovers` and `record` steps at least 15 of the job's 240.
-- The solo scrub's unit check also covers `/usr/local/lib/systemd/{system,user}`
-  and every account's `~/.config/systemd/user` (`/root` and each home found
-  under `/home`).
 - `scripts/hardened-image-leftovers.sh` also lists the build instance and
-  Packer's `packer_*` key pair, and `--clean-build` removes exactly those.
+  Packer's `packer_*` key pair, and `--clean-build` removes exactly those,
+  before it lists images across the regions.
   It refuses unless the credentials are the publisher account's. The
   publish workflow's `leftovers` step runs it after a failed, cancelled or
   timed-out build, with or without an image name, and says so instead when

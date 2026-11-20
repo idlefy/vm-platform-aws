@@ -643,14 +643,18 @@ the driver reads the console while Packer runs, interrupts Packer, and Packer
 terminates the instance and deletes its key pair. No image is taken and
 nothing needs cleaning. Fix the cause the console names (it is the converge
 or the scrub, on the instance), cut a new `v` release and publish again.
+A refusal that names "files deleted but still open" lists each file, its
+size and the process holding it: make that process close or truncate the
+file before the scrub (in the scrub or the cookbook), never add an
+exception to the check.
 
 If the run was **cancelled or timed out** instead (the `build` step stops
 at 210 minutes, the job at 240), Packer was interrupted but usually killed
 before it cleaned up.
 The workflow's `leftovers` step then terminates every instance tagged
 `Name=idlefy-hardened-image-build` that is still alive in the build region
-and deletes every `packer_*` key pair with that tag, and lists both in the
-job summary. Nothing else is removed — never an image. It first checks the
+and deletes every `packer_*` key pair with that tag — first, before it lists
+images across the regions — and lists both in the job summary. Nothing else is removed — never an image. It first checks the
 credentials are the publisher account's and stops, removing nothing, if not.
 If the run never got AWS credentials, the step says "No AWS credentials were
 configured: nothing could have been launched." — nothing to clean. If that

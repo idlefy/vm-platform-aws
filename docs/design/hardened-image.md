@@ -82,11 +82,15 @@ reaches it only through what the customer's own account does to the instance
    is a separate file because the scrub rides in every fleet VM's user data,
    which EC2 caps at 16 KB gzipped; only the solo build's user data embeds
    it. The driver writes both files side by side, then appends
-   `dev-vm-image-scrub --profile solo <sha256>` as the user data's last line;
-   just before that call the user data switches its output to the console,
-   because the scrub deletes `/var/log/user-data.log` while the shell holds
-   it open, and anything written to it afterwards would land in freed blocks
-   of the public snapshot. A refusal is therefore read on the serial console
+   `exec dev-vm-image-scrub --profile solo <sha256>` as the user data's last
+   line; just before it the user data switches its output to the console,
+   because the scrub deletes `/var/log/user-data.log`, and a file still held
+   open is freed only at power-off, after the zero-fill. `exec` does the same
+   for the script itself: bash holds cloud-init's copy of it (`part-001`,
+   which `cloud-init clean` deletes) open close-on-exec, and exec drops that
+   hold. Nothing else changes: the bootstrap's ERR trap is already cleared
+   before these lines, the scrub's exit status is the script's, and a
+   refusal leaves the instance running as before. A refusal is therefore read on the serial console
    of an instance nobody can log into.
    `test/test-image-scrub.sh` holds each list equal to its fixture.
 
@@ -250,7 +254,12 @@ reaches it only through what the customer's own account does to the instance
       (`/snap/amazon-ssm-agent`, `/var/lib/snapd/snaps/amazon-ssm-agent_*.snap`)
       — both checked here, because the solo list then removes `/opt/cinc`,
       `/snap` and `/var/lib/snapd`, and an absence would prove nothing after
-      it; then `apt-get purge snapd` and `apt-get clean` succeed. **snapd
+      it; then snapd's device key files
+      (`/var/lib/snapd/device/private-keys-v1/*`) are overwritten in place
+      and removed (`shred -u` — a second defence for the one identity known
+      to have reached the disk; best effort, a missing directory or a failed
+      shred is a console note, never a refusal), and `apt-get purge snapd` and
+      `apt-get clean` succeed. **snapd
       leaves the image** (ruling 2026-11-20): the hand-built image carried
       the build instance's snapd device identity —
       `/var/lib/snapd/device/private-keys-v1/<key>` and a serial that
@@ -261,7 +270,9 @@ reaches it only through what the customer's own account does to the instance
       `apt-get clean` drops the package cache (321 MB on that image); the
       lists stay. The solo list removes what a purge can leave:
       `/var/lib/snapd`, `/snap`, `/var/snap`, `/var/cache/snapd`,
-      `/root/snap`, `/home/*/snap`;
+      `/root/snap`, `/home/*/snap`, and snap-confine's compiled AppArmor
+      profiles `/var/cache/apparmor/*/snap-confine*` (measured left by the
+      purge on the hand-built image);
     - `solo_check`, immediately before `cloud-init clean`:
       1. `idlefy-hardened-firstboot.service` is enabled **and** its
          `multi-user.target.wants` symlink exists on disk (`enabled-runtime`
@@ -295,34 +306,67 @@ reaches it only through what the customer's own account does to the instance
          puts a filter `OUTPUT` line ahead of the drop: Docker is rootless
          (the system daemon is stopped, and dockerd's own OUTPUT jump is in
          `*nat`), and Tailscale's chains hang off `INPUT` and `FORWARD`;
-      7. dpkg knows neither `snapd` nor an `amazon-ssm-agent` package, or
-         knows it as `not-installed` — any other answer, including a
-         `dpkg-query` error, refuses; `/var/lib/snapd`, `/snap`,
-         `/usr/bin/snap` and `/usr/lib/snapd/snapd` are gone; no file or link
-         named `snap-*.mount`, `snapd.*`, `snap.*` or `amazon-ssm-agent*` is
-         left in a system or user unit directory (`/etc/systemd/system`,
-         `/etc/systemd/user`, `/lib/…`, `/usr/lib/systemd/{system,user}`,
-         `/usr/local/lib/systemd/{system,user}`, and each account's
-         `~/.config/systemd/user` for `/root` and every directory found
-         under `/home` — rootless Docker's `docker.service` there passes —
-         enablement links included — snapd ships
-         `snapd.session-agent.{service,socket}` as user units); an absent
-         directory is skipped by name, and one `find` cannot read refuses
-         (with the snap check in `solo_prep`, no SSM agent can be on the
-         image);
+      7. dpkg's database shows `dpkg` itself installed — an empty or
+         missing database answers "no packages found" for everything, which
+         would read as absence — then dpkg knows neither `snapd` nor an
+         `amazon-ssm-agent` package, or knows it as `not-installed`; any
+         other answer, including a `dpkg-query` error, refuses.
+         `/var/lib/snapd`, `/snap`, `/usr/bin/snap` and `/usr/lib/snapd/snapd`
+         are gone. **No unit-shaped file or link** named `snap*.service`,
+         `snap*.socket`, `snap*.mount`, `snap*.timer`, `snap*.target`,
+         `snap*.path` or `amazon-ssm-agent*` is left **anywhere on the root
+         filesystem**: one `find / -xdev` over files and links, not a list
+         of unit directories — three reviews each found another directory
+         systemd reads units from (`/usr/local/lib`, `~/.config`,
+         `~/.local/share`, `/etc/xdg`, `/usr/share/systemd/user`, …), so the
+         scan stopped enumerating them. `-xdev` keeps it on the filesystem the
+         snapshot images: `/proc`, `/sys`, `/dev` and `/run` are other
+         filesystems on the instance (procfs, sysfs, devtmpfs, tmpfs), and
+         `/boot` and `/boot/efi` are other partitions that systemd reads no
+         units from; nothing is excluded by name. Links are matched as links
+         and never followed: a unit behind a linked directory is found at the
+         path it really has on this filesystem, and a link to a directory on
+         another filesystem points at nothing the image keeps. Any hit
+         refuses, and so does a `find` error. Measured on the real image: the
+         exact scan returns nothing (rootless Docker's `docker.service`
+         included). With the snap check in `solo_prep`, no SSM agent can be
+         on the image;
       8. dpkg reports `cinc` as unknown or not installed, by the same strict
          rule;
       9. `/etc/dev-vm` — checked by `solo_dir` above;
-      10. last, `cloud-init clean --logs --machine-id`, then a **zero-fill
-          of `/`'s free space**: `dd if=/dev/zero` into one file on `/` until
-          the filesystem is full (root fills the reserved blocks too),
-          `sync`, remove the file, `sync`. The image is refused unless the
-          fill ended on "No space left on device" after writing something,
-          and the file is gone afterwards. The clean runs here, before the
-          fill, so that what it deletes is overwritten too; the shared
-          scrub's own clean after this hook then finds nothing left to
-          delete. A refusal from the fill comes after that clean. Why a
-          fill and not a trim: see "Freed blocks" in Security notes.
+      10. last:
+          - `/var/log/cloud-init.log` and `/var/log/cloud-init-output.log`
+            are truncated: cloud-init holds both open (its log handler, its
+            output `tee`), so deleting them frees nothing until power-off,
+            while truncating frees their blocks now;
+          - `cloud-init clean --logs --machine-id`, so that what it deletes
+            is overwritten by the fill; the shared scrub's own clean after
+            this hook then finds nothing left to delete;
+          - **no process holds a deleted regular file of non-zero size on
+            `/`** (`/proc/[0-9]*/fd/*`, compared by device with `/`): such a
+            file's blocks are freed only at power-off, after the fill. Any
+            hit refuses, naming the file, its size and the holder. Strict on
+            purpose — the build is the place to find a new holder;
+          - a **zero-fill of `/`'s free space**: `sync`; ext4's
+            `reserved_clusters` for the root device (found through
+            `mountpoint -d /` and `/sys/dev/block`) is read, set to 0 and
+            put back afterwards — that reserve (min(2 %, 4096 clusters), up
+            to 16 MiB) is withheld even from root, and a refusal from here on
+            puts it back too; `dd if=/dev/zero oflag=direct` into one file,
+            1 MiB writes and then 4 KiB writes for the last partial MiB, each
+            pass ending on "No space left on device"; while the file exists,
+            at most `ZERO_FILL_MAX_FREE` (1 MiB) of `/` may be free
+            (`stat -f`, free blocks × block size); `sync FILE` (an fsync
+            whose error is reported — a bare `sync` reports none); remove
+            the file; `sync`; the file must be gone. `O_DIRECT` makes ext4
+            allocate the blocks and the file's extent tree at write time, so
+            the full filesystem is reported to `dd` instead of failing a
+            delayed allocation at writeback with the reserve at 0. The 1 MiB
+            bound: after the 4 KiB pass only what ext4 keeps for the file's
+            own extent tree should be free, a few 4 KiB blocks; 256 blocks is
+            generous for that and 16 times below the reserve.
+          A refusal from here on comes after the clean. What the fill covers
+          and what it does not: "Freed blocks" in Security notes.
 
 13. **The publisher role is scoped to the build's own tags and a fixed,
     no-ingress security group.** The account also runs the dev organization's
@@ -423,6 +467,9 @@ The same script also lists, in the build region, every instance tagged
 `Name=idlefy-hardened-image-build` that is not terminated or shutting down
 and every `packer_*` key pair with that tag; with `--clean-build` it
 terminates those instances and deletes those key pairs, and nothing else.
+It does this **first**, before the image listing across every region: the
+instance is what costs money, and the workflow's step may run close to the
+job's deadline.
 Measured on the second run: an Actions cancel kills the runner before Packer
 cleans up, so the build instance kept running and the key pair stayed. The
 workflow's `leftovers` step runs `--clean-build`, **whether or not a name
@@ -449,7 +496,12 @@ driver reads the console of the instance Packer names (`Instance ID: i-…` in
 its own log, never another run's) every 30 s with
 `get-console-output --latest`. The markers are **whole lines** (a trailing
 carriage return allowed), so a console that merely quotes one inside another
-line is not a failure:
+line is not a failure — with one allowance: a marker may follow a getty
+prompt left unterminated on the console (`<host> login: `, seen on the real
+console followed by other text). `bootstrap-solo`'s banner and the solo
+scrub's refusals print a newline first; the shared scrub's own refusals
+(it rides in every fleet VM and is not changed) do not, hence the
+allowance:
 
 - `BOOTSTRAP FAILED: no image will be taken. Log follows.` — the bootstrap's
   banner, exactly as `bootstrap-solo` prints it (a test pins the two equal);
@@ -497,10 +549,20 @@ and cleans up — never hears it. So:
   trap at once; a foreground pipeline would hold the trap until Packer ended
   by itself). Its EXIT path — reached on INT, TERM or any failure — stops
   the watcher, then sends SIGINT to Packer's group and **waits** for Packer
-  to finish its clean-up before listing leftovers. There is no escalation to
-  SIGKILL: Packer's clean-up is what removes the instance and the key pair;
-  a runner that will not wait kills the job itself, and the workflow's
-  `leftovers` step removes what is left;
+  to finish its clean-up before listing leftovers. Its first act is to
+  ignore INT and TERM and keep the first exit status: an Actions cancel
+  sends INT, then TERM 7.5 s later, and the second signal used to cut short
+  the wait, the leftovers listing and the clean-up. The wait for Packer's
+  pid file has no cap (it ends when the file holds a pid or the pipeline
+  ends); a signal between starting the pipeline and recording its pid is
+  covered by taking the one job left. The SIGINT is repeated every 10 s
+  while Packer's group lives: the worker takes the first and drops the rest
+  (its handler reads one signal), the plugins discard every interrupt
+  (packer-plugin-sdk v0.5.4, `plugin/server.go`: "Eat the interrupts"), and
+  a repeat covers the instant after start-up when only the wrapper exists.
+  There is no escalation to SIGKILL: Packer's clean-up is what removes the
+  instance and the key pair; a runner that will not wait kills the job
+  itself, and the workflow's `leftovers` step removes what is left;
 - the rest of the pipeline (its subshell, `tee`, `awk`) stays in the
   driver's group but ignores INT and TERM and ends when Packer closes its
   output. A cancel that signals the driver's group must not end the `wait`
@@ -599,28 +661,47 @@ trailing comment. No input or ref name is interpolated into a `run:` script.
   (`/run/dev-vm/solo`), no credential ever reaches the instance, and the
   scrub list names nothing secret — only per-instance identity (host keys,
   machine id, engine ids) that must differ between clones. snapd's device
-  key broke that law (the scrub now removes snapd), so the solo image also
-  **zero-fills its free space** (decision 12, check 10).
+  key broke that law (the scrub now removes snapd and shreds the key first),
+  so the solo image also **zero-fills its free space** (decision 12, check
+  10). **The fill is defence in depth, not the guarantee**: it removes what
+  it can reach, and what it cannot reach is listed below. The guarantee is
+  still that nothing secret is written to the build disk.
   - Trimming does not help: EBS root volumes accept no discard (measured on a
     c7a.xlarge with a gp3 root: "fstrim: /: the discard operation is not
     supported"). The fleet scrub's `fstrim -av || true` has always been a
     no-op there, and freed blocks have always reached the fleet's private
     snapshots; the fleet is unchanged.
-  - The fill covers every block freed before it: everything the scrub lists
-    remove, the CINC and snapd purges, `apt-get clean`, the bootstrap's log,
-    whatever the converge deleted, and cloud-init's state, its copy of the
-    user data and its logs (the solo hook runs `cloud-init clean` before the
-    fill).
-  - It does not cover what lives outside free data blocks: the slack at the
-    end of a file's last block, directory entries that still name deleted
-    files, inode tables and other metadata, and the ext4 journal. Nor does
-    it cover what happens after it: the shared scrub's second `cloud-init
-    clean` (nothing left to delete; it rewrites `/etc/machine-id`), its
-    no-op `fstrim`, and what shutdown and cloud-init's final modules write
-    (written, not freed — for example the instance-id directory below).
-  - The cost: about two minutes of build time, and the snapshot stores the
-    zeroed blocks — roughly 16 GB more per region for the 20 GB root. Both
-    are estimates until the first Packer-built image is measured.
+  - The fill covers every data block of `/` that is free when it runs:
+    everything the scrub lists remove, the CINC and snapd purges,
+    `apt-get clean`, the bootstrap's log (closed before its removal: the
+    user data's output goes to the console first), whatever the converge
+    deleted, cloud-init's state, its copy of the user data and its logs (the
+    solo hook truncates the two open logs and runs `cloud-init clean` before
+    the fill), and the ext4 reserve (set to 0 for the fill). Files still
+    held open after deletion would escape it; the scrub refuses if any is
+    left (check 10), and `exec` drops bash's hold on its own script.
+  - It does **not** cover:
+    - the slack at the end of a file's last block (a live file's own block,
+      not a free one);
+    - directory entries that still name deleted files, inode tables and
+      other metadata blocks;
+    - the ext4 journal, which may hold recent metadata and, for data written
+      through it, data;
+    - up to `ZERO_FILL_MAX_FREE` (1 MiB) that may stay free after the fill;
+    - the other partitions of the volume, which the snapshot also images:
+      `/boot` (ext4; old kernels and initrds that apt removed) and
+      `/boot/efi` (vfat);
+    - what happens after it: the shared scrub's second `cloud-init clean`
+      (nothing left to delete; it rewrites `/etc/machine-id`), its no-op
+      `fstrim`, and what shutdown and cloud-init's final modules write
+      (written, not freed — for example the instance-id directory below).
+  - The cost, measured by hand on `1d6180e` (a real build instance, not yet
+    a Packer build): the build took about 5.5 minutes, 2.5 of them before
+    the fill — about **3 minutes more**; **taking the snapshot** afterwards
+    took **10–17 minutes instead of under 2**, because the whole disk had
+    been written. A box from that image was healthy, with the fill file gone
+    and 15 of 19 GB free. The snapshot's storage growth (roughly 16 GB more
+    per region for the 20 GB root) is still an estimate.
 - **The build instance's id directory.** `/var/lib/cloud/instances/<id>`
   (three semaphore files) stays in the image: cloud-init's final modules write
   it after the scrub returns. It names a terminated instance and nothing
@@ -677,11 +758,13 @@ trailing comment. No input or ref name is interpolated into a `run:` script.
   `aws` and `packer`: the account check, the stored-asset comparison, the
   release created when missing, the record, NN across every region, the
   leftover listing after a failure past `packer build`, the console watcher
-  (a failure marker interrupts Packer and prints the tail; no marker, an
-  empty console or a read error changes nothing), Packer's interrupt through
-  a panicwrap-like wrapper on a marker, INT and TERM, the leftovers script's
-  build-instance and key-pair listing and `--clean-build`, and the real solo
-  user data measured against EC2's 16 KB.
+  (a failure marker interrupts Packer and prints the tail, also after a
+  login prompt; no marker, an empty console or a read error changes
+  nothing), Packer's interrupt through a panicwrap-like wrapper on a marker,
+  INT, TERM, and INT then TERM during a slow clean-up, the leftovers
+  script's build-instance and key-pair listing and `--clean-build` (removal
+  before the image listing), the user data's `exec` last line, and the real
+  solo user data measured against EC2's 16 KB.
 - `test/test-hardened-guard.sh` — G1–G4 against a shimmed `aws`, including
   the default-quota fallback, the listed `/aws-reserved/` roles, implicit
   denies passing and allows failing, a "require MFA" deny that must not mask
@@ -690,9 +773,16 @@ trailing comment. No input or ref name is interpolated into a `run:` script.
 - `test/test-hardened-retire.sh` — retention, the safety net, doubts and
   `--disable` against a shimmed `aws` and a fixed clock.
 - The solo section of `test/test-image-scrub.sh` — the solo lists against
-  their fixture, the CINC and snapd purges, `apt-get clean`, the bootstrap's
-  `apt-get update` before the converge, and the invariants of decision 12
-  refusing on a fake root.
+  their fixture, the CINC and snapd purges (the device key shredded first),
+  `apt-get clean`, the bootstrap's `apt-get update` before the converge and
+  its banner after an unterminated login prompt, and the invariants of
+  decision 12 refusing on a fake root: the whole-filesystem unit scan (hits
+  in `~/.local/share`, `/etc/xdg`, `/usr/share/systemd/user`, behind a
+  linked directory), an empty dpkg database, a deleted file held open, and
+  every way the zero-fill can fail (each pass, the fsync, the free-space
+  bound, the ext4 reserve). The `dd` shim checks, at the moment the fill
+  begins, that nothing on the removal list is left. Shims stand in for `dd`,
+  `stat -f`, `mountpoint`, `find` and the ext4 sysfs entry.
 - The workflows have no local test, and no automated check validates the
   workflow files today: they were checked by a YAML parse and by reading.
   The first private build is their test.
@@ -745,9 +835,17 @@ build — none of it was exercised by hand:
 - **snapd is gone** from the image: no `snapd` package, no
   `/var/lib/snapd`, no `snap` command, and nothing else the purge removed
   matters (read the purge's package list on the console);
-- **The zero-fill** ends on "No space left on device", how long it takes,
-  and how much the snapshot grows (the estimates above: about two minutes,
+- **The zero-fill as changed after the hand test** (`O_DIRECT`, the ext4
+  reserve at 0, the 1 MiB free-space bound, the fsync) passes on a real
+  instance: both passes end on "No space left on device", the free space
+  left is within the bound (note the number), and the reserve is back to
+  its value afterwards; how much the snapshot grows (estimate above,
   roughly 16 GB per region);
+- **The deleted-but-open check** passes on a real instance: no process
+  holds a deleted file of non-zero size on `/` once the user data's last
+  line has exec'd the scrub and cloud-init's two logs are truncated (a
+  refusal names the file and holder: add the holder to the scrub, never an
+  exception to the check);
 - **CreateImage** under the publisher role, and **CopyImage** to every
   region under the fence deny;
 - **Tags on the copies and their snapshots**: every copy and its snapshot
@@ -769,6 +867,13 @@ build — none of it was exercised by hand:
   not supported` (c7a.xlarge, gp3 root, a real build instance on
   `f713504`, whose strict trim therefore refused every build; everything
   before it — the snapd purge and every other check — passed).
+- The zero-fill (hand test of `1d6180e` on a real instance): the build
+  passed in about 5.5 minutes, 2.5 of them before the fill; the snapshot
+  then took 10–17 minutes instead of under 2 (the whole disk was written);
+  a box from the image was healthy, the fill file gone, 15 of 19 GB free.
+  The purge left `/var/cache/apparmor/*/snap-confine*` (now on the list).
+  The whole-filesystem unit scan (`find / -xdev`, the names of check 7)
+  returned nothing on that image, rootless Docker included.
 
 - `ec2:Owner` for Canonical's images is the alias `amazon`, not the account
   id (run 1, a refused RunInstances).
