@@ -62,8 +62,15 @@ the cookbook does not. No base release: the image still converges
   during that wait (Actions sends TERM 7.5 s after INT) is ignored and the
   first exit status kept. A cancel no longer breaks the pipe Packer logs
   to. A marker after an unterminated login prompt still counts.
-- The publish workflow's `build` step times out at 210 minutes, leaving the
-  `leftovers` and `record` steps at least 15 of the job's 240.
+- The publish workflow's `build` step times out at 180 minutes, so the
+  job's last 60 of 240 cover setup and the guard (up to 45) and leave the
+  `leftovers` and `record` steps at least 15.
+- An interrupted Packer gets 15 minutes to clean up
+  (`HARDENED_PACKER_GRACE`); after that the driver stops waiting without
+  killing it, says the clean-up was not confirmed, and still lists
+  leftovers. A console poll or grace of zero is refused.
+- `--clean-build` lists instances up to 3 times, 10 s apart, before it
+  reports none: a just-launched instance may not be listable yet.
 - `scripts/hardened-image-leftovers.sh` also lists the build instance and
   Packer's `packer_*` key pair, and `--clean-build` removes exactly those,
   before it lists images across the regions.

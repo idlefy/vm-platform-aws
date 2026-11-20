@@ -649,7 +649,7 @@ file before the scrub (in the scrub or the cookbook), never add an
 exception to the check.
 
 If the run was **cancelled or timed out** instead (the `build` step stops
-at 210 minutes, the job at 240), Packer was interrupted but usually killed
+at 180 minutes, the job at 240), Packer was interrupted but usually killed
 before it cleaned up.
 The workflow's `leftovers` step then terminates every instance tagged
 `Name=idlefy-hardened-image-build` that is still alive in the build region
@@ -662,6 +662,21 @@ step could not run or reports "could not terminate" / "could not delete",
 run `scripts/hardened-image-leftovers.sh --clean-build` with the publisher
 account's credentials (the publisher role may do exactly this), or remove
 them in the console.
+
+"instances: could not list" or "packer_* key pairs: could not list" is
+different: the listing itself failed, so **nothing of that kind was
+removed** — not even what may be there. Run
+`scripts/hardened-image-leftovers.sh --clean-build` again with working
+publisher credentials, or look in the build region (the first line of
+`image/hardened/regions`) by hand for instances tagged
+`Name=idlefy-hardened-image-build` and `packer_*` key pairs. "could not
+terminate" / "could not delete" means the resource was found and its
+removal failed.
+
+A local run whose Packer stalls in its clean-up stops waiting after 15
+minutes (`HARDENED_PACKER_GRACE`) and says "Packer's clean-up was NOT
+confirmed": Packer may still be running in its own session, and the
+instance and key pair may still exist — run `--clean-build` as above.
 
 #### A hardened build that failed after its images
 

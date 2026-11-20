@@ -377,7 +377,7 @@ reaches it only through what the customer's own account does to the instance
     role itself is applied by Terraform outside this repository. Measured on
     the first run: for Canonical's source image the `ec2:Owner` condition key
     is the owner **alias** `amazon` (DescribeImages `ImageOwnerAlias`), not
-    the account id `099720109477`, so a RunInstances condition on the id
+    the account id (`<canonical-account-id>`), so a RunInstances condition on the id
     alone refuses the launch. Packer's temporary `packer_*` key pair carries
     the same `Name` tag (it is created with the run tags), so the role may
     delete exactly those key pairs and terminate exactly those instances —
@@ -468,6 +468,11 @@ The same script also lists, in the build region, every instance tagged
 `Name=idlefy-hardened-image-build` that is not terminated or shutting down
 and every `packer_*` key pair with that tag; with `--clean-build` it
 terminates those instances and deletes those key pairs, and nothing else.
+With `--clean-build`, an empty instance listing is asked again — 3 listings
+10 s apart (`CLEAN_TRIES`, `CLEAN_PAUSE`; `HARDENED_LEFTOVERS_PAUSE` for
+the tests) — because EC2 may accept a launch just before the runner kills
+Packer and a new instance can take a moment to be listable; anything listed
+is acted on at once, and a plain listing asks once.
 It does this **first**, before the image listing across every region: the
 instance is what costs money, and the workflow's step may run close to the
 job's deadline.
@@ -495,7 +500,11 @@ the second run, it would have waited its whole budget (480 × 15 s = 2 h)
 after a bootstrap that failed in 28 s. So while `packer build` runs, the
 driver reads the console of the instance Packer names (`Instance ID: i-…` in
 its own log, never another run's) every 30 s with
-`get-console-output --latest`. The markers are **whole lines** (a trailing
+`get-console-output --latest`. Only Nitro instance types serve `--latest`:
+a non-Nitro type loses this fast failure path (Packer's own 2 h stop
+timeout remains); the publisher role allows exactly `c7a.xlarge`, so only a
+hand run with other credentials could pick another type. A poll of zero, in
+any decimal form, is refused (the watcher would spin). The markers are **whole lines** (a trailing
 carriage return allowed), so a console that merely quotes one inside another
 line is not a failure — with one allowance: a marker may follow a getty
 prompt left unterminated on the console (`<host> login: `, seen on the real
@@ -563,7 +572,16 @@ and cleans up — never hears it. So:
   a repeat covers the instant after start-up when only the wrapper exists.
   There is no escalation to SIGKILL: Packer's clean-up is what removes the
   instance and the key pair; a runner that will not wait kills the job
-  itself, and the workflow's `leftovers` step removes what is left;
+  itself, and the workflow's `leftovers` step removes what is left. On a
+  local run nothing would end a Packer or plugin stalled in its clean-up,
+  so the wait (for the pid file, then for Packer's group) has a **grace
+  period**: `PACKER_GRACE_DEFAULT=900` s (15 minutes;
+  `HARDENED_PACKER_GRACE` overrides it, validated like the poll). When it
+  runs out the driver stops waiting — still no KILL — prints that Packer's
+  clean-up was **not** confirmed and that the build instance and key pair
+  may still exist, pointing at `hardened-image-leftovers.sh --clean-build`,
+  keeps the first exit status and still lists leftovers and cleans up. A
+  Packer that exits within the grace period sees no change;
 - the rest of the pipeline (its subshell, `tee`, `awk`) stays in the
   driver's group but ignores INT and TERM and ends when Packer closes its
   output. A cancel that signals the driver's group must not end the `wait`
@@ -593,7 +611,7 @@ UTC):
   a `vX.Y.Z` tag ref, else it fails with "run this on a vX.Y.Z tag"; the
   schedule takes the newest `vX.Y.Z` tag on origin, peeled to its commit.
 - `publish` (`environment: hardened-publish`, 240 minutes; its `build` step
-  210): checkout of the
+  180): checkout of the
   tag with `persist-credentials: false`, Packer 1.11.2, Cinc Workstation,
   OIDC credentials for `HARDENED_PUBLISH_ROLE_ARN` (4 hours), then the guard,
   then the build. One approval covers both. `HARDENED_PUBLIC` is set once,
@@ -603,12 +621,16 @@ UTC):
   build chose no name, or its record was uploaded, and lists no images),
   terminates the build instance and deletes Packer's key pair if a killed
   run left them, and the `record` step prints any record written. The build
-  step's own `timeout-minutes: 210` keeps at least 15 minutes of the job's
-  240 for those two steps (30, less what the steps before the build took);
-  without it a build that ran out the job's clock would leave them no time.
-  The role session (`role-duration-seconds: 14400`, the job's 240 minutes)
-  outlives every step, so the leftovers step still has credentials after a
-  build timeout. A test pins the 15-minute margin and the session length.
+  step's own `timeout-minutes: 180` starts counting only after the steps
+  before it, so the job's last 60 minutes are split: up to 45 for checkout,
+  the Packer and Cinc setup, credentials and the guard (a few minutes in
+  practice), and at least 15 for those two steps. Setup and guard would
+  have to take over 45 minutes to eat that reserve; no file bounds them, so
+  that part is not asserted. The role session (`role-duration-seconds:
+  14400`, the job's 240 minutes) outlives every step, so the leftovers step
+  still has credentials after a build timeout. A test pins job ≥ build + 45
+  + 15, the session length, the steps' order and their exact `if:`
+  (`failure() || cancelled()` for leftovers, `always()` for the record).
   On a cancel or a step timeout the runner signals the driver, which passes
   SIGINT to Packer, but kills the job's processes seconds later — usually
   before Packer's clean-up ends; the leftovers step is what removes the
