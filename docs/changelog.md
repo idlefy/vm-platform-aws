@@ -1,5 +1,41 @@
 # Changelog
 
+## 2.2.1
+
+Fixes from the first builds of Idlefy's hardened image: two Actions runs and
+one image built by hand from the same user data. The image's build changes;
+the cookbook does not. No base release: the image still converges
+`base-2.2.0`. Nothing here touches a tenant fleet or its image. Design record:
+[Hardened image for AI agents](design/hardened-image.md).
+
+**`v2.2.1`**
+
+- `bootstrap-solo` runs `apt-get update` before the converge. A stock image
+  ships no apt lists, so the first package had no candidate version and the
+  bootstrap failed.
+- The solo scrub purges snapd. The hand-built image carried the build
+  instance's snapd device key and serial, which every box from a public
+  image would have shared. The amazon-ssm-agent snap is now checked before
+  the purge. A purge's leftovers (`/var/lib/snapd`, `/snap`, `/var/snap`,
+  `/var/cache/snapd`, `/root/snap`, `/home/*/snap`) are removed. The image is
+  refused unless snapd, any SSM agent package and every snap or snapd unit
+  are gone. `apt-get clean` drops the package cache (321 MB); the apt lists
+  stay. To use a snap, the admin installs snapd.
+- The build driver reads the build instance's serial console while Packer
+  runs. On the bootstrap's `BOOTSTRAP FAILED` banner or the scrub's refusal,
+  it prints the console's tail and interrupts Packer, so the instance and its
+  key pair are removed. The build then fails with the reason. Before this, a
+  build that failed in 28 s waited out Packer's 2-hour budget. A console
+  read error is noted, never fatal.
+- `scripts/hardened-image-leftovers.sh` also lists the build instance and
+  Packer's `packer_*` key pair, and `--clean-build` removes exactly those.
+  The publish workflow's `leftovers` step runs it after a failed, cancelled
+  or timed-out build, with or without an image name. An Actions cancel had
+  left both running. Images are still only listed.
+- Measured: for Canonical's source image the IAM condition key `ec2:Owner` is
+  the alias `amazon`, not the account id. The publisher role's condition
+  (outside this repository) was fixed to match.
+
 ## 2.2.0
 
 A second published policy, `solo`: one developer's box with an AI agent

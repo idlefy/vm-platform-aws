@@ -632,6 +632,25 @@ a tenant image and nothing here builds it from a
 tenant. How it is built, published and retired is in
 [Hardened image for AI agents](design/hardened-image.md).
 
+#### A hardened build whose bootstrap or scrub failed
+
+The build log says "the bootstrap failed on the build instance" (or "the
+image scrub refused the image …") and shows the end of the instance's serial
+console above it. The build ends by itself about a minute after the failure:
+the driver reads the console while Packer runs, interrupts Packer, and Packer
+terminates the instance and deletes its key pair. No image is taken and
+nothing needs cleaning. Fix the cause the console names (it is the converge
+or the scrub, on the instance), cut a new `v` release and publish again.
+
+If the run was **cancelled or timed out** instead, Packer never cleaned up.
+The workflow's `leftovers` step then terminates every instance tagged
+`Name=idlefy-hardened-image-build` that is still alive in the build region
+and deletes every `packer_*` key pair with that tag, and lists both in the
+job summary. Nothing else is removed — never an image. If that step could
+not run or reports "could not terminate" / "could not delete", run
+`scripts/hardened-image-leftovers.sh --clean-build` with credentials that
+may (the publisher role may do exactly this), or remove them in the console.
+
 #### A hardened build that failed after its images
 
 When `publish-hardened-image` fails after `packer build` started and before
@@ -641,7 +660,8 @@ one line per region with the image id, its state, `public=` and whether
 `IdlefyPublishedImage=true` is set, or "could not list" for a region to check
 by hand. After a cancelled or timed-out run the same list is in the job
 summary, written by the `leftovers` step (or, by hand,
-`scripts/hardened-image-leftovers.sh <name>`). No consumer pins these
+`scripts/hardened-image-leftovers.sh <name>`, which only lists). That step
+also removes a left build instance and key pair (see above), never an image. No consumer pins these
 images, but a public one is launchable by
 anyone until it is removed, and retention would count it as a real build. So
 clean up **before any retention run or new build**:
