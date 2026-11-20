@@ -58,6 +58,17 @@ case "${SHIM_DD:-enospc}" in
   stuck)  mkdir -p "$of/x"; echo "dd: error writing '$of': No space left on device" >&2; exit 1 ;;
 esac
 SHIM
+# find: the real one, unless SHIM_FIND_FAIL names the directory it is asked
+# to scan (relative to the fake root) — then it fails as on an unreadable
+# directory. A shim, not chmod 000: root reads through any mode.
+REAL_FIND=$(command -v find)
+printf '#!/usr/bin/env bash
+if [ -n "${SHIM_FIND_FAIL:-}" ] && [ "$1" = "$DEV_VM_IMAGE_ROOT/$SHIM_FIND_FAIL" ]; then
+  echo "find: '"'"'$1'"'"': Permission denied" >&2; exit 1
+fi
+exec %q "$@"
+' "$REAL_FIND" > "$T/bin/find"
+chmod +x "$T/bin/find"
 # The solo profile's shims. Each logs like the others, then answers from the
 # environment: by default a clean solo build (cinc purged and gone, sudoers
 # valid, ubuntu in no admin group, no SSM snap).
@@ -412,8 +423,18 @@ solo_refuses "a user unit left: snapd.session-agent.socket" "snap or SSM units a
 solo_refuses "a user enablement link left" "snap or SSM units are left" \
   "mkdir -p etc/systemd/user/sockets.target.wants && ln -s /usr/lib/systemd/user/snapd.session-agent.socket etc/systemd/user/sockets.target.wants/snapd.session-agent.socket"
 solo_refuses "a unit directory find cannot read" "cannot scan /etc/systemd/user" \
-  "mkdir -p etc/systemd/user/x && chmod 000 etc/systemd/user"
-chmod 755 "$R/etc/systemd/user"   # so the next build_root can remove it
+  "mkdir -p etc/systemd/user/x" SHIM_FIND_FAIL=etc/systemd/user
+solo_refuses "an account's unit directory find cannot read" "cannot scan /home/ubuntu/.config/systemd/user" \
+  "mkdir -p home/ubuntu/.config/systemd/user" SHIM_FIND_FAIL=home/ubuntu/.config/systemd/user
+for u in usr/local/lib/systemd/system/snapd.service \
+         usr/local/lib/systemd/user/snapd.session-agent.socket \
+         root/.config/systemd/user/snap.foo.bar.service \
+         home/ubuntu/.config/systemd/user/amazon-ssm-agent.service \
+         home/someone-else/.config/systemd/user/default.target.wants/snap.lxd.daemon.service; do
+  solo_refuses "a unit left: /$u" "snap or SSM units are left" "mkdir -p \"\$(dirname $u)\" && touch $u"
+done
+solo_passes "rootless Docker's user unit (~ubuntu/.config/systemd/user/docker.service) is not a snap unit" \
+  "mkdir -p home/ubuntu/.config/systemd/user/default.target.wants && touch home/ubuntu/.config/systemd/user/docker.service && ln -s ../docker.service home/ubuntu/.config/systemd/user/default.target.wants/docker.service"
 solo_passes "a directory named like a unit is not a unit" "mkdir -p etc/systemd/system/snap.d-not-a-unit"
 # A failed fill refuses after cloud-init clean has run (it must free its
 # files before the fill), so these check the rest by hand.
@@ -514,9 +535,10 @@ check "  …after the seed wait" \
 check "  …and stops its unit directly too" "$(rc before_curl '^systemctl stop snap.amazon-ssm-agent.amazon-ssm-agent.service')"
 # A stock image has no apt lists: the converge's first package would have no
 # candidate (measured on the first build). Refreshed after the policy is
-# vetted, before the converge, and under the ERR trap (a failure is reported).
+# vetted, before the converge, and under the ERR trap (a failure is reported);
+# --error-on=any, so a list that fails to download fails it too.
 check "apt-get update before the converge, after the policy check" \
-  "$(a=$(first_line '^apt-get update -qq$'); b=$(first_line '^if ! cinc-client -z '); c=$(first_line 'does not name the solo policy'); \
+  "$(a=$(first_line '^apt-get update --error-on=any -qq$'); b=$(first_line '^if ! cinc-client -z '); c=$(first_line 'does not name the solo policy'); \
      d=$(first_line '^trap bootstrap_failed ERR$'); \
      [ -n "$a" ] && [ -n "$b" ] && [ -n "$c" ] && [ -n "$d" ] && [ "$c" -lt "$a" ] && [ "$a" -lt "$b" ] && [ "$d" -lt "$a" ]; echo $?)"
 

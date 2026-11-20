@@ -175,12 +175,20 @@ pkg_absent() {
 }
 
 # no_units_left: no unit file or enablement link of snapd, a snap or the SSM
-# agent in any system or user unit directory. A directory that is absent is
+# agent in any system or user unit directory: the distribution's, the local
+# administrator's (/usr/local/lib), /etc's, and each account's own
+# (~/.config/systemd/user, for /root and every directory under /home — read
+# from the disk, not from a list of names). A directory that is absent is
 # skipped by name; one find cannot read refuses.
 no_units_left() {
-  local d hits
-  for d in /etc/systemd/system /lib/systemd/system /usr/lib/systemd/system \
-           /etc/systemd/user /lib/systemd/user /usr/lib/systemd/user; do
+  local d hits dirs=(/etc/systemd/system /lib/systemd/system /usr/lib/systemd/system
+                     /usr/local/lib/systemd/system /etc/systemd/user /lib/systemd/user
+                     /usr/lib/systemd/user /usr/local/lib/systemd/user)
+  for d in "$R/root" "$R"/home/*; do
+    [ -d "$d" ] || continue
+    dirs+=("${d#"$R"}/.config/systemd/user")
+  done
+  for d in "${dirs[@]}"; do
     [ -e "$R$d" ] || [ -L "$R$d" ] || continue
     hits=$(find "$R$d" \( -type f -o -type l \) \
              \( -name 'snap-*.mount' -o -name 'snapd.*' -o -name 'snap.*' -o -name 'amazon-ssm-agent*' \) -print) \

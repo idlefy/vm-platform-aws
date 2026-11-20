@@ -88,8 +88,10 @@ EOF
 
 # A stock image ships no apt lists: without this the first package the converge
 # asks for has no candidate version (measured on the first build). The fleet's
-# bootstrap does the same before its converge.
-apt-get update -qq
+# bootstrap does the same before its converge. --error-on=any: a list that
+# fails to download (a mirror error, a bad signature) fails the bootstrap here,
+# where plain apt-get update would only warn and exit 0.
+apt-get update --error-on=any -qq
 
 # The scrub writes image-revision here; no solo recipe is guaranteed to create it.
 install -d -m 0755 -o root -g root /etc/dev-vm
