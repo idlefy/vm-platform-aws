@@ -205,6 +205,20 @@ seed_solo() {  # seed_solo DIR
 -A OUTPUT -d fd00:ec2::254/128 -j DROP
 COMMIT
 V6
+  # rules.v4 as iptables-save writes what base::firewall and base::imds install
+  # (`iptables -P INPUT DROP`; `iptables -I OUTPUT 1|3 -d 169.254.169.254 …`).
+  cat > "$1/etc/iptables/rules.v4" <<'V4'
+*filter
+:INPUT DROP [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+-A INPUT -i lo -j ACCEPT
+-A INPUT -p tcp -m tcp --dport 22 -j ACCEPT
+-A OUTPUT -d 169.254.169.254/32 -m owner --uid-owner 0 -j ACCEPT
+-A OUTPUT -d 169.254.169.254/32 -j DROP
+COMMIT
+V4
 }
 SOLO_STATE="$R/var/lib/dev-vm/policy"
 FIRSTBOOT=idlefy-hardened-firstboot.service
@@ -274,6 +288,11 @@ solo_refuses "IMDS drop only in *mangle"    "rules.v6" "printf '%s\n' '*mangle' 
 # Both lines present, but the file stops before *filter's COMMIT (truncated):
 # ip6tables-restore would apply nothing of that table.
 solo_refuses "rules.v6 truncated before COMMIT" "rules.v6" "printf '%s\n' '*filter' ':INPUT DROP [0:0]' '-A OUTPUT -d fd00:ec2::254/128 -j DROP' > etc/iptables/rules.v6"
+solo_refuses "no rules.v4"                  "/etc/iptables/rules.v4 is missing" "rm etc/iptables/rules.v4"
+solo_refuses "rules.v4 INPUT policy ACCEPT" "rules.v4 has no INPUT DROP" "printf '%s\n' '*filter' ':INPUT ACCEPT [0:0]' '-A OUTPUT -d 169.254.169.254/32 -j DROP' 'COMMIT' > etc/iptables/rules.v4"
+solo_refuses "rules.v4 without the IMDS drop" "rules.v4 does not drop 169.254.169.254" "printf '%s\n' '*filter' ':INPUT DROP [0:0]' '-A OUTPUT -d 169.254.169.254/32 -m owner --uid-owner 0 -j ACCEPT' 'COMMIT' > etc/iptables/rules.v4"
+solo_refuses "rules.v4 IMDS drop only in *mangle" "rules.v4 does not drop" "printf '%s\n' '*mangle' '-A OUTPUT -d 169.254.169.254/32 -j DROP' 'COMMIT' '*filter' ':INPUT DROP [0:0]' 'COMMIT' > etc/iptables/rules.v4"
+solo_refuses "rules.v4 truncated before COMMIT" "rules.v4" "printf '%s\n' '*filter' ':INPUT DROP [0:0]' '-A OUTPUT -d 169.254.169.254/32 -j DROP' > etc/iptables/rules.v4"
 solo_refuses "SSM snap still installed"     "amazon-ssm-agent"   ":" SHIM_SSM_SNAP_PRESENT=1
 # snap list fails when snapd is unreachable; the disk still tells.
 solo_refuses "SSM snap mounted though snap list fails" "amazon-ssm-agent" "mkdir -p snap/amazon-ssm-agent/current"

@@ -18,7 +18,10 @@
 #                                           an Identity Center role,
 #                                           github-cfn-publish; user aleksei
 #   iam simulate-principal-policy           explicitDeny for every action, except
-#                                           implicitDeny for names in $LEAKY
+#                                           implicitDeny for names in $LEAKY,
+#                                           allowed for names in $ALLOWED, and
+#                                           for names in $MFA_MASKED allowed
+#                                           only when MFA is simulated present
 # Any call whose "service verb" is in $FAIL_CALL exits 254.
 
 # The checks read `[ … ]; echo $?` and `run_guard; check … "$?"` on purpose.
@@ -37,8 +40,8 @@ printf '# Regions, one per line; the first is the build region.\n\nus-east-1\neu
 
 ACCT=995603458290
 CI_ROLE="arn:aws:iam::$ACCT:role/github-hardened-image-publish"
-IMAGE_ACTIONS="ec2:DeregisterImage ec2:ModifyImageAttribute ec2:ResetImageAttribute ec2:EnableImageDeprecation ec2:DisableImageDeprecation ec2:DisableImage ec2:EnableImage ec2:CreateTags ec2:DeleteTags"
-SNAP_ACTIONS="ec2:DeleteSnapshot ec2:ModifySnapshotAttribute ec2:ResetSnapshotAttribute ec2:CreateTags ec2:DeleteTags"
+IMAGE_ACTIONS="ec2:DeregisterImage ec2:ModifyImageAttribute ec2:ResetImageAttribute ec2:EnableImageDeprecation ec2:DisableImageDeprecation ec2:DisableImage ec2:EnableImage ec2:CreateTags ec2:DeleteTags ec2:EnableImageDeregistrationProtection ec2:DisableImageDeregistrationProtection ec2:AttachImageWatermark ec2:DetachImageWatermark ec2:ReplaceImageInstanceTypeSpecification"
+SNAP_ACTIONS="ec2:DeleteSnapshot ec2:ModifySnapshotAttribute ec2:ResetSnapshotAttribute ec2:CreateTags ec2:DeleteTags ec2:LockSnapshot ec2:UnlockSnapshot ec2:ModifySnapshotTier"
 
 cat > "$T/bin/aws" <<'SH'
 #!/usr/bin/env bash
@@ -107,7 +110,15 @@ JSON
         *) case "$mode" in src) src=$x; mode="" ;; act) actions+=("$x") ;; esac ;;
       esac
     done
-    if in_list "${src##*/}" "${LEAKY:-}"; then d=implicitDeny; else d=explicitDeny; fi
+    d=explicitDeny
+    if in_list "${src##*/}" "${LEAKY:-}"; then d=implicitDeny; fi
+    if in_list "${src##*/}" "${ALLOWED:-}"; then d=allowed; fi
+    # A "require MFA" deny: explicitDeny unless the simulation says MFA is present.
+    if in_list "${src##*/}" "${MFA_MASKED:-}"; then
+      case " $* " in
+        *" ContextKeyName=aws:MultiFactorAuthPresent,ContextKeyValues=true,ContextKeyType=boolean "*) d=allowed ;;
+      esac
+    fi
     python3 -I -c 'import json, sys
 d = sys.argv[1]
 print(json.dumps({"EvaluationResults": [{"EvalActionName": a, "EvalDecision": d} for a in sys.argv[2:]]}))' "$d" "${actions[@]}" ;;
@@ -141,14 +152,16 @@ check "the service-linked role is never simulated" "$([ "$(calls 'AWSServiceRole
 check "the CI role is never simulated" "$(grep -qF -- "--policy-source-arn $CI_ROLE" "$T/aws.log"; [ $? -ne 0 ]; echo $?)"
 check "the Identity Center role is never simulated" "$(grep -qF -- 'AWSReservedSSO_Admin_abc' "$T/aws.log"; [ $? -ne 0 ]; echo $?)"
 check "…but it is reported as skipped, by name, for a manual check" \
-  "$(grep -F 'AWSReservedSSO_Admin_abc' "$T/stdout" | grep -qF 'skipped: AWS-reserved (Identity Center) role — its permission set must carry the deny; check by hand'; echo $?)"
+  "$(grep -F 'AWSReservedSSO_Admin_abc' "$T/stdout" | grep -qF 'skipped: AWS-reserved (Identity Center) role — its permission set must not allow these actions; check by hand'; echo $?)"
 for p in "user/aleksei" "role/github-cfn-publish"; do
-  check "$p: the image actions are exactly the nine" "$([ "$(sim_actions "arn:aws:iam::$ACCT:$p" image)" = "$IMAGE_ACTIONS" ]; echo $?)"
-  check "$p: the snapshot actions are exactly the five" "$([ "$(sim_actions "arn:aws:iam::$ACCT:$p" snapshot)" = "$SNAP_ACTIONS" ]; echo $?)"
+  check "$p: the image actions are exactly the fourteen" "$([ "$(sim_actions "arn:aws:iam::$ACCT:$p" image)" = "$IMAGE_ACTIONS" ]; echo $?)"
+  check "$p: the snapshot actions are exactly the eight" "$([ "$(sim_actions "arn:aws:iam::$ACCT:$p" snapshot)" = "$SNAP_ACTIONS" ]; echo $?)"
 done
 check "two simulations per principal, four in all" "$([ "$(calls 'iam simulate-principal-policy')" = 4 ]; echo $?)"
 check "every simulation carries the fence-tag context" \
   "$([ "$(grep -F 'simulate-principal-policy' "$T/aws.log" | grep -cF 'ContextKeyName=ec2:ResourceTag/IdlefyPublishedImage,ContextKeyValues=true,ContextKeyType=string')" = 4 ]; echo $?)"
+check "every simulation says MFA is present" \
+  "$([ "$(grep -F 'simulate-principal-policy' "$T/aws.log" | grep -cF 'ContextKeyName=aws:MultiFactorAuthPresent,ContextKeyValues=true,ContextKeyType=boolean')" = 4 ]; echo $?)"
 check "image ARNs are image/ ARNs" "$(grep -F 'simulate-principal-policy' "$T/aws.log" | grep -F 'DeregisterImage' | grep -qE -- '--resource-arns arn:aws:ec2:us-east-1::image/ami-[0-9a-f]+ '; echo $?)"
 check "snapshot ARNs are snapshot/ ARNs" "$(grep -F 'simulate-principal-policy' "$T/aws.log" | grep -F 'DeleteSnapshot' | grep -qE -- '--resource-arns arn:aws:ec2:us-east-1::snapshot/snap-[0-9a-f]+ '; echo $?)"
 for r in us-east-1 eu-central-1; do
@@ -167,10 +180,29 @@ check "the public count includes deprecated images and only public ones of this 
 check "read-only: every call is get/list/describe/simulate" \
   "$(awk '{print $3}' "$T/aws.log" | grep -vqE '^(get|list|describe|simulate)-'; [ $? -ne 0 ]; echo $?)"
 
-echo "== a principal without the deny =="
-LEAKY=aleksei run_guard; check "exit 1" "$([ $? -eq 1 ]; echo $?)"
-check "names arn:…:user/aleksei" "$(grep -F "arn:aws:iam::$ACCT:user/aleksei" "$T/stderr" | grep -q 'implicitDeny'; echo $?)"
+echo "== a principal that cannot act needs no explicit deny =="
+LEAKY=aleksei run_guard; check "implicitDeny passes → exit 0" "$?"
+check "…listed as implicitDeny" "$(grep -F "arn:aws:iam::$ACCT:user/aleksei" "$T/stdout" | grep -q 'implicitDeny'; echo $?)"
+
+echo "== a principal that is allowed =="
+ALLOWED=aleksei run_guard; check "exit 1" "$([ $? -eq 1 ]; echo $?)"
+check "names arn:…:user/aleksei and an allowed action" \
+  "$(grep -F "arn:aws:iam::$ACCT:user/aleksei" "$T/stderr" | grep -q 'ec2:DeregisterImage=allowed'; echo $?)"
 check "does not blame github-cfn-publish" "$(grep -qF 'github-cfn-publish' "$T/stderr"; [ $? -ne 0 ]; echo $?)"
+MFA_MASKED=aleksei run_guard
+check "a 'require MFA' deny does not mask an allow → exit 1" \
+  "$([ $? -eq 1 ] && grep -F "arn:aws:iam::$ACCT:user/aleksei" "$T/stderr" | grep -q 'allowed'; echo $?)"
+
+echo "== HARDENED_PUBLIC decides the block-public-access check =="
+BPA_ON="us-east-1 eu-central-1" HARDENED_PUBLIC=false run_guard
+check "private build with block public access on → exit 0" "$?"
+check "…and says it may stay on" "$(grep -qF 'image block public access is not checked and may stay on' "$T/stdout"; echo $?)"
+BPA_ON=us-east-1 HARDENED_PUBLIC=true run_guard
+check "public build with block public access on → exit 1" "$([ $? -eq 1 ] && grep -qF 'block-new-sharing' "$T/stderr"; echo $?)"
+HARDENED_PUBLIC=yes run_guard
+check "HARDENED_PUBLIC=yes refuses before any call" "$([ $? -eq 1 ] && grep -qF "HARDENED_PUBLIC='yes'" "$T/stderr" && [ ! -s "$T/aws.log" ]; echo $?)"
+HARDENED_PUBLIC= run_guard
+check "an empty HARDENED_PUBLIC refuses too" "$([ $? -eq 1 ] && grep -qF 'HARDENED_PUBLIC' "$T/stderr"; echo $?)"
 
 echo "== region settings =="
 ENC_ON=eu-central-1 run_guard; check "encryption by default in eu-central-1 → exit 1" "$([ $? -eq 1 ]; echo $?)"
@@ -203,7 +235,7 @@ check "names both account ids" "$(grep -qF '111111111111' "$T/stderr" && grep -q
 check "no call after sts" "$([ "$(wc -l < "$T/aws.log")" = 1 ] && grep -qF 'aws sts get-caller-identity' "$T/aws.log"; echo $?)"
 
 echo "== every failure is listed, not the first =="
-LEAKY="aleksei github-cfn-publish" ENC_ON=us-east-1 BPA_ON=eu-central-1 PUBLIC_COUNT=5 run_guard
+ALLOWED="aleksei github-cfn-publish" ENC_ON=us-east-1 BPA_ON=eu-central-1 PUBLIC_COUNT=5 run_guard
 check "exit 1" "$([ $? -eq 1 ]; echo $?)"
 for s in "user/aleksei" "role/github-cfn-publish" "encryption-by-default" "block-new-sharing" "L-0E3CBAB9"; do
   check "lists $s" "$(grep -qF "$s" "$T/stderr"; echo $?)"

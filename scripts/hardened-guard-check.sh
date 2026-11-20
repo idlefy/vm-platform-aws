@@ -5,24 +5,35 @@
 # get-*, list-*, describe-* and simulate-* and nothing else.
 #
 #   HARDENED_CI_ROLE_ARN=arn:aws:iam::995603458290:role/<publish role> \
-#     scripts/hardened-guard-check.sh
+#   [HARDENED_PUBLIC=true|false] scripts/hardened-guard-check.sh
+#
+# HARDENED_PUBLIC (default true; anything but true or false is refused) says
+# whether the build about to run is public; it decides one check of G2.
 #
 # Exit 0 = safe to publish. Otherwise exit 1 and every failure is listed, not
 # only the first. Checks:
 #   G1  the caller is in account 995603458290 — nothing else is called if not;
 #   G2  every region of image/hardened/regions: EBS encryption by default is
-#       off (a copy would be encrypted and could not be public), image block
-#       public access is unblocked, and the region is enabled;
+#       off (a copy would be encrypted and could not be public), the region is
+#       enabled, and — for a public build only — image block public access is
+#       unblocked. With HARDENED_PUBLIC=false that one check is skipped: block
+#       public access may stay on for a private build, and then nothing can
+#       become public even by a bug;
 #   G2b SSM Default Host Management Configuration is unset in each region —
 #       otherwise SSM hands the build instance a role although the build gives
 #       it no instance profile (the build holds no credential);
 #   G2c each region has room under the public-AMI quota (L-0E3CBAB9) for one
 #       more public image; deprecated public images count against it;
-#   G3  every IAM user and role other than the publish role and AWS
-#       service-linked roles is explicitly denied every mutation of an image or
-#       snapshot tagged IdlefyPublishedImage=true (IAM policy simulation). Roles
-#       under /aws-reserved/ (Identity Center) cannot be simulated usefully
-#       here and are listed for a manual check;
+#   G3  no IAM user or role other than the publish role and AWS service-linked
+#       roles is ALLOWED any mutation of an image or snapshot tagged
+#       IdlefyPublishedImage=true (IAM policy simulation, with MFA present so
+#       an account's "require MFA" deny cannot mask a principal that is
+#       otherwise allowed). implicitDeny passes like explicitDeny: a principal
+#       that cannot act needs no explicit deny, and attaching the deny to
+#       CloudFormation-created roles makes their stacks undeletable; this
+#       check runs again on every publish. A failed simulation is a failure.
+#       Roles under /aws-reserved/ (Identity Center) cannot be simulated
+#       usefully here and are listed for a manual check;
 #   G4  every region of image/hardened/regions holds no unencrypted snapshot
 #       and no image with an unencrypted snapshot that this account owns and
 #       that is not tagged IdlefyPublishedImage=true. The publisher role can
@@ -46,9 +57,11 @@ QUOTA_CODE=L-0E3CBAB9
 DHMC_SETTING=/ssm/managed-instance/default-ec2-instance-management-role
 IMAGE_ACTIONS=(ec2:DeregisterImage ec2:ModifyImageAttribute ec2:ResetImageAttribute
   ec2:EnableImageDeprecation ec2:DisableImageDeprecation ec2:DisableImage ec2:EnableImage
-  ec2:CreateTags ec2:DeleteTags)
+  ec2:CreateTags ec2:DeleteTags
+  ec2:EnableImageDeregistrationProtection ec2:DisableImageDeregistrationProtection
+  ec2:AttachImageWatermark ec2:DetachImageWatermark ec2:ReplaceImageInstanceTypeSpecification)
 SNAP_ACTIONS=(ec2:DeleteSnapshot ec2:ModifySnapshotAttribute ec2:ResetSnapshotAttribute
-  ec2:CreateTags ec2:DeleteTags)
+  ec2:CreateTags ec2:DeleteTags ec2:LockSnapshot ec2:UnlockSnapshot ec2:ModifySnapshotTier)
 # Simulation needs a concrete resource; the deny is keyed on the tag, not the id.
 SIM_IMAGE_ID=ami-00000000000000000
 SIM_SNAP_ID=snap-00000000000000000
@@ -59,6 +72,9 @@ for c in aws python3; do command -v "$c" >/dev/null || die "$c is not on PATH"; 
 HARDENED_CI_ROLE_ARN="${HARDENED_CI_ROLE_ARN:-}"
 [[ $HARDENED_CI_ROLE_ARN =~ ^arn:aws:iam::$ACCOUNT_ID:role/([A-Za-z0-9+=,.@_-]+/)*[A-Za-z0-9+=,.@_-]+$ ]] \
   || die "HARDENED_CI_ROLE_ARN='$HARDENED_CI_ROLE_ARN' is not a role ARN in account $ACCOUNT_ID — set it to the publish role"
+HARDENED_PUBLIC="${HARDENED_PUBLIC-true}"
+[[ $HARDENED_PUBLIC =~ ^(true|false)$ ]] \
+  || die "HARDENED_PUBLIC='$HARDENED_PUBLIC' must be true or false (unset means true)"
 
 TMPS=()
 # shellcheck disable=SC2317  # reached only through the traps below
@@ -134,6 +150,9 @@ acct="$(jfield "$W/id.json" Account)" || die "sts get-caller-identity returned n
 [ "$acct" = "$ACCOUNT_ID" ] \
   || die "these credentials are for account $acct, not $ACCOUNT_ID — refusing before any region is checked"
 echo "Account $ACCOUNT_ID"
+if [ "$HARDENED_PUBLIC" = false ]; then
+  echo "Private build (HARDENED_PUBLIC=false): image block public access is not checked and may stay on."
+fi
 echo
 
 # ---- G2 the regions --------------------------------------------------------------
@@ -150,8 +169,11 @@ for r in $REGIONS; do
   fi
   if awscall "$W/bpa.json" "$r: ec2 get-image-block-public-access-state" ec2 get-image-block-public-access-state --region "$r"; then
     bpa="$(jfield "$W/bpa.json" ImageBlockPublicAccessState)" || bpa="?"
-    [ "$bpa" = unblocked ] \
-      || fail "$r: image block public access is '$bpa' (block-new-sharing refuses a public image) — set it to unblocked in $r"
+    # Only a public build needs it lifted; a private one is safer with it on.
+    if [ "$HARDENED_PUBLIC" = true ]; then
+      [ "$bpa" = unblocked ] \
+        || fail "$r: image block public access is '$bpa' (block-new-sharing refuses a public image) — set it to unblocked in $r"
+    fi
   fi
   if awscall "$W/opt.json" "$r: account get-region-opt-status" account get-region-opt-status --region-name "$r"; then
     opt="$(jfield "$W/opt.json" RegionOptStatus)" || opt="?"
@@ -196,14 +218,18 @@ echo
 
 # ---- G3 the deny ---------------------------------------------------------------------
 # simulate VAR ARN KIND RESOURCE ACTIONS… — sets VAR to the decision summary of
-# one simulation; records a failure unless every action is explicitDeny. Not
+# one simulation: explicitDeny when every action is, implicitDeny when every
+# action is denied and some only implicitly. Records a failure when any action
+# is allowed, missing from the answer, or the answer is unreadable. MFA is
+# simulated as present, so a "require MFA" deny cannot mask an allow. Not
 # called in $(…): a subshell would lose the failure.
 simulate() {
   local var=$1 arn=$2 kind=$3 res=$4; shift 4
   if ! awscall "$W/sim.json" "$arn: iam simulate-principal-policy ($kind)" \
          iam simulate-principal-policy --policy-source-arn "$arn" --action-names "$@" \
          --resource-arns "$res" \
-         --context-entries "ContextKeyName=ec2:ResourceTag/$FENCE_KEY,ContextKeyValues=true,ContextKeyType=string"; then
+         --context-entries "ContextKeyName=ec2:ResourceTag/$FENCE_KEY,ContextKeyValues=true,ContextKeyType=string" \
+                           "ContextKeyName=aws:MultiFactorAuthPresent,ContextKeyValues=true,ContextKeyType=boolean"; then
     printf -v "$var" '%s' error; return
   fi
   local verdict
@@ -216,15 +242,22 @@ try:
 except (OSError, ValueError, KeyError, TypeError):
     print("FAIL unreadable simulation result")
     sys.exit()
-bad = ["%s=%s" % (a, got.get(a, "missing")) for a in want if got.get(a) != "explicitDeny"]
-print("FAIL " + " ".join(bad) if bad else "explicitDeny")
+denied = ("explicitDeny", "implicitDeny")
+bad = ["%s=%s" % (a, got.get(a, "missing")) for a in want if got.get(a) not in denied]
+if bad:
+    print("FAIL " + " ".join(bad))
+elif all(got[a] == "explicitDeny" for a in want):
+    print("explicitDeny")
+else:
+    print("implicitDeny")
 PY
 )"
-  if [ "$verdict" = explicitDeny ]; then printf -v "$var" '%s' explicitDeny; return; fi
-  fail "$arn: not explicitly denied on a $FENCE_KEY=true $kind: ${verdict#FAIL }"
+  case "$verdict" in
+    explicitDeny|implicitDeny) printf -v "$var" '%s' "$verdict"; return ;;
+  esac
+  fail "$arn: allowed, or not readably denied, on a $FENCE_KEY=true $kind: ${verdict#FAIL }"
   case "$verdict" in
     *=allowed*) printf -v "$var" '%s' allowed ;;
-    *implicitDeny*) printf -v "$var" '%s' implicitDeny ;;
     *) printf -v "$var" '%s' unreadable ;;
   esac
 }
@@ -259,7 +292,7 @@ PY
       case "$what" in
         ci) printf '%-72s %s\n' "$arn" "publish role — not checked" ;;
         missing) fail "$arn: the publish role HARDENED_CI_ROLE_ARN names does not exist in this account" ;;
-        reserved) printf '%-72s %s\n' "$arn" "skipped: AWS-reserved (Identity Center) role — its permission set must carry the deny; check by hand" ;;
+        reserved) printf '%-72s %s\n' "$arn" "skipped: AWS-reserved (Identity Center) role — its permission set must not allow these actions; check by hand" ;;
         check)
           simulate img "$arn" image "arn:aws:ec2:$BUILD_REGION::image/$SIM_IMAGE_ID" "${IMAGE_ACTIONS[@]}"
           simulate snap "$arn" snapshot "arn:aws:ec2:$BUILD_REGION::snapshot/$SIM_SNAP_ID" "${SNAP_ACTIONS[@]}"
@@ -298,11 +331,13 @@ except (OSError, ValueError, KeyError, TypeError):
     sys.exit(1)
 PY
 }
-printf '%-16s %s
-' REGION UNENCRYPTED-UNFENCED
+printf '%-16s %s\n' REGION UNENCRYPTED-UNFENCED
 for r in $REGIONS; do
   col="?"
-  if awscall "$W/snaps.json" "$r: ec2 describe-snapshots (unencrypted, this account)"        ec2 describe-snapshots --region "$r" --owner-ids self --filters Name=encrypted,Values=false      && awscall "$W/own.json" "$r: ec2 describe-images (this account)"        ec2 describe-images --region "$r" --owners self --include-deprecated --include-disabled; then
+  if awscall "$W/snaps.json" "$r: ec2 describe-snapshots (unencrypted, this account)" \
+       ec2 describe-snapshots --region "$r" --owner-ids self --filters Name=encrypted,Values=false \
+     && awscall "$W/own.json" "$r: ec2 describe-images (this account)" \
+       ec2 describe-images --region "$r" --owners self --include-deprecated --include-disabled; then
     if strays "$W/snaps.json" "$W/own.json" > "$W/strays"; then
       col=$(wc -l < "$W/strays")
       while read -r kind id; do
@@ -312,8 +347,7 @@ for r in $REGIONS; do
       fail "$r: describe-snapshots / describe-images returned something unreadable"
     fi
   fi
-  printf '%-16s %s
-' "$r" "$col"
+  printf '%-16s %s\n' "$r" "$col"
 done
 echo
 

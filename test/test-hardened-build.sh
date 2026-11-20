@@ -14,7 +14,13 @@
 #           api …/git/ref/tags/<tag> fails when ${GH_BASE_TAG_MISSING}.
 #   aws     sts get-caller-identity prints ${AWS_ACCOUNT:-995603458290}, or
 #           fails with AWS's error text when ${STS_FAIL};
-#           describe-images … Images[].Name prints ${EXISTING_NAMES} tab-separated.
+#           describe-images … Images[].Name prints ${EXISTING_NAMES_<region>}
+#           (dashes as underscores), else ${EXISTING_NAMES}, tab-separated, and
+#           fails in ${NAMES_FAIL_REGION}; describe-images by exact name (the
+#           leftover listing) prints ${LEFTOVER_<region>}, else no images, and
+#           fails in ${LEFTOVER_FAIL}.
+#   gh      also: the record upload fails when ${GH_RECORD_UPLOAD_FAIL}, the
+#           notes edit when ${GH_NOTES_FAIL}.
 #   packer  build copies the user data and reports an AMI for each region in
 #           ${ARTIFACT_REGIONS:-every region of ami_regions}; exits ${PACKER_RC:-0}.
 # The last section measures the real solo user data against EC2's 16 KB.
@@ -85,7 +91,9 @@ case "$1 ${2:-}" in
     if [ -n "${GH_RELEASE_MISSING:-}" ] && [ ! -e "$GH_STATE/created" ]; then exit 1; fi
     case " $* " in *" --json body "*) printf 'Existing notes.\n' ;; esac ;;
   "release create") : > "$GH_STATE/created" ;;
-  "release upload") cp "$4" "$GH_STATE/" ;;
+  "release upload")
+    case "$4" in *hardened-ami-*.json) [ -z "${GH_RECORD_UPLOAD_FAIL:-}" ] || exit 1 ;; esac
+    cp "$4" "$GH_STATE/" ;;
   "release download")
     pat="" out=""
     while [ $# -gt 0 ]; do case "$1" in --pattern) pat=$2; shift ;; -O) out=$2; shift ;; esac; shift; done
@@ -94,6 +102,7 @@ case "$1 ${2:-}" in
     elif [ -f "$GH_STATE/$pat" ]; then cp "$GH_STATE/$pat" "$out"
     else exit 1; fi ;;
   "release edit")
+    [ -z "${GH_NOTES_FAIL:-}" ] || exit 1
     while [ $# -gt 0 ]; do [ "$1" = --notes-file ] && cp "$2" "$GH_STATE/notes"; shift; done ;;
   api\ repos/*/git/ref/tags/*) [ -z "${GH_BASE_TAG_MISSING:-}" ] || exit 1; echo '{"ref":"x"}' ;;
   *) exit 9 ;;
@@ -107,7 +116,20 @@ case "$1 $2" in
   "sts get-caller-identity")
     if [ -n "${STS_FAIL:-}" ]; then echo "An error occurred (ExpiredToken) when calling the GetCallerIdentity operation: expired" >&2; exit 254; fi
     echo "${AWS_ACCOUNT:-995603458290}" ;;
-  "ec2 describe-images") printf '%s\n' "$(printf '%s\t' ${EXISTING_NAMES:-} | sed 's/\t$//')" ;;
+  "ec2 describe-images")
+    region=""; a=("$@")
+    for ((i = 0; i < ${#a[@]}; i++)); do [ "${a[i]}" != --region ] || region=${a[i+1]}; done
+    case " $* " in
+      *" --query "*)
+        if [ "$region" = "${NAMES_FAIL_REGION:-}" ]; then echo "An error occurred (UnauthorizedOperation) in $region" >&2; exit 254; fi
+        var="EXISTING_NAMES_${region//-/_}"; names="${!var-${EXISTING_NAMES:-}}"
+        printf '%s\n' "$(printf '%s\t' $names | sed 's/\t$//')" ;;
+      *)
+        if [ "$region" = "${LEFTOVER_FAIL:-}" ]; then echo "An error occurred (RequestLimitExceeded) in $region" >&2; exit 254; fi
+        var="LEFTOVER_${region//-/_}"; v="${!var:-}"
+        [ -n "$v" ] || v='{"Images": []}'
+        printf '%s\n' "$v" ;;
+    esac ;;
   *) exit 9 ;;
 esac
 SH
@@ -334,6 +356,39 @@ ARTIFACT_REGIONS="${REGIONS[*]} me-south-1" run_build
 check "a region the file does not list refuses too" "$([ $? -ne 0 ] && [ ! -e "$RECORD" ]; echo $?)"
 PACKER_RC=1 run_build
 check "packer fails → refuses, no record" "$([ $? -ne 0 ] && [ ! -e "$RECORD" ] && ! grep -q 'release edit' "$T/gh.log"; echo $?)"
+
+echo "== a failure after the images were made lists them, read-only =="
+LEFT='{"Images": [{"ImageId": "ami-0aaa", "Name": "'"$P-01"'", "State": "available", "Public": true, "Tags": [{"Key": "IdlefyPublishedImage", "Value": "true"}]}]}'
+LEFTOVER_us_east_2="$LEFT" LEFTOVER_FAIL=sa-east-1 PACKER_RC=1 run_build; rc=$?
+check "packer fails → exit 1, the original status" "$([ $rc -eq 1 ]; echo $?)"
+check "...a heading says they may be public and no record names them" \
+  "$(grep -qF "Images named $P-01 may exist, and may be PUBLIC; no release record names them." "$T/stderr"; echo $?)"
+check "...each region read, by exact name, read-only" \
+  "$([ "$(grep -cF -- "--filters Name=name,Values=$P-01 --output json" "$T/aws.log")" = "${#REGIONS[@]}" ] \
+     && ! grep -qE '^aws ec2 (deregister|delete|disable|modify)' "$T/aws.log"; echo $?)"
+check "...the leftover: region, id, state, public, fence tag" \
+  "$(grep -qF 'us-east-2: ami-0aaa  state=available  public=true  IdlefyPublishedImage=true: yes' "$T/stderr"; echo $?)"
+check "...a region with none says none" "$(grep -qxF '   us-east-1: none' "$T/stderr"; echo $?)"
+check "...a failed describe is printed, not hidden" "$(grep -qF 'sa-east-1: could not list (check by hand): An error occurred (RequestLimitExceeded)' "$T/stderr"; echo $?)"
+check "...the old 'serial console holds the log' claim is gone" "$(! grep -qF "the instance's serial console holds the bootstrap log" "$T/stderr"; echo $?)"
+LEFTOVER_us_east_1="$LEFT" ARTIFACT_REGIONS="us-east-1" run_build
+check "an artifact short of regions → the images are listed" \
+  "$([ $? -ne 0 ] && grep -qF 'us-east-1: ami-0aaa' "$T/stderr"; echo $?)"
+LEFTOVER_us_east_1="$LEFT" GH_RECORD_UPLOAD_FAIL=1 run_build
+check "the record upload fails → the images are listed" \
+  "$([ $? -ne 0 ] && grep -qF 'may be PUBLIC' "$T/stderr" && grep -qF 'us-east-1: ami-0aaa' "$T/stderr"; echo $?)"
+LEFTOVER_us_east_1="$LEFT" GH_NOTES_FAIL=1 run_build
+check "the notes edit fails after the record is up → no leftover list" \
+  "$([ $? -ne 0 ] && grep -qF 'release notes were not updated' "$T/stderr" && ! grep -qF 'may be PUBLIC' "$T/stderr"; echo $?)"
+LEFTOVER_us_east_1="$LEFT" run_build
+check "a green build lists nothing" "$([ $? -eq 0 ] && ! grep -qF 'may be PUBLIC' "$T/stderr"; echo $?)"
+
+echo "== NN counts every region, and a region it cannot read refuses =="
+EXISTING_NAMES_us_east_2="$P-04" run_build
+check "-04 only in us-east-2 → -05" "$([ $? -eq 0 ] && var "ami_name=$P-05"; echo $?)"
+NAMES_FAIL_REGION=ap-south-1 run_build
+check "a failed describe in ap-south-1 refuses, naming it, packer never runs" \
+  "$([ $? -ne 0 ] && grep -qF 'ap-south-1' "$T/stderr" && [ ! -s "$T/packer.log" ]; echo $?)"
 
 echo "== public=false and an attached org =="
 PUBLIC=false ORG=0b7c3c1e-5f0e-4b8e-9a51-3f0c2d1e4a5b run_build; check "exits 0" "$?"

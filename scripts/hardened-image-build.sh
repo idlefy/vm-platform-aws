@@ -213,10 +213,15 @@ ARCHIVE_URL="https://github.com/$GH_REPO/releases/download/$PLATFORM_TAG/$ASSET"
 # ---- 6. the name -----------------------------------------------------------------
 # One past the highest NN in use today, not the count: a deregistered -01
 # next to a live -02 must not yield -02 again. Deprecated and disabled images
-# keep their names, so they are read too.
-NAMES="$(aws ec2 describe-images --region "$BUILD_REGION" --owners self --include-deprecated --include-disabled \
-      --filters "Name=name,Values=$NAME_PREFIX-$DATE-*" --query 'Images[].Name' --output text)" \
-  || die "could not list today's images in $BUILD_REGION — check the credentials, and that the AWS CLI is v2 with --include-disabled"
+# keep their names, so they are read too — in every region, since a copy left
+# behind by a failed build can hold a name the build region no longer has.
+NAMES=""
+for r in $REGIONS; do
+  n="$(aws ec2 describe-images --region "$r" --owners self --include-deprecated --include-disabled \
+        --filters "Name=name,Values=$NAME_PREFIX-$DATE-*" --query 'Images[].Name' --output text)" \
+    || die "could not list today's images in $r — check the credentials, and that the AWS CLI is v2 with --include-disabled"
+  NAMES="$NAMES $n"
+done
 NN="$(python3 -I - "$NAMES" "$NAME_PREFIX-$DATE" <<'PY'
 import re, sys
 names, prefix = sys.argv[1].split(), sys.argv[2]
@@ -281,6 +286,49 @@ echo "Building $AMI_NAME ($PLATFORM_TAG, $BASE_TAG, archive ${ARCHIVE_SHA256:0:1
 packer init "$IMG" >/dev/null \
   || die "packer init failed — it needs network access to the plugin registry; run 'packer init image/hardened' by hand to see why"
 tmp PKLOG
+
+# From here until the record is on the release, a failure can leave images
+# named $AMI_NAME in some regions — possibly public — that no record names.
+# leftovers lists them (read-only) on stderr; the exit status stays the
+# failure's own.
+leftovers() {
+  local r out
+  echo >&2
+  echo "!! Images named $AMI_NAME may exist, and may be PUBLIC; no release record names them." >&2
+  echo "!! Deregister them and delete their snapshots by hand before any retention run or new" >&2
+  echo "!! build — docs/runbook.md, \"A hardened build that failed after its images\"." >&2
+  for r in $REGIONS; do
+    if ! out="$(aws ec2 describe-images --region "$r" --owners self --include-deprecated --include-disabled \
+                  --filters "Name=name,Values=$AMI_NAME" --output json 2>"$W/leftovers.err")"; then
+      echo "   $r: could not list (check by hand): $(tr '\n' ' ' < "$W/leftovers.err")" >&2
+      continue
+    fi
+    python3 -I - "$r" "$out" "$AMI_NAME" >&2 <<'PY' || echo "   $r: unreadable answer (check by hand)" >&2
+import json, sys
+region, answer, name = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    images = [i for i in json.loads(answer)["Images"] if i.get("Name") == name]
+    rows = []
+    for i in images:
+        fenced = any(t.get("Key") == "IdlefyPublishedImage" and t.get("Value") == "true" for t in i.get("Tags") or [])
+        rows.append("   %s: %s  state=%s  public=%s  IdlefyPublishedImage=true: %s"
+                    % (region, i["ImageId"], i.get("State", "?"), str(i.get("Public")).lower(), "yes" if fenced else "no"))
+except (ValueError, KeyError, TypeError, AttributeError):
+    sys.exit(1)
+print("\n".join(rows) if rows else "   %s: none" % region)
+PY
+  done
+}
+IMAGES_MAY_EXIST=1
+# shellcheck disable=SC2317  # reached only through the trap
+on_exit() {
+  local rc=$?
+  if [ "$rc" -ne 0 ] && [ "$IMAGES_MAY_EXIST" = 1 ]; then leftovers || true; fi
+  cleanup
+  exit "$rc"
+}
+trap on_exit EXIT
+
 # -machine-readable: the artifact line is the only reliable source of the AMI
 # ids. The ui lines are echoed as they come, so the operator sees progress.
 packer build -machine-readable \
@@ -301,7 +349,7 @@ packer build -machine-readable \
   "$IMG" \
   | tee "$PKLOG" \
   | awk -F, '$3 == "ui" { m = $5; for (i = 6; i <= NF; i++) m = m "," $i; gsub(/%!\(PACKER_COMMA\)/, ",", m); gsub(/\\n/, "\n", m); print m; fflush() }' \
-  || die "packer build failed — no record is written; the instance's serial console holds the bootstrap log"
+  || die "packer build failed — no record is written. A failure before the image was taken left its reason on the build instance's serial console; one during the copies may have left images (listed below)"
 
 # ---- 9. the record ---------------------------------------------------------------
 # "<region>:<ami>,<region>:<ami>", commas escaped as %!(PACKER_COMMA). Every
@@ -313,7 +361,7 @@ tmp RECORD_TMP; tmp NOTES_ADD
 python3 -I - "$ARTIFACT" "$RECORD_TMP" "$NOTES_ADD" "$REGIONS" "$AMI_NAME" "$OWNER_ID" "$HARDENED_PUBLIC" \
   "$VOLUME_GIB" "$PLATFORM_TAG" "$PLATFORM_SHA" "$BASE_TAG" "$ARCHIVE_SHA256" "$ARCHIVE_URL" "$ASSET" \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(basename "$RECORD")" <<'PY' \
-  || die "packer's artifact does not name exactly the regions of image/hardened/regions — no record is written"
+  || die "packer built images, but its artifact does not name exactly the regions of image/hardened/regions — no record is written; the images are listed below"
 import json, re, sys
 (artifact, record, notes, regions, name, owner, public, volume, tag, sha, base_tag,
  archive_sha, archive_url, asset, built_at, record_name) = sys.argv[1:]
@@ -359,7 +407,9 @@ PY
 chmod 0644 "$RECORD_TMP"
 mv "$RECORD_TMP" "$RECORD"
 gh release upload -R "$GH_REPO" "$PLATFORM_TAG" "$RECORD" >/dev/null \
-  || die "the AMIs exist but the record $RECORD was not uploaded — upload it to $PLATFORM_TAG by hand (gh release upload)"
+  || die "the AMIs exist but the record $RECORD was not uploaded — upload it to $PLATFORM_TAG by hand (gh release upload), or treat the images below as leftovers"
+# The record names the images now: a later failure leaves nothing unnamed.
+IMAGES_MAY_EXIST=0
 tmp NOTES
 gh release view -R "$GH_REPO" "$PLATFORM_TAG" --json body -q .body > "$NOTES" \
   && cat "$NOTES_ADD" >> "$NOTES" \

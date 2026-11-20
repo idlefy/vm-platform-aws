@@ -103,15 +103,15 @@ solo_prep() {
   EMPTY=("${EMPTY_SOLO[@]}")
 }
 
-# filter_has ERE: a line of rules.v6's *filter table matches, and that table
-# is closed by its COMMIT — ip6tables-restore applies no table it never sees
-# committed, so a truncated file counts as no match.
+# filter_has FILE ERE: a line of FILE's *filter table matches, and that table
+# is closed by its COMMIT — iptables-restore applies no table it never sees
+# committed, so a truncated file counts as no match, and so does a missing one.
 filter_has() {
-  awk -v re="$1" '
+  awk -v re="$2" '
     /^\*/       { t = $0; m = 0 }
     t == "*filter" && $0 ~ re { m = 1 }
     /^COMMIT$/  { if (t == "*filter" && m) f = 1; t = ""; m = 0 }
-    END         { exit !f }' "$R/etc/iptables/rules.v6" 2>/dev/null
+    END         { exit !f }' "$R$1" 2>/dev/null
 }
 
 # Hook 3, immediately before cloud-init clean, on the disk Packer is about to
@@ -149,12 +149,18 @@ solo_check() {
   for g in $grp; do
     case $g in sudo | admin | adm | lxd) refuse "ubuntu is in group $g" ;; esac
   done
-  # 6. The persisted v6 rules as ip6tables-save writes them, in the filter
-  #    table only (*filter … COMMIT): the INPUT policy is a chain header (never
-  #    a -P line), and base::imds's IMDS drop (`ip6tables -I OUTPUT 3 -d
-  #    fd00:ec2::254 -j DROP`) is saved as an OUTPUT rule with its /128.
-  filter_has '^:INPUT DROP( |$)' || refuse "/etc/iptables/rules.v6 has no INPUT DROP policy in *filter"
-  filter_has '^-A OUTPUT -d fd00:ec2::254/128 -j DROP$' \
+  # 6. The persisted rules as iptables-save / ip6tables-save write them, in the
+  #    filter table only (*filter … COMMIT): the INPUT policy is a chain header
+  #    (never a -P line), and base::imds's IMDS drops (`iptables -I OUTPUT 3 -d
+  #    169.254.169.254 -j DROP`, `ip6tables -I OUTPUT 3 -d fd00:ec2::254 -j
+  #    DROP`) are saved as OUTPUT rules with their /32 and /128.
+  for f in /etc/iptables/rules.v4 /etc/iptables/rules.v6; do
+    [ -f "$R$f" ] || refuse "$f is missing"
+    filter_has "$f" '^:INPUT DROP( |$)' || refuse "$f has no INPUT DROP policy in a committed *filter"
+  done
+  filter_has /etc/iptables/rules.v4 '^-A OUTPUT -d 169\.254\.169\.254/32 -j DROP$' \
+    || refuse "/etc/iptables/rules.v4 does not drop 169.254.169.254 (IMDS) in a committed *filter OUTPUT"
+  filter_has /etc/iptables/rules.v6 '^-A OUTPUT -d fd00:ec2::254/128 -j DROP$' \
     || refuse "/etc/iptables/rules.v6 does not drop fd00:ec2::254 (IMDS v6) in *filter OUTPUT"
   # 7. The SSM agent is an inbound instruction channel. `snap list` also fails
   #    when snapd is unreachable, so the disk is checked as well.

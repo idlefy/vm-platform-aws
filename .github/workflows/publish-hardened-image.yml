@@ -113,6 +113,9 @@ jobs:
       - name: guard
         env:
           HARDENED_CI_ROLE_ARN: ${{ vars.HARDENED_PUBLISH_ROLE_ARN }}
+          # The same value as the build step's: a private build may keep image
+          # block public access on, and the guard then does not ask for it off.
+          HARDENED_PUBLIC: ${{ github.event_name == 'schedule' && 'true' || inputs.public }}
         run: scripts/hardened-guard-check.sh
 
       - name: build
