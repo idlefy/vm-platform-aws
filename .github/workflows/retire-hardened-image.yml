@@ -49,8 +49,7 @@ jobs:
         with:
           persist-credentials: false
 
-      # COORDINATOR: the same SHA as in publish-hardened-image.yml.
-      - uses: aws-actions/configure-aws-credentials@REPLACE_WITH_COMMIT_SHA # v5
+      - uses: aws-actions/configure-aws-credentials@00943011d9042930efac3dcd3a170e4273319bc8 # v5.1.0
         with:
           role-to-assume: ${{ vars.HARDENED_PUBLISH_ROLE_ARN }}
           aws-region: us-east-1
