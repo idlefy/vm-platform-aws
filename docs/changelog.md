@@ -19,19 +19,27 @@ the cookbook does not. No base release: the image still converges
   the purge. A purge's leftovers (`/var/lib/snapd`, `/snap`, `/var/snap`,
   `/var/cache/snapd`, `/root/snap`, `/home/*/snap`) are removed. The image is
   refused unless snapd, any SSM agent package and every snap or snapd unit
-  are gone. `apt-get clean` drops the package cache (321 MB); the apt lists
-  stay. To use a snap, the admin installs snapd.
+  are gone, including user units, `/usr/bin/snap` and `/usr/lib/snapd/snapd`.
+  A `dpkg-query` that cannot answer refuses too. `apt-get clean` drops the
+  package cache (321 MB); the apt lists stay. To use a snap, the admin
+  installs snapd.
+- The solo scrub requires a successful `fstrim` of `/` after its removals:
+  freed blocks of a public snapshot are readable. The fleet scrub's trim
+  stays best-effort.
 - The build driver reads the build instance's serial console while Packer
-  runs. On the bootstrap's `BOOTSTRAP FAILED` banner or the scrub's refusal,
-  it prints the console's tail and interrupts Packer, so the instance and its
-  key pair are removed. The build then fails with the reason. Before this, a
-  build that failed in 28 s waited out Packer's 2-hour budget. A console
-  read error is noted, never fatal.
+  runs. On the bootstrap's `BOOTSTRAP FAILED` banner or a scrub refusal, as a
+  whole line, it prints the console's tail and interrupts Packer, so the
+  instance and its key pair are removed. The build then fails with the
+  reason, whatever Packer reports. Before this, a build that failed in 28 s
+  waited out Packer's 2-hour budget. A console read error is noted, never
+  fatal. The watcher never outlives the driver.
 - `scripts/hardened-image-leftovers.sh` also lists the build instance and
   Packer's `packer_*` key pair, and `--clean-build` removes exactly those.
-  The publish workflow's `leftovers` step runs it after a failed, cancelled
-  or timed-out build, with or without an image name. An Actions cancel had
-  left both running. Images are still only listed.
+  It refuses unless the credentials are the publisher account's. The
+  publish workflow's `leftovers` step runs it after a failed, cancelled or
+  timed-out build, with or without an image name, and says so instead when
+  the run never got AWS credentials. An Actions cancel had left both
+  running. Images are still only listed.
 - Measured: for Canonical's source image the IAM condition key `ec2:Owner` is
   the alias `amazon`, not the account id. The publisher role's condition
   (outside this repository) was fixed to match.

@@ -295,14 +295,28 @@ reaches it only through what the customer's own account does to the instance
          puts a filter `OUTPUT` line ahead of the drop: Docker is rootless
          (the system daemon is stopped, and dockerd's own OUTPUT jump is in
          `*nat`), and Tailscale's chains hang off `INPUT` and `FORWARD`;
-      7. dpkg reports neither `snapd` nor an `amazon-ssm-agent` package as
-         installed; `/var/lib/snapd` and `/snap` are gone; no unit file named
-         `snap-*.mount`, `snapd.*`, `snap.*` or `amazon-ssm-agent*` is left
-         under `/etc/systemd/system`, `/lib/systemd/system` or
-         `/usr/lib/systemd/system` (with the snap check in `solo_prep`, no
-         SSM agent can be on the image);
-      8. dpkg reports `cinc` as not installed;
-      9. `/etc/dev-vm` — checked by `solo_dir` above.
+      7. dpkg knows neither `snapd` nor an `amazon-ssm-agent` package, or
+         knows it as `not-installed` — any other answer, including a
+         `dpkg-query` error, refuses; `/var/lib/snapd`, `/snap`,
+         `/usr/bin/snap` and `/usr/lib/snapd/snapd` are gone; no file or link
+         named `snap-*.mount`, `snapd.*`, `snap.*` or `amazon-ssm-agent*` is
+         left in a system or user unit directory (`/etc/systemd/system`,
+         `/etc/systemd/user`, `/lib/…` and `/usr/lib/systemd/{system,user}`,
+         enablement links included — snapd ships
+         `snapd.session-agent.{service,socket}` as user units); an absent
+         directory is skipped by name, and one `find` cannot read refuses
+         (with the snap check in `solo_prep`, no SSM agent can be on the
+         image);
+      8. dpkg reports `cinc` as unknown or not installed, by the same strict
+         rule;
+      9. `/etc/dev-vm` — checked by `solo_dir` above;
+      10. last, `fstrim -v /` succeeds. A public snapshot's freed blocks are
+          readable (Security notes), and the removals above include the
+          build's snapd device key, so for this image a failed trim of the
+          root filesystem refuses it. The shared scrub's own `fstrim -av ||
+          true`, after `cloud-init clean`, stays best-effort: the fleet's
+          behaviour does not change, and the solo profile's strictness lives
+          only in its own hook.
 
 13. **The publisher role is scoped to the build's own tags and a fixed,
     no-ingress security group.** The account also runs the dev organization's
@@ -317,6 +331,15 @@ reaches it only through what the customer's own account does to the instance
     the same `Name` tag (it is created with the run tags), so the role may
     delete exactly those key pairs and terminate exactly those instances —
     which the workflow's `leftovers` step does after a killed run.
+    Beyond what Packer needs, this repository's scripts use, under that role:
+    `GetConsoleOutput` on the build instance (the console watcher),
+    `DescribeInstances` and `DescribeKeyPairs` (the leftovers listing),
+    `TerminateInstances` and `DeleteKeyPair` (`--clean-build`), and
+    `DescribeImages`. If the role's `ec2:Describe*` is ever narrowed to
+    single actions, keep `DescribeInstances`, `DescribeKeyPairs` and
+    `DescribeImages`: without them a killed run's instance is neither listed
+    nor removed, and the watcher's instance is the one Packer names, so it
+    needs no describe at all.
 
 14. **How the release gets created.** `make release TAG=vX.Y.Z` cuts and the
     owner pushes only the git **tag**; nothing in this repository creates a
@@ -401,26 +424,59 @@ file exists**: only build resources carry that tag, the publisher role may
 touch nothing else, and the concurrency group lets no other publish run be
 live, so there is nothing else it could remove — while a leftover from an
 earlier killed run would otherwise survive. Images are never removed by it.
+Before any terminate or delete, `--clean-build` checks that
+`sts get-caller-identity` names the publisher account — the id it reads from
+`scripts/hardened-guard-check.sh` (G1's `ACCOUNT_ID`), not a copy of its own;
+a different account or an unreadable identity stops it with nothing listed or
+removed. When the job's credentials step never succeeded, the step only says
+"No AWS credentials were configured: nothing could have been launched." and
+exits 0 (the step reads that step's outcome through `env:`).
 
 ### A build whose bootstrap or scrub failed
 
 `bootstrap-solo` fails closed and leaves the instance **running**, so its
-serial console keeps the log (`BOOTSTRAP FAILED: no image will be taken. Log
-follows.`); the scrub's refusal does the same (`dev-vm-image-scrub: … no image
-will be taken`). Packer, with `communicator = "none"`, only waits for the
-instance to stop — measured on the second run, it would have waited its whole
-budget (480 × 15 s = 2 h) after a bootstrap that failed in 28 s. So while
-`packer build` runs, the driver reads the console of the instance Packer
-names (`Instance ID: i-…` in its own log, never another run's) every 30 s
-with `get-console-output --latest`. On either marker it prints the console's
-tail into the job log, sends Packer SIGINT — Packer then terminates the
-instance and deletes its key pair — and fails with "the bootstrap failed on
-the build instance" (or "the image scrub refused the image …"). A console
+serial console keeps the log; the scrub's refusal does the same. Packer, with
+`communicator = "none"`, only waits for the instance to stop — measured on
+the second run, it would have waited its whole budget (480 × 15 s = 2 h)
+after a bootstrap that failed in 28 s. So while `packer build` runs, the
+driver reads the console of the instance Packer names (`Instance ID: i-…` in
+its own log, never another run's) every 30 s with
+`get-console-output --latest`. The markers are **whole lines** (a trailing
+carriage return allowed), so a console that merely quotes one inside another
+line is not a failure:
+
+- `BOOTSTRAP FAILED: no image will be taken. Log follows.` — the bootstrap's
+  banner, exactly as `bootstrap-solo` prints it (a test pins the two equal);
+- a line starting `dev-vm-image-scrub: internal error` or
+  `dev-vm-image-scrub: refusing` — every exit-70 message either scrub logs,
+  including the three early ones that do not say "no image will be taken"
+  (a test holds every `log` call of both scrubs to those prefixes or
+  `note:`). The fleet scrub's wording is matched, not changed.
+
+On a marker it prints the console's tail into the job log, sends Packer
+SIGINT — Packer then terminates the instance and deletes its key pair — and
+fails with "the bootstrap failed on the build instance" (or "the image scrub
+refused the image …") **whatever Packer's own exit status**: a Packer that
+took the interrupt and still reported an artifact writes no record. A console
 that cannot be read is noted once and is not a failure. A good build shows
-nothing: a stopped instance's console reads empty (measured), and the watcher
-ends with Packer. Packer runs in the foreground of the pipeline, its pid
-written to a file for the watcher: started as a background job it would
-inherit an ignored SIGINT, which a Go program keeps.
+nothing: a stopped instance's console reads empty (measured).
+
+The watcher's lifetime: it runs in the background and is stopped and reaped
+on every way out of the driver — after `packer build` returns, and in the
+EXIT trap on a failure, INT or TERM, before the temporary directory is
+removed; stopping it also kills its pending sleep or in-flight console read,
+so no orphan holds the job's output open. As a backstop it returns on its own
+once that directory or the driver's process is gone. A test sends SIGINT to
+the whole session before the first poll and finds no process of it left.
+Packer runs in the foreground of the pipeline, its pid written to a file for
+the watcher: started as a background job it would inherit an ignored SIGINT,
+which a Go program keeps.
+
+**Nothing the bootstrap or the converge prints may be a secret**: a failure's
+console tail — up to 80 lines, the last 56 kB of the bootstrap's log behind
+the banner — lands in the job log, which everyone who can read the
+repository's Actions can read. The build holds no credential (decision 3);
+keep it so, and keep secrets out of the converge's output.
 
 ### Workflows
 
@@ -488,7 +544,15 @@ trailing comment. No input or ref name is interpolated into a `run:` script.
   build ever wrote to disk is therefore public: the converge state stays on
   tmpfs (`/run/dev-vm/solo`), no credential ever reaches the instance, and
   the scrub list names nothing secret — only per-instance identity (host keys,
-  machine id, engine ids) that must differ between clones.
+  machine id, engine ids) that must differ between clones. The one exception
+  was snapd's device key, which the scrub now removes with snapd; the solo
+  profile therefore requires a successful trim of `/` after the removals
+  (decision 12, check 10). What `cloud-init clean` deletes after that check
+  (cloud-init's own logs and state) is trimmed only best-effort.
+- **The build instance's id directory.** `/var/lib/cloud/instances/<id>`
+  (three semaphore files) stays in the image: cloud-init's final modules write
+  it after the scrub returns. It names a terminated instance and nothing
+  else; accepted as a residual.
 - **Packer's temporary key pair.** The template uses `communicator = "none"`,
   so Packer never connects. If the plugin still registers a temporary key
   pair, its public half lands in `authorized_keys` through cloud-init — the
@@ -599,7 +663,8 @@ Found and fixed in `v2.2.1`:
 
 Harmless, left as is: the scrub scripts stay in `/usr/local/sbin`; the build
 instance's id directory under `/var/lib/cloud/instances` (three semaphore
-files).
+files) — cloud-init's final modules write it after the scrub returns, so the
+scrub cannot remove it (Security notes).
 
 Still to verify on the first Packer-built private image, before any public
 build — none of it was exercised by hand:

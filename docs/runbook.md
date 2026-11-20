@@ -636,7 +636,9 @@ tenant. How it is built, published and retired is in
 
 The build log says "the bootstrap failed on the build instance" (or "the
 image scrub refused the image …") and shows the end of the instance's serial
-console above it. The build ends by itself about a minute after the failure:
+console above it. The build ends by itself about a minute after the failure (the console tail
+in the log is the instance's own output — the build prints no secret, and must
+not):
 the driver reads the console while Packer runs, interrupts Packer, and Packer
 terminates the instance and deletes its key pair. No image is taken and
 nothing needs cleaning. Fix the cause the console names (it is the converge
@@ -646,10 +648,14 @@ If the run was **cancelled or timed out** instead, Packer never cleaned up.
 The workflow's `leftovers` step then terminates every instance tagged
 `Name=idlefy-hardened-image-build` that is still alive in the build region
 and deletes every `packer_*` key pair with that tag, and lists both in the
-job summary. Nothing else is removed — never an image. If that step could
-not run or reports "could not terminate" / "could not delete", run
-`scripts/hardened-image-leftovers.sh --clean-build` with credentials that
-may (the publisher role may do exactly this), or remove them in the console.
+job summary. Nothing else is removed — never an image. It first checks the
+credentials are the publisher account's and stops, removing nothing, if not.
+If the run never got AWS credentials, the step says "No AWS credentials were
+configured: nothing could have been launched." — nothing to clean. If that
+step could not run or reports "could not terminate" / "could not delete",
+run `scripts/hardened-image-leftovers.sh --clean-build` with the publisher
+account's credentials (the publisher role may do exactly this), or remove
+them in the console.
 
 #### A hardened build that failed after its images
 
