@@ -102,7 +102,10 @@ print(json.dumps({"Images": [{"ImageId": "ami-%017x" % i, "Public": True} for i 
   {"Path": "/", "RoleName": "github-hardened-image-publish", "Arn": "arn:aws:iam::995603458290:role/github-hardened-image-publish"},
   {"Path": "/aws-service-role/support.amazonaws.com/", "RoleName": "AWSServiceRoleForSupport", "Arn": "arn:aws:iam::995603458290:role/aws-service-role/support.amazonaws.com/AWSServiceRoleForSupport"},
   {"Path": "/aws-reserved/sso.amazonaws.com/", "RoleName": "AWSReservedSSO_Admin_abc", "Arn": "arn:aws:iam::995603458290:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_Admin_abc"},
-  {"Path": "/", "RoleName": "github-cfn-publish", "Arn": "arn:aws:iam::995603458290:role/github-cfn-publish"}
+  {"Path": "/", "RoleName": "github-cfn-publish", "Arn": "arn:aws:iam::995603458290:role/github-cfn-publish"}$(
+  for ((k = 1; k <= ${EXTRA_ROLES:-0}; k++)); do
+    printf ',\n  {"Path": "/", "RoleName": "extra-%02d", "Arn": "arn:aws:iam::995603458290:role/extra-%02d"}' "$k" "$k"
+  done)
 ]}
 JSON
     ;;
@@ -185,14 +188,14 @@ sim_actions() {
 
 echo "== everything in order → safe to publish =="
 run_guard; check "exit 0" "$?"
-for p in user/aleksei role/github-cfn-publish; do
-  check "lists $p with explicitDeny" "$(grep -F "arn:aws:iam::$ACCT:$p" "$T/stdout" | grep -q 'explicitDeny'; echo $?)"
-done
+check "passing principals are counted, not listed" \
+  "$(grep -qxF 'G3: 2 principals carry the deny everywhere; 0 do not (44 decisions each)' "$T/stdout" \
+     && ! grep -qF 'user/aleksei' "$T/stdout"; echo $?)"
 check "the service-linked role is never simulated" "$([ "$(calls 'AWSServiceRoleForSupport')" = 0 ]; echo $?)"
 check "the CI role is never simulated" "$(grep -qF -- "--policy-source-arn $CI_ROLE" "$T/aws.log"; [ $? -ne 0 ]; echo $?)"
 check "the Identity Center role is never simulated" "$(grep -qF -- 'AWSReservedSSO_Admin_abc' "$T/aws.log"; [ $? -ne 0 ]; echo $?)"
 check "…but it is reported as skipped, by name, for a manual check" \
-  "$(grep -F 'AWSReservedSSO_Admin_abc' "$T/stdout" | grep -qF 'skipped: AWS-reserved (Identity Center) role — its permission set must not allow these actions; check by hand'; echo $?)"
+  "$(grep -F 'AWSReservedSSO_Admin_abc' "$T/stdout" | grep -qF 'AWS-reserved (Identity Center) role; its permission set must carry the deny; check by hand'; echo $?)"
 for p in "user/aleksei" "role/github-cfn-publish"; do
   check "$p: the image actions are exactly the fourteen" "$([ "$(sim_actions "arn:aws:iam::$ACCT:$p" image)" = "$IMAGE_ACTIONS" ]; echo $?)"
   check "$p: the snapshot actions are exactly the eight" "$([ "$(sim_actions "arn:aws:iam::$ACCT:$p" snapshot)" = "$SNAP_ACTIONS" ]; echo $?)"
@@ -220,27 +223,41 @@ check "the public count includes deprecated images and only public ones of this 
 check "read-only: every call is get/list/describe/simulate" \
   "$(awk '{print $3}' "$T/aws.log" | grep -vqE '^(get|list|describe|simulate)-'; [ $? -ne 0 ]; echo $?)"
 
-echo "== a principal that cannot act needs no explicit deny =="
-LEAKY=aleksei run_guard; check "implicitDeny passes → exit 0" "$?"
-check "…listed as implicitDeny" "$(grep -F "arn:aws:iam::$ACCT:user/aleksei" "$T/stdout" | grep -q 'implicitDeny'; echo $?)"
+HINT='attach deny-idlefy-published-image-mutation to these principals (terraform apply in idlefy/infra, terraform/aws/account)'
+# line_of P — the stderr failure line for principal P.
+line_of() { grep -F "arn:aws:iam::$ACCT:$1:" "$T/stderr"; }
 
-echo "== G3 reads conditions and every region's resource =="
+echo "== G3: only explicitDeny everywhere passes =="
+LEAKY=aleksei run_guard; check "implicitDeny everywhere → exit 1" "$([ $? -eq 1 ]; echo $?)"
+check "…one line: all 44 decisions, worst implicitDeny, three examples" \
+  "$([ "$(grep -cF 'user/aleksei' "$T/stderr")" = 1 ] \
+     && line_of user/aleksei | grep -qE ': 44 of 44 decisions not explicitDeny \(worst: implicitDeny\), e\.g\. [^,]+@[a-z0-9-]+, [^,]+@[a-z0-9-]+, [^,]+@[a-z0-9-]+$'; echo $?)"
+check "…then the hint, once" "$([ "$(grep -cxF "$HINT" "$T/stderr")" = 1 ]; echo $?)"
+check "…and the count" "$(grep -qxF 'G3: 1 principals carry the deny everywhere; 1 do not (44 decisions each)' "$T/stdout"; echo $?)"
 CONDITIONED=aleksei run_guard
-check "an Allow conditioned on a key the simulation lacks → exit 1" "$([ $? -eq 1 ]; echo $?)"
-check "…names the principal, an action and the missing key, and says check by hand" \
-  "$(grep -F "arn:aws:iam::$ACCT:user/aleksei" "$T/stderr" | grep -F 'ec2:DeregisterImage' | grep -F 'aws:SourceIp' | grep -qF 'check by hand, then attach the deny'; echo $?)"
-check "…listed as conditional" "$(grep -F "arn:aws:iam::$ACCT:user/aleksei" "$T/stdout" | grep -q 'conditional'; echo $?)"
+check "implicitDeny with missing context keys fails the same way" \
+  "$([ $? -eq 1 ] && line_of user/aleksei | grep -qF '44 of 44 decisions not explicitDeny (worst: implicitDeny)'; echo $?)"
 EXPLICIT_MISSING=aleksei run_guard
-check "an explicit deny that also reports a missing key passes" "$?"
+check "explicitDeny with missing context keys passes" "$?"
 REGION_ALLOWED=aleksei:eu-central-1 run_guard
-check "an Allow scoped to a non-build region's ARNs → exit 1, naming that ARN" \
-  "$([ $? -eq 1 ] && grep -F "arn:aws:iam::$ACCT:user/aleksei" "$T/stderr" | grep -qF 'allowed on arn:aws:ec2:eu-central-1::image/'; echo $?)"
+check "allowed in one region only → exit 1, worst allowed, the example names that region" \
+  "$([ $? -eq 1 ] && line_of user/aleksei | grep -qE ': [0-9]+ of 44 decisions not explicitDeny \(worst: allowed\), e\.g\. ec2:DeregisterImage@eu-central-1'; echo $?)"
+check "…counts only eu-central-1's 22 (us-east-1 is explicitDeny)" \
+  "$(line_of user/aleksei | grep -qF ': 22 of 44 decisions'; echo $?)"
+LEAKY=aleksei REGION_ALLOWED=aleksei:eu-central-1 run_guard
+check "mixed: 22 allowed + 22 implicitDeny → 44, worst allowed" \
+  "$([ $? -eq 1 ] && line_of user/aleksei | grep -qF ': 44 of 44 decisions not explicitDeny (worst: allowed), e.g. ec2:DeregisterImage@eu-central-1'; echo $?)"
 run_guard
 check "each simulation names one resource per region" \
   "$(grep -F 'simulate-principal-policy' "$T/aws.log" | grep -F 'DeregisterImage' | grep -qF -- '--resource-arns arn:aws:ec2:us-east-1::image/ami-00000000000000000 arn:aws:ec2:eu-central-1::image/ami-00000000000000000 --context-entries'; echo $?)"
 NO_PER_RESOURCE=1 run_guard
-check "no per-resource results for several resources → unreadable, exit 1" \
-  "$([ $? -eq 1 ] && grep -qF 'no per-resource results' "$T/stderr"; echo $?)"
+check "no per-resource results for several resources → a failure (unreadable)" \
+  "$([ $? -eq 1 ] && line_of user/aleksei | grep -qF '(worst: unreadable)'; echo $?)"
+names=""; for k in $(seq -w 1 10); do names="$names extra-$k"; done
+EXTRA_ROLES=10 LEAKY="$names aleksei github-cfn-publish" run_guard
+check "12 failing principals → 12 lines + the hint, not thousands" \
+  "$([ $? -eq 1 ] && [ "$(grep -c 'decisions not explicitDeny' "$T/stderr")" = 12 ] \
+     && [ "$(wc -l < "$T/stderr")" -le 15 ] && [ "$(grep -cxF "$HINT" "$T/stderr")" = 1 ]; echo $?)"
 cp "$R/image/hardened/regions" "$T/regions.two"
 printf '%s\n' us-east-1 us-east-2 us-west-1 us-west-2 ca-central-1 eu-central-1 eu-west-1 eu-west-2 eu-west-3 eu-north-1 ap-south-1 ap-northeast-1 \
   > "$R/image/hardened/regions"
@@ -253,12 +270,12 @@ cp "$T/regions.two" "$R/image/hardened/regions"
 
 echo "== a principal that is allowed =="
 ALLOWED=aleksei run_guard; check "exit 1" "$([ $? -eq 1 ]; echo $?)"
-check "names arn:…:user/aleksei and an allowed action" \
-  "$(grep -F "arn:aws:iam::$ACCT:user/aleksei" "$T/stderr" | grep -q 'ec2:DeregisterImage=allowed'; echo $?)"
+check "names arn:…:user/aleksei, worst allowed" \
+  "$(line_of user/aleksei | grep -qF '(worst: allowed), e.g. ec2:DeregisterImage@us-east-1'; echo $?)"
 check "does not blame github-cfn-publish" "$(grep -qF 'github-cfn-publish' "$T/stderr"; [ $? -ne 0 ]; echo $?)"
 MFA_MASKED=aleksei run_guard
-check "a 'require MFA' deny does not mask an allow → exit 1" \
-  "$([ $? -eq 1 ] && grep -F "arn:aws:iam::$ACCT:user/aleksei" "$T/stderr" | grep -q 'allowed'; echo $?)"
+check "a 'require MFA' deny does not stand in for the fence deny → exit 1" \
+  "$([ $? -eq 1 ] && line_of user/aleksei | grep -qF '(worst: allowed)'; echo $?)"
 
 echo "== HARDENED_PUBLIC decides the block-public-access check =="
 BPA_ON="us-east-1 eu-central-1" HARDENED_PUBLIC=false run_guard

@@ -90,8 +90,11 @@ publishes it from Idlefy's account; design record:
 - `scripts/hardened-guard-check.sh`: refuses to publish unless the account is
   still safe to publish from (encryption by default off, public sharing
   unblocked for a public build, SSM Default Host Management unset, quota
-  room, no principal but the publisher allowed to change a published image,
-  and no unencrypted snapshot or image outside the published ones).
+  room, every principal but the publisher and service-linked roles
+  explicitly denied any change to a published image, in every region, and
+  no unencrypted snapshot or image outside the published ones). A failing
+  principal is reported in one line, with a hint to apply the account's
+  Terraform.
 - `scripts/hardened-image-leftovers.sh` lists, read-only, any image of a
   build's name in every listed region. The driver runs it when a build fails
   or is signalled after `packer build` started, and the publish workflow runs

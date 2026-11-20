@@ -86,24 +86,31 @@ reaches it only through what the customer's own account does to the instance
 6. **The trust anchor is the consumer's pinned AMI id list.** Idlefy's
    costpilot side launches only ids it has pinned from a release record; a
    name pattern or an owner id alone is never enough. The account-side fence
-   (no principal other than the publisher role and AWS service-linked roles
-   may mutate an image or snapshot tagged `IdlefyPublishedImage=true`) is
-   hygiene. The guard simulates it for every IAM user and role (G3) and
-   refuses to publish when any principal is **allowed** such a mutation, on
-   one resource ARN per listed region, judged per resource (an Allow scoped
-   to one region's ARNs shows only there). A plain implicit deny passes like
-   an explicit one: a principal that cannot act needs no explicit deny, and
-   attaching the deny to CloudFormation-created roles makes their stacks
-   undeletable; the guard re-checks on every publish. An implicit deny that
-   names `MissingContextValues` does **not** pass: it means an Allow that
-   holds under a key the simulation cannot supply (`aws:SourceIp`,
-   `aws:PrincipalTag`, …), so the principal is checked by hand and given the
-   explicit deny. An explicit deny passes whatever keys it reports missing.
-   The simulation says MFA is present
-   (`aws:MultiFactorAuthPresent=true`), so an account's "require MFA" deny
-   cannot mask a principal that is otherwise allowed — measured on the
-   account: the owner's user simulated `explicitDeny` only because of such a
-   policy. The
+   is hygiene: the deny policy `deny-idlefy-published-image-mutation`
+   (every mutation of an image or snapshot tagged
+   `IdlefyPublishedImage=true`) is attached by the account's Terraform
+   (`idlefy/infra`, `terraform/aws/account`) to **every** IAM user and role
+   except the publisher role and AWS service-linked (`/aws-service-role/`)
+   roles. The guard (G3) passes a principal only when every simulated
+   decision is `explicitDeny` — top level and every per-resource result, for
+   every fenced action, on one resource ARN per listed region. `implicitDeny`
+   fails like `allowed`. The reason is that simulation cannot decide a
+   conditional Allow: run against the real account, `MissingContextValues`
+   listed every condition key found anywhere in a principal's policies (S3-only
+   users reported `s3:prefix` for `ec2:` actions), so it cannot tell a
+   related condition from an unrelated one. The only decidable rule is that
+   each principal carries the deny itself (ruling 2026-11-20, reversing the
+   earlier "an implicit deny passes"). Consequences: a role created after
+   the last `terraform apply` blocks publishing until the next apply, and a
+   CloudFormation stack whose role carries the deny needs the attachment
+   removed before the stack can be deleted. The simulation says MFA is
+   present (`aws:MultiFactorAuthPresent=true`): an account's "require MFA"
+   deny would otherwise read as `explicitDeny` and hide a principal that
+   lacks the fence deny — measured on the account, the owner's user simulated
+   `explicitDeny` only because of such a policy. The report is one line per
+   failing principal (how many decisions were not `explicitDeny`, the worst,
+   three `action@region` examples) and one hint to apply the Terraform;
+   passing principals are only counted. The
    guard is read-only and reports every failure, not the first; roles under
    `/aws-reserved/` (Identity Center) cannot be simulated usefully, so they
    are skipped and listed for a manual check. For the public-AMI quota (G2c)
@@ -272,7 +279,7 @@ not the first, and a denied or unreadable read is a failure, never a pass.
 | G2 | in a region of `image/hardened/regions`: EBS encryption by default is on (the copy would be encrypted and could not be public); the region is not enabled; for a **public** build only, image block public access is not `unblocked` |
 | G2b | SSM Default Host Management Configuration is set in a region (it would hand the build instance a role) |
 | G2c | a region has no room under the public-AMI quota `L-0E3CBAB9` for one more public image (deprecated public images count; the AWS default applies when no value was applied) |
-| G3 | an IAM user or role other than the publish role and service-linked roles is **allowed** any fenced action on an image or snapshot tagged `IdlefyPublishedImage=true` in any listed region, gets an `implicitDeny` that names `MissingContextValues` (a conditioned Allow — check by hand, then attach the deny), or its simulation fails. Policy simulation with the fence tag and `aws:MultiFactorAuthPresent=true`, one resource ARN per region (at most 10 per call), every `ResourceSpecificResults` entry a deny; a plain `implicitDeny` passes like `explicitDeny`. `/aws-reserved/` roles are skipped and listed for a manual check |
+| G3 | an IAM user or role other than the publish role and service-linked roles gets any simulated decision other than `explicitDeny` — top level or per resource, any fenced action on an image or snapshot tagged `IdlefyPublishedImage=true`, any listed region — or its simulation fails or answers short. `implicitDeny` fails like `allowed`. Policy simulation with the fence tag and `aws:MultiFactorAuthPresent=true`, one resource ARN per region (at most 10 per call). One line per failing principal plus the Terraform hint; passing ones are counted. `/aws-reserved/` roles are skipped and listed for a manual check |
 | G4 | a region holds a self-owned unencrypted snapshot, or a self-owned image with an unencrypted snapshot, not tagged `IdlefyPublishedImage=true` — each named with its region |
 
 G4 exists because the publisher role can copy images inside the account, and

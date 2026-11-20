@@ -24,21 +24,19 @@
 #       it no instance profile (the build holds no credential);
 #   G2c each region has room under the public-AMI quota (L-0E3CBAB9) for one
 #       more public image; deprecated public images count against it;
-#   G3  no IAM user or role other than the publish role and AWS service-linked
-#       roles is ALLOWED any mutation of an image or snapshot tagged
-#       IdlefyPublishedImage=true (IAM policy simulation, with MFA present so
-#       an account's "require MFA" deny cannot mask a principal that is
-#       otherwise allowed), on one resource ARN per region of the regions
-#       file. Every per-resource result must be a deny. A plain implicitDeny
-#       passes like explicitDeny: a principal that cannot act needs no
-#       explicit deny, and attaching the deny to CloudFormation-created roles
-#       makes their stacks undeletable; this check runs again on every
-#       publish. An implicitDeny that names MissingContextValues fails — an
-#       Allow conditioned on a key the simulation cannot supply (aws:SourceIp,
-#       aws:PrincipalTag, …) is checked by hand and then given the explicit
-#       deny. A failed simulation is a failure.
-#       Roles under /aws-reserved/ (Identity Center) cannot be simulated
-#       usefully here and are listed for a manual check;
+#   G3  every IAM user and role other than the publish role and AWS
+#       service-linked (/aws-service-role/) roles is EXPLICITLY denied every
+#       mutation of an image or snapshot tagged IdlefyPublishedImage=true:
+#       every simulated decision — top level and per resource, every fenced
+#       action, one resource ARN per region — is explicitDeny. implicitDeny
+#       fails like allowed: simulation cannot decide a conditional Allow, so
+#       the only decidable rule is that each principal carries the deny
+#       policy, which the account's Terraform attaches to every principal.
+#       MFA is simulated present, so a "require MFA" deny cannot stand in for
+#       the missing fence deny. A missing or short answer, or a failed
+#       simulation, fails. One line per failing principal; passing ones are
+#       counted. Roles under /aws-reserved/ (Identity Center) cannot be
+#       simulated usefully here and are listed for a manual check;
 #   G4  every region of image/hardened/regions holds no unencrypted snapshot
 #       and no image with an unencrypted snapshot that this account owns and
 #       that is not tagged IdlefyPublishedImage=true. The publisher role can
@@ -222,102 +220,100 @@ done
 echo
 
 # ---- G3 the deny ---------------------------------------------------------------------
-# simulate VAR ARN KIND RESOURCE ACTIONS… — simulates ARN on KIND's RESOURCE
-# (e.g. image/ami-0…) in every region of the regions file, at most
-# SIM_BATCH resource ARNs per call, and sets VAR to the worst result:
-#   explicitDeny  every action on every resource is explicitly denied;
-#   implicitDeny  every one is denied, some only implicitly, with no context
-#                 key missing;
-#   conditional   an implicitDeny names MissingContextValues: an Allow that
-#                 holds under a key the simulation did not supply (aws:SourceIp,
-#                 aws:PrincipalTag, …) — a failure, to check by hand;
-#   allowed / unreadable / error — failures.
-# Every per-resource result (ResourceSpecificResults) must be a deny, not only
-# the top-level decision: an Allow scoped to one region's ARNs shows there.
-# MFA is simulated as present, so a "require MFA" deny cannot mask an allow.
-# Not called in $(…): a subshell would lose the failure.
+# A principal passes only when EVERY simulated decision is explicitDeny: the
+# top level and every per-resource result, for every fenced action, on one
+# resource ARN per region. implicitDeny fails like allowed — simulation
+# cannot decide a conditional Allow (MissingContextValues names every
+# condition key anywhere in a principal's policies, related or not), so the
+# only decidable rule is that every principal but the publish role and
+# service-linked roles carries the deny policy itself.
+#
+# The context says MFA is present on purpose: an account's "require MFA"
+# deny would otherwise read as explicitDeny and hide a principal that lacks
+# the fence deny. With MFA present only the fence deny can produce it.
+#
+# simulate ARN KIND RESOURCE ACTIONS… — simulates ARN on KIND's RESOURCE (e.g.
+# image/ami-0…) in every region, at most SIM_BATCH resource ARNs per call, and
+# appends one "<decision>\t<action>@<region>" line to $W/bad for every
+# decision that is not explicitDeny: allowed, implicitDeny, unreadable (a
+# missing or short answer) or error (a failed call — every action × resource
+# of that call). Not called in $(…): the file is the result.
 SIM_BATCH=10
 simulate() {
-  local var=$1 arn=$2 kind=$3 res=$4; shift 4
-  local worst=explicitDeny verdict r batch=() tab=$'\t'
-  rank() { case "$1" in explicitDeny) echo 0 ;; implicitDeny) echo 1 ;; conditional) echo 2 ;; allowed) echo 3 ;; *) echo 4 ;; esac; }
-  local regions=($REGIONS) i
+  local arn=$1 kind=$2 res=$3; shift 3
+  local r a i batch=()
+  local regions=($REGIONS)
   for ((i = 0; i < ${#regions[@]}; i += SIM_BATCH)); do
     batch=()
     for r in "${regions[@]:i:SIM_BATCH}"; do batch+=("arn:aws:ec2:$r::$res"); done
-    if ! awscall "$W/sim.json" "$arn: iam simulate-principal-policy ($kind)" \
-           iam simulate-principal-policy --policy-source-arn "$arn" --action-names "$@" \
+    if ! aws iam simulate-principal-policy --policy-source-arn "$arn" --action-names "$@" \
            --resource-arns "${batch[@]}" \
            --context-entries "ContextKeyName=ec2:ResourceTag/$FENCE_KEY,ContextKeyValues=true,ContextKeyType=string" \
-                             "ContextKeyName=aws:MultiFactorAuthPresent,ContextKeyValues=true,ContextKeyType=boolean"; then
-      verdict=error
-    else
-      verdict="$(python3 -I - "$W/sim.json" "$(IFS=,; echo "${batch[*]}")" "$@" <<'PY'
+                             "ContextKeyName=aws:MultiFactorAuthPresent,ContextKeyValues=true,ContextKeyType=boolean" \
+           --output json > "$W/sim.json" 2> "$W/err" < /dev/null; then
+      for a in "$@"; do
+        for r in "${regions[@]:i:SIM_BATCH}"; do printf 'error\t%s@%s\n' "$a" "$r" >> "$W/bad"; done
+      done
+      SIM_ERRORS+=("$arn ($kind): $(head -n1 "$W/err")")
+      continue
+    fi
+    python3 -I - "$W/sim.json" "$(IFS=,; echo "${batch[*]}")" "$@" >> "$W/bad" <<'PY'
 import json, sys
 arns, want = sys.argv[2].split(","), sys.argv[3:]
-DENY = ("explicitDeny", "implicitDeny")
-bad, implicit = [], False
+def region(arn):
+    parts = arn.split(":")
+    return parts[3] if len(parts) > 3 and parts[3] else "all"
 try:
     res = {r["EvalActionName"]: r for r in json.load(open(sys.argv[1]))["EvaluationResults"]}
-    for a in want:
-        r = res.get(a)
-        if r is None:
-            bad.append(("unreadable", "%s: no result" % a))
-            continue
-        per = r.get("ResourceSpecificResults")
-        if not per:
-            # One resource: AWS may answer at the top level only.
-            if len(arns) == 1 and r.get("EvalResourceName") == arns[0]:
-                per = [{"EvalResourceName": arns[0], "EvalResourceDecision": r["EvalDecision"],
-                        "MissingContextValues": r.get("MissingContextValues") or []}]
-            else:
-                bad.append(("unreadable", "%s: no per-resource results" % a))
-                continue
-        seen = set()
-        for p in [{"EvalResourceName": "(top level)", "EvalResourceDecision": r["EvalDecision"],
-                   "MissingContextValues": r.get("MissingContextValues") or []}] + per:
-            name, d = p["EvalResourceName"], p["EvalResourceDecision"]
-            missing = p.get("MissingContextValues") or []
-            seen.add(name)
-            if d == "explicitDeny":
-                continue
-            if d == "implicitDeny" and not missing:
-                implicit = True
-                continue
-            if d == "implicitDeny":
-                bad.append(("conditional", "%s on %s: implicitDeny with missing context keys %s"
-                            % (a, name, " ".join(missing))))
-            elif d == "allowed":
-                bad.append(("allowed", "%s=allowed on %s" % (a, name)))
-            else:
-                bad.append(("unreadable", "%s=%s on %s" % (a, d, name)))
-        for x in arns:
-            if x not in seen:
-                bad.append(("unreadable", "%s: no result for %s" % (a, x)))
 except (OSError, ValueError, KeyError, TypeError, AttributeError):
-    print("unreadable\tunreadable simulation result")
-    sys.exit()
-order = ["unreadable", "allowed", "conditional"]
-if bad:
-    worst = min((b[0] for b in bad), key=order.index)
-    print("%s\t%s" % (worst, "; ".join(b[1] for b in bad)))
-else:
-    print("implicitDeny" if implicit else "explicitDeny")
+    res = {}
+for a in want:
+    r = res.get(a)
+    if not isinstance(r, dict):
+        for x in arns:
+            print("unreadable\t%s@%s" % (a, region(x)))
+        continue
+    per = r.get("ResourceSpecificResults") or []
+    if not per and len(arns) == 1 and r.get("EvalResourceName") == arns[0]:
+        per = [{"EvalResourceName": arns[0], "EvalResourceDecision": r.get("EvalDecision")}]
+    got = {}
+    for p in per:
+        if isinstance(p, dict):
+            got[p.get("EvalResourceName")] = p.get("EvalResourceDecision")
+    for x in arns:
+        d = got.get(x)
+        if d is None:
+            print("unreadable\t%s@%s" % (a, region(x)))
+        elif d != "explicitDeny":
+            print("%s\t%s@%s" % (d if d in ("allowed", "implicitDeny") else "unreadable", a, region(x)))
+    top = r.get("EvalDecision")
+    if top != "explicitDeny" and all(got.get(x) == "explicitDeny" for x in arns):
+        print("%s\t%s@all" % (top if top in ("allowed", "implicitDeny") else "unreadable", a))
 PY
-)"
-      case "$verdict" in
-        explicitDeny|implicitDeny) ;;
-        conditional*) fail "$arn: ${verdict#*"$tab"} on a $FENCE_KEY=true $kind — an Allow under a condition the simulation cannot supply; check by hand, then attach the deny"
-                      verdict=conditional ;;
-        *) fail "$arn: allowed, or not readably denied, on a $FENCE_KEY=true $kind: ${verdict#*"$tab"}"
-           verdict=${verdict%%"$tab"*} ;;
-      esac
-    fi
-    [ "$(rank "$verdict")" -le "$(rank "$worst")" ] || worst=$verdict
   done
-  printf -v "$var" '%s' "$worst"
 }
 
+# summarize ARN TOTAL — one line for a principal whose $W/bad is not empty.
+summarize() {
+  python3 -I - "$W/bad" "$1" "$2" <<'PY'
+import sys
+lines = [l.rstrip("\n").split("\t", 1) for l in open(sys.argv[1]) if "\t" in l]
+order = ["allowed", "implicitDeny", "error", "unreadable"]
+worst = min((d for d, _ in lines), key=lambda d: order.index(d) if d in order else len(order))
+examples = []
+for d, where in lines:
+    if d == worst and where not in examples:
+        examples.append(where)
+    if len(examples) == 3:
+        break
+print("%s: %d of %s decisions not explicitDeny (worst: %s), e.g. %s"
+      % (sys.argv[2], len(lines), sys.argv[3], worst, ", ".join(examples)))
+PY
+}
+
+G3_PASS=0 G3_FAIL=0 SIM_ERRORS=()
+nregions=$(wc -w <<< "$REGIONS")
+total=$(( (${#IMAGE_ACTIONS[@]} + ${#SNAP_ACTIONS[@]}) * nregions ))
 principals_ok=1
 awscall "$W/roles.json" "iam list-roles" iam list-roles || principals_ok=0
 awscall "$W/users.json" "iam list-users" iam list-users || principals_ok=0
@@ -343,18 +339,25 @@ if not found:
     print("missing", ci)
 PY
   then
-    printf '%-72s %-13s %s\n' PRINCIPAL IMAGE SNAPSHOT
     while read -r what arn; do
       case "$what" in
-        ci) printf '%-72s %s\n' "$arn" "publish role — not checked" ;;
+        ci) echo "publish role $arn — not checked" ;;
         missing) fail "$arn: the publish role HARDENED_CI_ROLE_ARN names does not exist in this account" ;;
-        reserved) printf '%-72s %s\n' "$arn" "skipped: AWS-reserved (Identity Center) role — its permission set must not allow these actions; check by hand" ;;
+        reserved) echo "skipped: $arn — AWS-reserved (Identity Center) role; its permission set must carry the deny; check by hand" ;;
         check)
-          simulate img "$arn" image "image/$SIM_IMAGE_ID" "${IMAGE_ACTIONS[@]}"
-          simulate snap "$arn" snapshot "snapshot/$SIM_SNAP_ID" "${SNAP_ACTIONS[@]}"
-          printf '%-72s %-13s %s\n' "$arn" "$img" "$snap" ;;
+          : > "$W/bad"
+          simulate "$arn" image "image/$SIM_IMAGE_ID" "${IMAGE_ACTIONS[@]}"
+          simulate "$arn" snapshot "snapshot/$SIM_SNAP_ID" "${SNAP_ACTIONS[@]}"
+          if [ -s "$W/bad" ]; then
+            G3_FAIL=$((G3_FAIL + 1))
+            fail "$(summarize "$arn" "$total")"
+          else
+            G3_PASS=$((G3_PASS + 1))
+          fi ;;
       esac
     done < "$W/principals"
+    echo "G3: $G3_PASS principals carry the deny everywhere; $G3_FAIL do not ($total decisions each)"
+    for e in "${SIM_ERRORS[@]}"; do echo "   simulation failed: $e"; done
   else
     fail "iam list-roles / list-users returned something unreadable"
   fi
@@ -414,6 +417,9 @@ if [ ${#FAILS[@]} -gt 0 ]; then
   {
     echo "✗ hardened-guard-check: $n $word — do not publish from this account until they are fixed:"
     printf '  - %s\n' "${FAILS[@]}"
+    if [ "${G3_FAIL:-0}" -gt 0 ]; then
+      echo "attach deny-idlefy-published-image-mutation to these principals (terraform apply in idlefy/infra, terraform/aws/account)"
+    fi
   } >&2
   exit 1
 fi
