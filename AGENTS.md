@@ -17,7 +17,9 @@ tenant. This file carries the mechanisms and the evidence behind them, which is
 what a change to the platform needs.
 
 **Agent guides.** Someone who has just cloned this repository and wants to
-start → follow [`GET-STARTED.md`](GET-STARTED.md).
+start → follow [`GET-STARTED.md`](GET-STARTED.md). An Idlefy-published image
+(the public hardened AMI, its workflows and retention) →
+[`docs/design/hardened-image.md`](docs/design/hardened-image.md).
 
 There is no deployable `vms/` root here on purpose: two copies of it would drift
 and nothing would catch it. `vms/` holds `modules/` and `README.md`.

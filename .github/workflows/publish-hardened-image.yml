@@ -1,0 +1,149 @@
+# Builds and publishes Idlefy's hardened image for AI agents
+# (idlefy-hardened-agent-ubuntu-24.04-amd64-YYYYMMDD-NN) from a platform tag.
+# Design: docs/design/hardened-image.md.
+#
+# Run it ON A TAG REF: Actions -> publish-hardened-image -> Run workflow ->
+# "Use workflow from" -> Tags -> vX.Y.Z. A dispatch from a branch is refused.
+# The schedule rebuilds the newest v* tag once a month (OS updates, agent CLIs).
+#
+# One job touches AWS, behind the protected environment `hardened-publish`:
+# one approval covers the account guard and the build. The guard runs first and
+# a failure stops the job before anything is built.
+#
+# Never set HARDENED_SKIP_TAG_CHECK or HARDENED_TODAY here. They are test hooks
+# of scripts/hardened-image-build.sh: the first skips the check that the
+# checkout is the tag's commit, the second replaces the date in the image name.
+#
+# No input reaches a `run:` script through ${{ }}: every value goes through
+# `env:` and is quoted, and the scripts validate each one again.
+name: publish-hardened-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      public:
+        type: boolean
+        default: true
+        description: "false = private build for inspection"
+  schedule:
+    - cron: "0 3 1 * *"
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: hardened-publish
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: resolve the platform tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      sha: ${{ steps.tag.outputs.sha }}
+    steps:
+      - id: tag
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_SHA: ${{ github.sha }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          semver='^v[0-9]+\.[0-9]+\.[0-9]+$'
+          if [ "$EVENT" = schedule ]; then
+            # The newest vX.Y.Z tag on origin, peeled: an annotated tag's
+            # "^{}" line names its commit, a lightweight tag's line already does.
+            git ls-remote --tags "$REPO_URL" 'refs/tags/v*' > refs.txt
+            tag=$(awk '{ sub("^refs/tags/", "", $2); sub("\\^\\{\\}$", "", $2); print $2 }' refs.txt \
+                  | grep -E "$semver" | sort -u -V | tail -n 1) || true
+            [ -n "$tag" ] || { echo "::error::no vX.Y.Z tag on origin"; exit 1; }
+            sha=$(awk -v t="refs/tags/$tag^{}" '$2 == t { print $1 }' refs.txt)
+            [ -n "$sha" ] || sha=$(awk -v t="refs/tags/$tag" '$2 == t { print $1 }' refs.txt)
+          else
+            if [ "$REF_TYPE" != tag ] || ! printf '%s\n' "$REF_NAME" | grep -Eq "$semver"; then
+              echo "::error::run this on a vX.Y.Z tag (Use workflow from -> Tags), not on '$REF_NAME'"
+              exit 1
+            fi
+            tag=$REF_NAME
+            sha=$RUN_SHA
+          fi
+          printf '%s\n' "$sha" | grep -Eq '^[0-9a-f]{40}$' \
+            || { echo "::error::could not resolve $tag to a commit"; exit 1; }
+          echo "building $tag at $sha"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: guard, build and publish
+    needs: resolve
+    runs-on: ubuntu-latest
+    environment: hardened-publish
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
+          # gh reads GH_TOKEN from the environment; nothing needs git auth.
+          persist-credentials: false
+
+      - uses: hashicorp/setup-packer@ce93c3c08a6c2ff2275bf4b54ff0d9a75f6c9789 # v3.4.0
+        with:
+          version: 1.11.2
+
+      # Cinc Workstation, as in ci.yml: the driver exports the solo Policyfile
+      # lock with `chef`.
+      - name: install Cinc Workstation
+        run: |
+          curl -fsSL https://omnitruck.cinc.sh/install.sh \
+            | sudo bash -s -- -P cinc-workstation -v 26
+          chef --version
+
+      # COORDINATOR: replace REPLACE_WITH_COMMIT_SHA with the full commit SHA of
+      # the aws-actions/configure-aws-credentials v5 release before merging.
+      # Until then the action cannot resolve and the job fails at set-up,
+      # before any step runs. Never replace it with a tag or a branch.
+      - uses: aws-actions/configure-aws-credentials@REPLACE_WITH_COMMIT_SHA # v5
+        with:
+          role-to-assume: ${{ vars.HARDENED_PUBLISH_ROLE_ARN }}
+          aws-region: us-east-1
+          role-duration-seconds: 14400
+
+      - name: guard
+        env:
+          HARDENED_CI_ROLE_ARN: ${{ vars.HARDENED_PUBLISH_ROLE_ARN }}
+        run: scripts/hardened-guard-check.sh
+
+      - name: build
+        env:
+          PLATFORM_TAG: ${{ needs.resolve.outputs.tag }}
+          PLATFORM_SHA: ${{ needs.resolve.outputs.sha }}
+          HARDENED_SECURITY_GROUP_ID: ${{ vars.HARDENED_BUILD_SG_ID }}
+          # Never `inputs.public || 'true'`: a boolean false would collapse to 'true'.
+          HARDENED_PUBLIC: ${{ github.event_name == 'schedule' && 'true' || inputs.public }}
+          HARDENED_ATTACHED_ORG_ID: ${{ vars.HARDENED_DEV_ORG_ID }}
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/hardened-image-build.sh
+
+      # The record is also on the release; this copy survives a failed upload.
+      - name: record
+        if: always()
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(dist/hardened-ami-*.json)
+          [ ${#files[@]} -gt 0 ] || { echo "no release record was written" >> "$GITHUB_STEP_SUMMARY"; exit 0; }
+          for f in "${files[@]}"; do
+            {
+              echo "### $(basename "$f")"
+              echo
+              echo '```json'
+              cat "$f"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          done

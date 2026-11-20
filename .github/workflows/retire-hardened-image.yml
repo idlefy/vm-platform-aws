@@ -1,0 +1,83 @@
+# Retires old builds of Idlefy's hardened image, or yanks one, through
+# scripts/hardened-image-retire.sh. Design: docs/design/hardened-image.md
+# (decision 9).
+#
+# Dispatch only, never scheduled: every mutation waits for the owner's click
+# and the approval of the protected environment `hardened-publish`. Run it with
+# apply=false first and read the plan in the job summary; run it with
+# apply=true only after the costpilot pin PR for the superseding build has
+# shipped.
+#
+#   apply=false, disable_name=""      retention plan only ("would …")
+#   apply=true,  disable_name=""      retention, applied
+#   apply=…,     disable_name=<name>  yank that one build in every region and
+#                                     nothing else (no retention runs)
+#
+# The script exits 1 when an AWS call failed or a region was left alone out of
+# doubt; this job then fails, and the plan in the summary says which region and
+# why. Inputs reach the script only through `env:`, quoted.
+name: retire-hardened-image
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply:
+        type: boolean
+        default: false
+        description: "true = make the changes; false = print the plan only"
+      disable_name:
+        type: string
+        default: ""
+        description: "yank one build: idlefy-hardened-agent-ubuntu-24.04-amd64-YYYYMMDD-NN (empty = retention)"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: hardened-publish
+  cancel-in-progress: false
+
+jobs:
+  retire:
+    name: retention or yank
+    runs-on: ubuntu-latest
+    environment: hardened-publish
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # COORDINATOR: the same SHA as in publish-hardened-image.yml.
+      - uses: aws-actions/configure-aws-credentials@REPLACE_WITH_COMMIT_SHA # v5
+        with:
+          role-to-assume: ${{ vars.HARDENED_PUBLISH_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: retire
+        env:
+          APPLY: ${{ inputs.apply }}
+          DISABLE_NAME: ${{ inputs.disable_name }}
+        run: |
+          # Not -e (the runner's default): a failed retire must still reach the
+          # summary below, and then fail the job with its own exit code.
+          set +e -uo pipefail
+          args=()
+          if [ "$APPLY" = true ]; then args+=(--apply); fi
+          if [ -n "$DISABLE_NAME" ]; then args+=(--disable "$DISABLE_NAME"); fi
+          scripts/hardened-image-retire.sh "${args[@]}" 2>&1 | tee plan.txt
+          rc=${PIPESTATUS[0]}
+          {
+            if [ -n "$DISABLE_NAME" ]; then echo "### Yank (apply=$APPLY)"
+            else echo "### Retention (apply=$APPLY)"; fi
+            echo
+            if [ "$rc" != 0 ]; then
+              echo "**Exit $rc: a region was left alone or an AWS call failed — read the plan.**"
+              echo
+            fi
+            echo '```text'
+            cat plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"

@@ -623,6 +623,14 @@ running VM, because the module ignores AMI changes on existing instances.
   with their snapshots in every region. Never deregister one a pinned `ami_id`
   names.
 
+### Idlefy-published image
+
+Idlefy also publishes a public image built from this repository for its own
+Dev Boxes: `idlefy-hardened-agent-ubuntu-24.04-amd64-YYYYMMDD-NN`, owner
+`995603458290`. It is not a tenant image and nothing here builds it from a
+tenant. How it is built, published and retired is in
+[Hardened image for AI agents](design/hardened-image.md).
+
 ## Defaults you may want to change
 
 These are the template's starting values, not leftovers. Each is a deliberate
