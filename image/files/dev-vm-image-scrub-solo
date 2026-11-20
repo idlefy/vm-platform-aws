@@ -1,0 +1,142 @@
+# shellcheck shell=bash
+# The solo profile of dev-vm-image-scrub: Idlefy's hardened public image,
+# converged once by image/files/bootstrap-solo (docs/design/ami-image.md).
+#
+# SOURCED, never executed: `dev-vm-image-scrub --profile solo <sha256>` reads
+# this file from its own directory and calls the three hooks below. It lives
+# apart from the scrub because the scrub rides in every fleet VM's user data,
+# which EC2 caps at 16 KB gzipped; only the solo build's user data embeds this
+# file (installed as /usr/local/sbin/dev-vm-image-scrub-solo, 0755 root:root).
+#
+# Law A1: nothing baked into this image takes instructions from Idlefy after
+# launch. So CINC is purged, and the image is refused (exit 70, named on the
+# console, no cloud-init clean, no poweroff) unless every invariant holds.
+#
+# The lists are test/fixtures/image-scrub-paths-solo, verbatim; the reasons are
+# there, and test/test-image-scrub.sh fails if the two drift.
+
+# bootstrap-solo keeps the converge's state on tmpfs, off the disk.
+STATE=${DEV_VM_POLICY_STATE:-/run/dev-vm/solo}
+
+REMOVE_SOLO=(
+  "/etc/ssh/ssh_host_*" # host keys; regenerated on first boot
+  "/var/lib/amazon/ssm/Vault" # SSM agent's registration for the build instance; a credential even with the snap gone
+  "/var/lib/amazon/ssm/runtimeconfig/identity_config.json" # SSM agent's cached identity
+  "/home/ubuntu/.local/share/docker/engine-id" # rootless dockerd's engine id
+  "/home/ubuntu/.claude.json" # Claude Code's userID/machineID, created by its installer
+  "/home/ubuntu/.claude/backups" # backups of that file
+  "/var/lib/systemd/random-seed" # an RNG seed clones must not share
+  "/var/lib/systemd/credential.secret" # systemd's per-host credential key; clones must not share it
+  "/var/cache/pollinate/seeded" # so pollinate seeds each VM on first boot
+  "/var/lib/dhcpcd/*" # the DHCP DUID and the build's lease
+  "/home/ubuntu/.local/share/docker/containerd/daemon/io.containerd.grpc.v1.introspection/uuid" # rootless containerd's instance uuid
+  "/home/ubuntu/.local/share/docker/buildkit/containerd-overlayfs/workerid" # rootless buildkit's worker id
+  "/var/lib/docker/engine-id" # dockerd's engine id
+  "/var/lib/docker/buildkit/containerd-overlayfs/workerid" # buildkit's worker id
+  "/var/lib/containerd/io.containerd.grpc.v1.introspection/uuid" # containerd's instance uuid
+  "/var/lib/fail2ban/fail2ban.sqlite3" # the build's ban database
+  "/var/lib/systemd/timers/stamp-*" # stale stamps would fire apt-daily-upgrade during the first converge
+  "/home/ubuntu/.ssh/authorized_keys" # Packer's temporary key pair, written by cloud-init
+  "/root/.ssh/authorized_keys" # the same key, behind cloud-init's "login as ubuntu" prefix
+  "/root/.gnupg" # gpg-agent state from apt key imports
+  "/var/lib/tailscale/*" # tailscaled node state and logs
+  "/var/cache/tailscale" # tailscaled cache
+  "/var/lib/dev-vm/policy/*" # never created in solo; defensive
+  "/opt/cinc" # dpkg --purge cinc leaves nothing here; defensive
+  "/etc/cinc" # cinc-client's config dir, if the purge leaves it
+  "/root/.chef" # cinc-client's per-user state
+  "/var/log/journal/*" # the build's journal
+  "/var/log/user-data.log" # the build's bootstrap log
+  "/var/log/cinc-first-run.log" # the build's converge log (bootstrap-solo writes it)
+  "/var/log/*.gz" # rotated logs
+  "/var/log/*.1" # rotated logs
+  "/var/log/amazon/ssm/*" # SSM agent logs of the build
+  "/var/log/sysstat/*" # the build's sysstat data
+  "/var/log/apt/*" # the build's apt history
+  "/var/log/unattended-upgrades/*" # the build's unattended-upgrades logs
+  "/var/log/landscape/*" # the build's landscape logs
+  "/home/ubuntu/.npm/_logs" # npm debug logs from the installs
+  "/home/ubuntu/.bash_history" # none expected; defensive
+  "/root/.bash_history" # none expected; defensive
+  "/tmp/*" # install leftovers (uv tarball, node compile cache, sockets)
+  "/var/tmp/*" # systemd private dirs
+)
+EMPTY_SOLO=(
+  "/etc/machine-id" # systemd/journald identity; /var/lib/dbus/machine-id links here
+  "/var/log/syslog" # the build's syslog
+  "/var/log/auth.log" # the build's auth log
+  "/var/log/kern.log" # the build's kernel log
+  "/var/log/wtmp" # login records
+  "/var/log/btmp" # failed logins
+  "/var/log/lastlog" # last logins
+  "/var/log/dpkg.log" # the build's package log
+  "/var/log/fail2ban.log" # the build's fail2ban log
+  "/var/log/dmesg" # the build's boot messages
+)
+
+# refuse WHAT: the same shape as the scrub's timer check before poweroff.
+refuse() {
+  log "internal error: $*; no image will be taken"
+  exit 70
+}
+
+# Hook 1, before image-revision is written: without the directory that write
+# would fail into the ERR trap, which names a line rather than the reason.
+solo_dir() {
+  [ -d "$R/etc/dev-vm" ] || refuse "/etc/dev-vm is not a directory (bootstrap-solo creates it)"
+}
+
+# Hook 2, after the stops and before the removals: purge CINC (fatal, never a
+# note — an image with CINC on it is the thing law A1 forbids), then swap in
+# the solo lists, which mop up whatever the purge leaves.
+solo_prep() {
+  dpkg --purge cinc || refuse "cinc purge failed"
+  REMOVE=("${REMOVE_SOLO[@]}")
+  EMPTY=("${EMPTY_SOLO[@]}")
+}
+
+# Hook 3, immediately before cloud-init clean, on the disk Packer is about to
+# snapshot. Paths under $R; the root-ownership check only on a real root,
+# since a test's fake root cannot be chowned.
+solo_check() {
+  local f g grp st mode own
+  local h=/usr/local/sbin/idlefy-share v6="$R/etc/iptables/rules.v6"
+  # 1. The oneshot that strips cloud-init's re-grants to ubuntu on first boot.
+  systemctl is-enabled --quiet idlefy-hardened-firstboot.service \
+    || refuse "idlefy-hardened-firstboot.service is not enabled"
+  # 2. What base::solo bakes and the first boot relies on.
+  for f in /etc/cloud/cloud.cfg.d/90-idlefy-hardened.cfg /etc/sudoers.d/50-tailscale-login \
+           /etc/sudoers.d/51-idlefy-share "$h"; do
+    [ -f "$R$f" ] || refuse "$f is missing"
+  done
+  # sudoers grants the helper with `*`: whoever can write it is root.
+  mode=$(stat -c %a "$R$h")
+  [ "$mode" = 755 ] || refuse "$h has mode $mode, expected 755"
+  if [ -z "$R" ]; then
+    own=$(stat -c %u:%g "$h")
+    [ "$own" = 0:0 ] || refuse "$h is owned by $own, expected 0:0"
+  fi
+  # 3. A sudoers syntax error locks out the admin too.
+  visudo -c >/dev/null 2>&1 || refuse "visudo -c rejects the sudoers files"
+  # 4. Cloud-init's NOPASSWD grant to ubuntu.
+  [ ! -e "$R/etc/sudoers.d/90-cloud-init-users" ] || refuse "/etc/sudoers.d/90-cloud-init-users is present"
+  # 5. Whole words, as base::sudoers warns: lxd-installer is not lxd.
+  grp=$(id -nG ubuntu) || refuse "cannot read the groups of ubuntu"
+  for g in $grp; do
+    case $g in sudo | admin | adm | lxd) refuse "ubuntu is in group $g" ;; esac
+  done
+  # 6. The persisted v6 rules as ip6tables-save writes them: the INPUT policy
+  #    is a chain header (never a -P line), and base::imds's IMDS drop
+  #    (`ip6tables -I OUTPUT 3 -d fd00:ec2::254 -j DROP`) is saved with its /128.
+  grep -qE '^:INPUT DROP( |$)' "$v6" 2>/dev/null || refuse "/etc/iptables/rules.v6 has no INPUT DROP policy"
+  grep -qF -- '-d fd00:ec2::254/128 -j DROP' "$v6" 2>/dev/null \
+    || refuse "/etc/iptables/rules.v6 does not drop fd00:ec2::254 (IMDS v6)"
+  # 7. The SSM agent is an inbound instruction channel.
+  if snap list amazon-ssm-agent >/dev/null 2>&1; then refuse "the amazon-ssm-agent snap is still installed"; fi
+  # 8. So is CINC. A purged package dpkg still remembers reads not-installed.
+  # shellcheck disable=SC2016 # dpkg-query's format, not a shell expansion
+  if st=$(dpkg-query -W -f='${db:Status-Status}' cinc 2>/dev/null) && [ "$st" != not-installed ]; then
+    refuse "cinc still installed (dpkg status '${st:-?}')"
+  fi
+  # 9. /etc/dev-vm ran in solo_dir, before image-revision was written.
+}

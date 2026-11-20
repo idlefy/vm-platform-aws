@@ -203,6 +203,9 @@ V6
 }
 SOLO_STATE="$R/var/lib/dev-vm/policy"
 FIRSTBOOT=idlefy-hardened-firstboot.service
+# The solo code: sourced by the scrub from its own directory, embedded only in
+# the solo build's user data (the scrub rides in every fleet VM's 16 KB).
+SOLO="$ROOT/image/files/dev-vm-image-scrub-solo"
 
 echo "== solo profile: a green build is scrubbed, cinc purged, powered off =="
 build_root "$R" "2026-11-01T00:00:00Z ok $REV" "$LIST_SOLO"; seed_solo "$R"; : > "$T/log"
@@ -224,7 +227,7 @@ check "checks the SSM snap is gone" "$(grep -q '^snap list amazon-ssm-agent' "$T
 check "checks cinc is gone after the purge" "$(rc between "$(lineno '^dpkg-query .*cinc')" "$(lineno 'dpkg --purge cinc')" "$(lineno 'cloud-init clean')")"
 check "records the sha" "$(grep -qx "$REV" "$R/etc/dev-vm/image-revision"; echo $?)"
 check "powers off last" "$(tail -1 "$T/log" | grep -q '^poweroff'; echo $?)"
-check "the status default is /run/dev-vm/solo" "$(grep -qF 'DEV_VM_POLICY_STATE:-/run/dev-vm/solo' "$SCRUB"; echo $?)"
+check "the status default is /run/dev-vm/solo" "$(grep -qF 'DEV_VM_POLICY_STATE:-/run/dev-vm/solo' "$SOLO"; echo $?)"
 
 echo "== solo profile fails closed: every broken invariant → exit 70, console says which, no poweroff =="
 # solo_refuses "LABEL" "CONSOLE SUBSTRING" "MUTATION (run in the fresh root)" [VAR=VALUE…]
@@ -259,6 +262,17 @@ solo_refuses "SSM snap still installed"     "amazon-ssm-agent"   ":" SHIM_SSM_SN
 solo_refuses "no /etc/dev-vm"               "/etc/dev-vm"        "rm -r etc/dev-vm"
 check "  …and no image-revision written" "$(rc [ ! -e "$R/etc/dev-vm/image-revision" ])"
 
+echo "== solo profile without its sibling file fails closed =="
+mkdir -p "$T/alone"; cp "$SCRUB" "$T/alone/dev-vm-image-scrub"
+build_root "$R" "2026-11-01T00:00:00Z ok $REV" "$LIST_SOLO"; seed_solo "$R"; : > "$T/log"
+( SCRUB="$T/alone/dev-vm-image-scrub"
+  DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$FIRSTBOOT" run_scrub "$R" solo ); got=$?
+check "no dev-vm-image-scrub-solo next to the scrub → exit 70" "$(rc [ "$got" = 70 ])"
+check "  …console names it" "$(grep -q 'dev-vm-image-scrub-solo' "$T/console"; echo $?)"
+check "  …no poweroff" "$(! grep -q '^poweroff' "$T/log"; echo $?)"
+check "  …no cloud-init clean" "$(! grep -q 'cloud-init clean' "$T/log"; echo $?)"
+check "  …touched nothing" "$(rc untouched)"
+
 echo "== whole-word group match: lxd-installer is not lxd =="
 build_root "$R" "2026-11-01T00:00:00Z ok $REV" "$LIST_SOLO"; seed_solo "$R"; : > "$T/log"
 DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$FIRSTBOOT" SHIM_UBUNTU_GROUPS="ubuntu lxd-installer sudoers adm1" \
@@ -279,9 +293,12 @@ check "  …and ran nothing" "$(rc [ ! -s "$T/log" ])"
 
 echo "== the solo lists are the solo fixture's =="
 fx=$(grep -E '^(remove|empty) ' "$LIST_SOLO" | awk '{print $1" "$2}' | sort)
-sc=$(awk '/^REMOVE_SOLO=\(/{v="remove";next} /^EMPTY_SOLO=\(/{v="empty";next} /^\)/{v="";next} v && $1 !~ /^#/ && NF {gsub(/"/,"",$1); print v" "$1}' "$SCRUB" 2>/dev/null | sort)
+sc=$(awk '/^REMOVE_SOLO=\(/{v="remove";next} /^EMPTY_SOLO=\(/{v="empty";next} /^\)/{v="";next} v && $1 !~ /^#/ && NF {gsub(/"/,"",$1); print v" "$1}' "$SOLO" 2>/dev/null | sort)
 check "REMOVE_SOLO/EMPTY_SOLO equal the solo fixture's remove/empty lines" "$([ -n "$fx" ] && [ "$fx" = "$sc" ]; echo $?)"
 
+echo "== the fleet's scrub carries no solo code (its user data is capped at 16 KB) =="
+check "no solo lists, purge or invariants in dev-vm-image-scrub" \
+  "$(! grep -qE 'REMOVE_SOLO|EMPTY_SOLO|dpkg --purge|dpkg-query|visudo|snap list|id -nG|rules\.v6|idlefy-|sudoers\.d|fd00:ec2|/run/dev-vm/solo' "$SCRUB"; echo $?)"
 # ---- bootstrap-solo: the build's user data ----------------------------------------
 BOOT="$ROOT/image/files/bootstrap-solo"
 UD="$ROOT/vms/modules/ec2/user_data.tf"
