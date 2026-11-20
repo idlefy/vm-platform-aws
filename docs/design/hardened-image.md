@@ -61,7 +61,8 @@ reaches it only through what the customer's own account does to the instance
 
 4. **The policy archive is a release asset, and its bytes are what the sha
    names.** The driver exports the committed solo lock as
-   `solo-<base tag>.tgz` and stores it once on the tag's release. On a later
+   `solo-<platform tag>.tgz` (for example `solo-v2.2.0.tgz`) and stores it
+   once on that tag's release. On a later
    build it downloads the stored asset and compares its contents with a fresh
    export; a stored asset that differs is never used and never replaced — the
    build stops and names it (the same rule as AGENTS.md trap 9).
@@ -116,8 +117,10 @@ reaches it only through what the customer's own account does to the instance
      default deprecation date two years after creation, and a future date is
      not a deprecation;
    - **deprecate** another public build once the newest is 7 days old, and a
-     private build once it is itself 7 days old (set 10 minutes ahead, since
-     AWS refuses a time in the past);
+     private build once it is itself 7 days old (set 600 s ahead, since AWS
+     refuses a time in the past; AWS rounds the date up to the minute, so a
+     date up to 660 s ahead is read as an earlier run's pending deprecation
+     and left be);
    - **deregister** a build deprecated 7 or more days ago, or disabled, 7 or
      more days old and not one of the two newest builds ever published; then
      delete its snapshots;
@@ -151,7 +154,7 @@ reaches it only through what the customer's own account does to the instance
     {
       "amis": { "<region>": "ami-…", "…": "…" },
       "archive_sha256": "<64 hex>",
-      "archive_url": "https://github.com/idlefy/vm-platform-aws/releases/download/<tag>/solo-<base tag>.tgz",
+      "archive_url": "https://github.com/idlefy/vm-platform-aws/releases/download/<tag>/solo-<tag>.tgz",
       "architecture": "x86_64",
       "base_tag": "base-X.Y.Z",
       "built_at": "YYYY-MM-DDTHH:MM:SSZ",
@@ -224,6 +227,25 @@ reaches it only through what the customer's own account does to the instance
     with only the hardened-image table in its notes, and the owner edits the
     notes afterwards. The driver never deletes or recreates a release.
 
+### The guard
+
+`scripts/hardened-guard-check.sh`, read-only, run by the publish job before
+any build and by hand after any change to the account. It lists every failure,
+not the first, and a denied or unreadable read is a failure, never a pass.
+
+| Check | Refuses when |
+|---|---|
+| G1 | the caller is not in account `995603458290` (nothing else is called) |
+| G2 | in a region of `image/hardened/regions`: EBS encryption by default is on (the copy would be encrypted and could not be public); image block public access is not `unblocked`; the region is not enabled |
+| G2b | SSM Default Host Management Configuration is set in a region (it would hand the build instance a role) |
+| G2c | a region has no room under the public-AMI quota `L-0E3CBAB9` for one more public image (deprecated public images count; the AWS default applies when no value was applied) |
+| G3 | an IAM user or role other than the publish role and service-linked roles is not explicitly denied every mutation of an image or snapshot tagged `IdlefyPublishedImage=true` (policy simulation); `/aws-reserved/` roles are skipped and listed for a manual check |
+| G4 | a region holds a self-owned unencrypted snapshot, or a self-owned image with an unencrypted snapshot, not tagged `IdlefyPublishedImage=true` — each named with its region |
+
+G4 exists because the publisher role can copy images inside the account, and
+an unencrypted private disk is the only thing a compromised run could make
+public. While none exists, nothing can leak.
+
 ### Workflows
 
 `publish-hardened-image` (dispatch on a tag, or monthly on the 1st at 03:00
@@ -237,15 +259,22 @@ UTC):
   OIDC credentials for `HARDENED_PUBLISH_ROLE_ARN` (4 hours), then the guard,
   then the build. One approval covers both.
 - `permissions: contents: write, id-token: write`, nothing broader;
-  `concurrency: hardened-publish` without cancel, shared with the retire
-  workflow so a retention never runs during a build. A third queued run
-  replaces a pending one, as GitHub concurrency does.
+  `concurrency: hardened-publish` without cancel. A third queued run replaces
+  a pending one, as GitHub concurrency does. The retire workflow has its own
+  group, `hardened-retire`, so a publish waiting for approval never blocks a
+  yank and a queued publish never replaces a pending retire. A retention that
+  runs during a build is harmless: the new image is registered only at the
+  end, and retention keys on registered public builds.
+- The first scheduled run after this workflow reaches `main` builds the
+  newest existing `v*` tag, whichever that is.
 - `public` is a boolean input, default `true`; the schedule always builds
   public. The expression is
   `github.event_name == 'schedule' && 'true' || inputs.public` — never
   `inputs.public || 'true'`, which turns a `false` into `'true'`.
 - The driver's test hooks `HARDENED_SKIP_TAG_CHECK` and `HARDENED_TODAY` are
-  never set by a workflow.
+  never set by a workflow. The driver refuses `HARDENED_TODAY` unless
+  `HARDENED_SKIP_TAG_CHECK=1` is set too: a forward-dated name would stay the
+  "newest" build for retention forever.
 - A scheduled run also waits for the environment approval; an unapproved one
   expires. GitHub disables schedules in a repository without activity for 60
   days.
@@ -285,11 +314,31 @@ trailing comment. No input or ref name is interpolated into a `run:` script.
   `bootstrap-solo` stops the stock SSM agent before anything reaches the
   network; the scrub removes the agent's registration and refuses an image
   that still has the snap.
-- **The workflow's credentials.** The publisher role's trust should accept
-  only this repository's `hardened-publish` environment
-  (`repo:idlefy/vm-platform-aws:environment:hardened-publish`), and the
-  environment should be restricted to `main` and `v*` tags with a required
-  reviewer. A branch cannot then assume the role with its own workflow file.
+- **The workflow's credentials — owner prerequisites.** These live outside
+  the repository, and the workflows are only as safe as they are:
+  - the publisher role trusts only this repository's `hardened-publish`
+    environment (`repo:idlefy/vm-platform-aws:environment:hardened-publish`),
+    and its `MaxSessionDuration` is at least 14400 s — the publish job asks
+    for a 4-hour session;
+  - the environment has a required reviewer and its deployment refs are
+    restricted to `main` and `v*` tags, so a branch cannot assume the role
+    with its own workflow file;
+  - a tag ruleset restricts creation, update and deletion of `v*` and
+    `base-*` tags to repository admins. A tag is what the publish job builds
+    and what a tenant pins; without the ruleset, anyone with write access
+    could point one at an ungated commit.
+- **Read what you approve.** A scheduled run's approval screen shows `main`,
+  not the tag it will build. Before approving any run, open its `resolve` job
+  and read the `building <tag> at <sha>` line.
+- **Network-fetched tooling in a job that holds the OIDC token.** The publish
+  job pipes the Cinc Workstation installer from `omnitruck.cinc.sh` into
+  `sudo bash`, pinned to a major version only, and the driver runs
+  `packer init`, which downloads the Amazon plugin under `~> 1.3`. Both run in
+  the job that can mint the environment's OIDC token and so assume the
+  publisher role. A compromise of either source is a compromise of a publish
+  run; the role's scope (decision 13), the guard (G4) and the consumer's
+  pinned ids (decision 6) bound what such a run could do. Accepted, not
+  defended: ci.yml installs the same way.
 
 ## Testing
 
@@ -301,8 +350,9 @@ trailing comment. No input or ref name is interpolated into a `run:` script.
   `aws` and `packer`: the account check, the stored-asset comparison, the
   release created when missing, the record, and the real solo user data
   measured against EC2's 16 KB.
-- `test/test-hardened-guard.sh` — G1–G3 against a shimmed `aws`, including
-  the default-quota fallback and the listed `/aws-reserved/` roles.
+- `test/test-hardened-guard.sh` — G1–G4 against a shimmed `aws`, including
+  the default-quota fallback, the listed `/aws-reserved/` roles, and stray
+  unencrypted snapshots and images, fenced or not.
 - `test/test-hardened-retire.sh` — retention, the safety net, doubts and
   `--disable` against a shimmed `aws` and a fixed clock.
 - The solo section of `test/test-image-scrub.sh` — the solo lists against

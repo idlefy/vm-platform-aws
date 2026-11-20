@@ -34,8 +34,10 @@ permissions:
   contents: read
   id-token: write
 
+# Its own group: a publish waiting for approval never blocks a yank, and a
+# queued publish never replaces a pending retire.
 concurrency:
-  group: hardened-publish
+  group: hardened-retire
   cancel-in-progress: false
 
 jobs:
