@@ -638,7 +638,10 @@ the record reached the release, the build log ends with a list headed
 "Images named … may exist, and may be PUBLIC; no release record names them":
 one line per region with the image id, its state, `public=` and whether
 `IdlefyPublishedImage=true` is set, or "could not list" for a region to check
-by hand. No consumer pins these images, but a public one is launchable by
+by hand. After a cancelled or timed-out run the same list is in the job
+summary, written by the `leftovers` step (or, by hand,
+`scripts/hardened-image-leftovers.sh <name>`). No consumer pins these
+images, but a public one is launchable by
 anyone until it is removed, and retention would count it as a real build. So
 clean up **before any retention run or new build**:
 
@@ -646,14 +649,13 @@ clean up **before any retention run or new build**:
    read-only):
    `aws ec2 describe-images --region <r> --owners self --include-deprecated --include-disabled --filters Name=name,Values=<name> --query 'Images[].[ImageId,State,Public,BlockDeviceMappings[].Ebs.SnapshotId]'`.
 2. **Tagged leftovers** (`IdlefyPublishedImage=true: yes`). Once tagged, no
-   principal but the publisher role may change them — not the owner either.
-   Run *retire-hardened-image* with `disable_name=<name>` and `apply=true`:
-   it disables the name in every region and runs no retention, and a disabled
-   image is private and cannot be launched. A later retention run deregisters
-   it and deletes its snapshots once it is 7 days old and two newer builds
-   exist. To remove it sooner, the only other way is to use the publisher role
-   temporarily for `aws ec2 deregister-image` and then
-   `aws ec2 delete-snapshot` on each of its snapshots, region by region.
+   principal but the publisher role may change them — not the owner either,
+   and that role trusts only the workflow's environment. The only path is
+   the retire workflow: run *retire-hardened-image* with
+   `disable_name=<name>` and `apply=true`. It disables the name in every
+   region and runs no retention; a disabled image is private and cannot be
+   launched. A later retention run deregisters it and deletes its snapshots
+   once it is 7 days old and two newer builds exist.
 3. **Untagged leftovers** (`IdlefyPublishedImage=true: no` — tagging failed).
    The owner removes them with the owner's credentials: note the snapshot ids
    (step 1), `aws ec2 deregister-image --region <r> --image-id <ami>`, then

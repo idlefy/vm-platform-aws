@@ -89,11 +89,17 @@ reaches it only through what the customer's own account does to the instance
    (no principal other than the publisher role and AWS service-linked roles
    may mutate an image or snapshot tagged `IdlefyPublishedImage=true`) is
    hygiene. The guard simulates it for every IAM user and role (G3) and
-   refuses to publish when any principal is **allowed** such a mutation. An
-   implicit deny passes like an explicit one: a principal that cannot act
-   needs no explicit deny, and attaching the deny to CloudFormation-created
-   roles makes their stacks undeletable; the guard re-checks on every
-   publish. The simulation says MFA is present
+   refuses to publish when any principal is **allowed** such a mutation, on
+   one resource ARN per listed region, judged per resource (an Allow scoped
+   to one region's ARNs shows only there). A plain implicit deny passes like
+   an explicit one: a principal that cannot act needs no explicit deny, and
+   attaching the deny to CloudFormation-created roles makes their stacks
+   undeletable; the guard re-checks on every publish. An implicit deny that
+   names `MissingContextValues` does **not** pass: it means an Allow that
+   holds under a key the simulation cannot supply (`aws:SourceIp`,
+   `aws:PrincipalTag`, …), so the principal is checked by hand and given the
+   explicit deny. An explicit deny passes whatever keys it reports missing.
+   The simulation says MFA is present
    (`aws:MultiFactorAuthPresent=true`), so an account's "require MFA" deny
    cannot mask a principal that is otherwise allowed — measured on the
    account: the owner's user simulated `explicitDeny` only because of such a
@@ -217,7 +223,13 @@ reaches it only through what the customer's own account does to the instance
          `iptables-save` writes it: `-A OUTPUT -d 169.254.169.254/32 -j DROP`
          in rules.v4 (from `iptables -I OUTPUT 3 -d 169.254.169.254 -j DROP`)
          and `-A OUTPUT -d fd00:ec2::254/128 -j DROP` in rules.v6. A truncated
-         file, a missing one, or the rule in another table or chain refuses;
+         file, a missing one, or the rule in another table or chain refuses.
+         So does an OUTPUT rule **before** that drop that accepts the
+         metadata address for every user — `-A OUTPUT -j ACCEPT`, or one
+         naming the address with `-j ACCEPT` and no `-m owner --uid-owner`.
+         The check reads only what precedes the drop, never its index, so
+         base::imds's owner-matched accepts (root, Instance Connect) pass
+         whether the drop is inserted at position 3 or appended;
       7. the `amazon-ssm-agent` snap is neither listed by `snap` nor on disk
          (`/snap/amazon-ssm-agent`, `/var/lib/snapd/snaps/amazon-ssm-agent_*.snap`);
       8. dpkg reports `cinc` as not installed;
@@ -253,7 +265,7 @@ not the first, and a denied or unreadable read is a failure, never a pass.
 | G2 | in a region of `image/hardened/regions`: EBS encryption by default is on (the copy would be encrypted and could not be public); the region is not enabled; for a **public** build only, image block public access is not `unblocked` |
 | G2b | SSM Default Host Management Configuration is set in a region (it would hand the build instance a role) |
 | G2c | a region has no room under the public-AMI quota `L-0E3CBAB9` for one more public image (deprecated public images count; the AWS default applies when no value was applied) |
-| G3 | an IAM user or role other than the publish role and service-linked roles is **allowed** any fenced action on an image or snapshot tagged `IdlefyPublishedImage=true`, or its simulation fails (policy simulation with the fence tag and `aws:MultiFactorAuthPresent=true`; `implicitDeny` passes like `explicitDeny`); `/aws-reserved/` roles are skipped and listed for a manual check |
+| G3 | an IAM user or role other than the publish role and service-linked roles is **allowed** any fenced action on an image or snapshot tagged `IdlefyPublishedImage=true` in any listed region, gets an `implicitDeny` that names `MissingContextValues` (a conditioned Allow — check by hand, then attach the deny), or its simulation fails. Policy simulation with the fence tag and `aws:MultiFactorAuthPresent=true`, one resource ARN per region (at most 10 per call), every `ResourceSpecificResults` entry a deny; a plain `implicitDeny` passes like `explicitDeny`. `/aws-reserved/` roles are skipped and listed for a manual check |
 | G4 | a region holds a self-owned unencrypted snapshot, or a self-owned image with an unencrypted snapshot, not tagged `IdlefyPublishedImage=true` — each named with its region |
 
 G4 exists because the publisher role can copy images inside the account, and
@@ -284,10 +296,16 @@ region; the record is written only after all of that. A failure anywhere from
 artifact that does not name exactly the listed regions, a failed record
 upload, an interrupted run — can leave images named `$AMI_NAME` in some
 regions, **public if the build was**, that no release record names. The
-driver then lists them on stderr (read-only `describe-images` by exact name,
-in every listed region: id, state, `Public`, and whether the fence tag is
-set; a failed describe is printed, never hidden) and keeps the failure's exit
-status. The consumer never pins them, but they are public until removed, and
+driver writes the name to `dist/hardened-ami-name` before `packer build`,
+and on a failure, INT or TERM it runs `scripts/hardened-image-leftovers.sh`
+(read-only `describe-images` by exact name, in every listed region: id,
+state, `Public`, and whether the fence tag is set; a failed describe is
+printed, never hidden) and keeps the failure's exit status (143 on TERM).
+A cancelled or timed-out Actions run is listed by the workflow's `leftovers`
+step instead (`if: failure() || cancelled()`), which reads that file and runs
+the same script into the job summary: the runner may kill the driver before
+it can list anything itself. The consumer never pins them, but they are
+public until removed, and
 the next build's NN skips their number (NN is one past the highest same-day
 number in **any** listed region). Clean-up is manual and comes before any
 retention run or new build — `docs/runbook.md`, "A hardened build that failed
@@ -304,9 +322,12 @@ UTC):
   schedule takes the newest `vX.Y.Z` tag on origin, peeled to its commit.
 - `publish` (`environment: hardened-publish`, 240 minutes): checkout of the
   tag with `persist-credentials: false`, Packer 1.11.2, Cinc Workstation,
-  OIDC credentials for `HARDENED_PUBLISH_ROLE_ARN` (4 hours), then the guard
-  (given the same `HARDENED_PUBLIC` as the build), then the build. One
-  approval covers both.
+  OIDC credentials for `HARDENED_PUBLISH_ROLE_ARN` (4 hours), then the guard,
+  then the build. One approval covers both. `HARDENED_PUBLIC` is set once,
+  in the job's `env:`, so the guard and the build cannot drift. After a
+  failed, cancelled or timed-out build the `leftovers` step lists any image
+  of the chosen name into the job summary (it says so when the build never
+  chose a name), and the `record` step prints any record written.
 - `permissions: contents: write, id-token: write`, nothing broader;
   `concurrency: hardened-publish` without cancel. A third queued run replaces
   a pending one, as GitHub concurrency does. The retire workflow has its own

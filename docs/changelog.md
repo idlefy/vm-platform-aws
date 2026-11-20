@@ -92,10 +92,13 @@ publishes it from Idlefy's account; design record:
   unblocked for a public build, SSM Default Host Management unset, quota
   room, no principal but the publisher allowed to change a published image,
   and no unencrypted snapshot or image outside the published ones).
-- The driver also lists, read-only, any image of the build's name left in a
-  region when a build fails after `packer build` started, and takes NN from
+- `scripts/hardened-image-leftovers.sh` lists, read-only, any image of a
+  build's name in every listed region. The driver runs it when a build fails
+  or is signalled after `packer build` started, and the publish workflow runs
+  it after a failed, cancelled or timed-out build. The driver takes NN from
   every listed region. The solo scrub checks `rules.v4` as it checks
-  `rules.v6`.
+  `rules.v6`, and refuses an OUTPUT accept for every user ahead of either
+  metadata drop.
 - `scripts/hardened-image-retire.sh`: keeps the newest two public builds,
   deprecates and deregisters older ones on a 7-day cadence, never
   deregisters one of the two newest, yanks one build with `--disable`, and
