@@ -230,7 +230,10 @@ if [ -d "$MOD/.terraform" ] \
   size=$(stat -c %s "$T/ud.gz")
   echo "       real bootstrap + scrub, gzip -9: $size bytes (EC2 takes 16384)"
   check "the real user data fits EC2's 16 KB" "$([ "$size" -le 16384 ]; echo $?)"
-  check "...and it is the module's script" "$(zcat "$T/ud.gz" | grep -q 'DEV_VM_POLICY_FETCH'; echo $?)"
+  # Decompressed to a file first: `zcat | grep -q` fails under pipefail when grep
+  # exits at the first match and zcat is still writing (SIGPIPE, status 141).
+  zcat "$T/ud.gz" > "$T/ud.real"
+  check "...and it is the module's script" "$(grep -q 'DEV_VM_POLICY_FETCH' "$T/ud.real"; echo $?)"
 elif [ -n "${CI:-}" ]; then
   # CI's terraform job runs `terraform init` in vms/modules/ec2 before the
   # script tests; a SKIP there means the measurement silently stopped.
