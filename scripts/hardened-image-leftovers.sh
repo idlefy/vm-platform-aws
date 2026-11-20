@@ -15,8 +15,11 @@
 #     down, and every key pair named packer_* carrying that tag. A runner
 #     killed mid-build (an Actions cancel or timeout) leaves both behind:
 #     Packer never gets to clean up.
-# With --clean-build it then terminates those instances and deletes those key
-# pairs — exactly those, and nothing else; the publisher role may do no more.
+# With --clean-build it first checks that the credentials are the publisher
+# account's (the id scripts/hardened-guard-check.sh holds for G1 — read from
+# there, not copied), and refuses before any call but that check if not; then
+# it terminates those instances and deletes those key pairs — exactly those,
+# and nothing else; the publisher role may do no more.
 # Without it, it calls describe-* only.
 #
 # Called by scripts/hardened-image-build.sh (read-only) when a build fails
@@ -79,6 +82,18 @@ BUILD_REGION=${REGIONS%% *}
 ERR="$(mktemp)"
 trap 'rm -f "$ERR"' EXIT
 RC=0
+
+# ---- --clean-build: the publisher account, or nothing -------------------------------
+if [ "$CLEAN" = 1 ]; then
+  GUARD="$ROOT/scripts/hardened-guard-check.sh"
+  WANT="$(sed -n 's/^ACCOUNT_ID=\([0-9]\{12\}\)$/\1/p' "$GUARD" 2>/dev/null)" || WANT=""
+  [[ $WANT =~ ^[0-9]{12}$ ]] \
+    || die "cannot read the publisher account id (ACCOUNT_ID=) from $GUARD — nothing was terminated or deleted"
+  GOT="$(aws sts get-caller-identity --region "$BUILD_REGION" --query Account --output text 2>"$ERR" < /dev/null)" \
+    || die "could not read the AWS account (aws sts get-caller-identity): $(tr '\n' ' ' < "$ERR")— nothing was listed, terminated or deleted"
+  [ "$GOT" = "$WANT" ] \
+    || die "these credentials are for account '$GOT', not the publisher account $WANT — nothing was listed, terminated or deleted"
+fi
 
 # ---- images (read-only) ----------------------------------------------------------
 if [ -n "$NAME" ]; then

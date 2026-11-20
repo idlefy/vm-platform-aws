@@ -156,6 +156,39 @@ meta_preamble_ok() {
     END         { exit bad }' "$R$1" 2>/dev/null
 }
 
+# pkg_absent NAME: dpkg knows no such package (dpkg-query exits 1 saying "no
+# packages found matching"), or knows it as not-installed (what a purge
+# leaves). Any other answer — installed, half-installed, config-files, an
+# error, an unreadable database — is not absence.
+# Its answer (status or error, one line) is left in PKG_SAID for the refusal.
+PKG_SAID=""
+pkg_absent() {
+  local rc=0
+  # shellcheck disable=SC2016 # dpkg-query's format, not a shell expansion
+  PKG_SAID=$(LC_ALL=C dpkg-query -W -f='${db:Status-Status}' "$1" 2>&1) || rc=$?
+  PKG_SAID=$(printf '%s' "$PKG_SAID" | head -n 1)
+  case $rc in
+    0) [ "$PKG_SAID" = not-installed ] ;;
+    1) [[ $PKG_SAID == *"no packages found matching $1"* ]] ;;
+    *) return 1 ;;
+  esac
+}
+
+# no_units_left: no unit file or enablement link of snapd, a snap or the SSM
+# agent in any system or user unit directory. A directory that is absent is
+# skipped by name; one find cannot read refuses.
+no_units_left() {
+  local d hits
+  for d in /etc/systemd/system /lib/systemd/system /usr/lib/systemd/system \
+           /etc/systemd/user /lib/systemd/user /usr/lib/systemd/user; do
+    [ -e "$R$d" ] || [ -L "$R$d" ] || continue
+    hits=$(find "$R$d" \( -type f -o -type l \) \
+             \( -name 'snap-*.mount' -o -name 'snapd.*' -o -name 'snap.*' -o -name 'amazon-ssm-agent*' \) -print) \
+      || refuse "cannot scan $d for snap or SSM units"
+    [ -z "$hits" ] || refuse "snap or SSM units are left: $(printf '%s' "$hits" | head -n 3 | tr '\n' ' ')"
+  done
+}
+
 # Hook 3, immediately before cloud-init clean, on the disk Packer is about to
 # snapshot. Paths under $R; the root-ownership check only on a real root,
 # since a test's fake root cannot be chowned.
@@ -215,24 +248,21 @@ solo_check() {
   # 7. snapd is gone, and with it every snap and the SSM agent (its snap was
   #    checked gone in solo_prep): the package, its state, and every unit a
   #    snap or snapd installs. No SSM agent as a package either.
-  # shellcheck disable=SC2016 # dpkg-query's format, not a shell expansion
   for f in snapd amazon-ssm-agent; do
-    if st=$(dpkg-query -W -f='${db:Status-Status}' "$f" 2>/dev/null) && [ "$st" != not-installed ]; then
-      refuse "$f still installed (dpkg status '${st:-?}')"
-    fi
+    pkg_absent "$f" || refuse "$f still installed, or dpkg cannot say (dpkg-query: '${PKG_SAID:-?}')"
   done
-  for f in /var/lib/snapd /snap; do
-    [ ! -e "$R$f" ] || refuse "$f is still on disk after the snapd purge"
+  for f in /var/lib/snapd /snap /usr/bin/snap /usr/lib/snapd/snapd; do
+    [ ! -e "$R$f" ] && [ ! -L "$R$f" ] || refuse "$f is still on disk after the snapd purge"
   done
-  st=$(find "$R/etc/systemd/system" "$R/lib/systemd/system" "$R/usr/lib/systemd/system" \
-         \( -name 'snap-*.mount' -o -name 'snapd.*' -o -name 'snap.*' -o -name 'amazon-ssm-agent*' \) \
-         -print 2>/dev/null | head -n 3) || true
-  [ -z "$st" ] || refuse "snap or SSM units are left: $(printf '%s' "$st" | tr '\n' ' ')"
+  no_units_left
   # 8. So is CINC (its files on disk were checked in solo_prep, after the
   #    purge). A purged package dpkg still remembers reads not-installed.
-  # shellcheck disable=SC2016 # dpkg-query's format, not a shell expansion
-  if st=$(dpkg-query -W -f='${db:Status-Status}' cinc 2>/dev/null) && [ "$st" != not-installed ]; then
-    refuse "cinc still installed (dpkg status '${st:-?}')"
-  fi
+  pkg_absent cinc || refuse "cinc still installed, or dpkg cannot say (dpkg-query: '${PKG_SAID:-?}')"
   # 9. /etc/dev-vm ran in solo_dir, before image-revision was written.
+  # 10. Last, after every removal: trim the root filesystem, strictly. A public
+  #     snapshot's freed blocks are readable by anyone, and the removals above
+  #     include the build's snapd device key. The shared scrub's own
+  #     `fstrim -av || true` after cloud-init clean stays best-effort for the
+  #     fleet; for this image a failed trim of / refuses it.
+  fstrim -v "$R/" || refuse "fstrim of the root filesystem failed; removed files (the snapd device key among them) could sit in the snapshot's freed blocks"
 }

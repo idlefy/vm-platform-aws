@@ -319,9 +319,21 @@ tmp PKLOG
 # to $HARDENED_OUT/hardened-ami-name first: a runner that kills this script
 # outright (an Actions cancel or timeout) leaves the listing to the workflow.
 IMAGES_MAY_EXIST=1
+# The console watcher's pid, once started (below). Every way out of this
+# script — a normal end, a failure, INT, TERM — passes through on_exit, which
+# stops and reaps it first.
+WATCH_PID=""
+# shellcheck disable=SC2317  # reached through on_exit and after packer build
+stop_watch() {
+  [ -n "$WATCH_PID" ] || return 0
+  kill "$WATCH_PID" 2>/dev/null || true
+  wait "$WATCH_PID" 2>/dev/null || true
+  WATCH_PID=""
+}
 # shellcheck disable=SC2317  # reached only through the trap
 on_exit() {
   local rc=$?
+  stop_watch
   if [ "$rc" -ne 0 ] && [ "$IMAGES_MAY_EXIST" = 1 ]; then
     echo >&2
     "$ROOT/scripts/hardened-image-leftovers.sh" "$AMI_NAME" >&2 || true
@@ -336,42 +348,56 @@ printf '%s\n' "$AMI_NAME" > "$HARDENED_OUT/hardened-ami-name"
 # watch_console PIDFILE — while Packer runs, read the build instance's serial
 # console every $CONSOLE_POLL seconds. A failed bootstrap leaves the instance
 # running (its console is the only record of why), so Packer would wait its
-# whole stop budget (2 h) for nothing. When the console shows the bootstrap's
-# "BOOTSTRAP FAILED" banner — or the scrub's refusal, which also leaves the
-# instance running ("dev-vm-image-scrub: … no image will be taken") — print
+# whole stop budget (2 h) for nothing. When the console holds, as a whole
+# line, the bootstrap's banner ("BOOTSTRAP FAILED: no image will be taken.
+# Log follows.") or a refusal of the scrub, which also leaves the instance
+# running ("dev-vm-image-scrub: internal error…" / "…: refusing…" — every
+# exit-70 message the scrub logs; its "note:" lines are not refusals) — print
 # its tail and interrupt Packer with SIGINT: Packer then terminates the
-# instance and deletes its temporary key pair.
+# instance and deletes its temporary key pair. Whole lines only, with a
+# trailing carriage return allowed: a console that merely quotes the banner
+# inside another line is not a failure.
 # The instance is the one Packer itself names ("Instance ID: i-…" in its log),
 # never another run's. A console that cannot be read is noted once and is not
 # a failure of the build. A stopped instance's console reads empty (measured),
 # so a good build shows nothing here and the watcher just ends with Packer.
+# Its lifetime: stop_watch (after packer build, and in on_exit on any way
+# out) sends it TERM, which also kills its pending sleep or console read, so
+# no orphan holds the job's output open. As a backstop it returns on its own
+# once $W is gone (cleanup ran) or this script's process is.
 # shellcheck disable=SC2317  # runs in the background
 watch_console() {
-  local pidfile=$1 pid="" iid="" noted=0 sp=""
-  # Killed when Packer ends: take the pending sleep along, so no orphan holds
-  # the job's output open.
-  trap '[ -z "$sp" ] || kill "$sp" 2>/dev/null; exit 0' TERM
+  local pidfile=$1 driver=$$ pid="" iid="" noted=0 sp="" cp=""
+  trap '[ -z "$sp" ] || kill "$sp" 2>/dev/null; [ -z "$cp" ] || kill "$cp" 2>/dev/null; exit 0' TERM
   while :; do
     sleep "$CONSOLE_POLL" & sp=$!
     wait "$sp" || true
     sp=""
+    [ -d "$W" ] || return 0
+    kill -0 "$driver" 2>/dev/null || return 0
     [ -n "$pid" ] || pid="$(cat "$pidfile" 2>/dev/null)" || pid=""
     [ -n "$pid" ] || continue
     kill -0 "$pid" 2>/dev/null || return 0
     [ -n "$iid" ] || iid="$(grep -oE 'Instance ID: i-[0-9a-f]+' "$PKLOG" 2>/dev/null | head -n 1 | cut -d' ' -f3)" || iid=""
     [ -n "$iid" ] || continue
-    if ! aws ec2 get-console-output --region "$BUILD_REGION" --instance-id "$iid" --latest \
-           --query Output --output text > "$W/console" 2> "$W/console.err" < /dev/null; then
+    aws ec2 get-console-output --region "$BUILD_REGION" --instance-id "$iid" --latest \
+      --query Output --output text > "$W/console" 2> "$W/console.err" < /dev/null & cp=$!
+    if ! wait "$cp"; then
+      cp=""
+      [ -d "$W" ] || return 0
       [ "$noted" = 1 ] || echo "note: cannot read the console of $iid yet ($(head -n 1 "$W/console.err")); Packer keeps waiting" >&2
       noted=1; continue
     fi
-    if grep -q 'BOOTSTRAP FAILED' "$W/console"; then
+    cp=""
+    # Whole lines; a serial console may end them with CR LF.
+    tr -d '\r' < "$W/console" > "$W/console.lf" || continue
+    if grep -qxF 'BOOTSTRAP FAILED: no image will be taken. Log follows.' "$W/console.lf"; then
       echo "the bootstrap failed on the build instance" > "$W/build-failed"
-    elif grep -q '^dev-vm-image-scrub: .*no image will be taken' "$W/console"; then
+    elif grep -qE '^dev-vm-image-scrub: (internal error|refusing)[ :]' "$W/console.lf"; then
       echo "the image scrub refused the image on the build instance" > "$W/build-failed"
     fi
     if [ -e "$W/build-failed" ]; then
-      { echo; echo "!! $iid: $(cat "$W/build-failed"). The end of its console:"; tail -n 80 "$W/console"; } >&2
+      { echo; echo "!! $iid: $(cat "$W/build-failed"). The end of its console:"; tail -n 80 "$W/console.lf"; } >&2
       kill -INT "$pid" 2>/dev/null || true
       return 0
     fi
@@ -405,8 +431,7 @@ PK_RC=0
   | tee "$PKLOG" \
   | awk -F, '$3 == "ui" { m = $5; for (i = 6; i <= NF; i++) m = m "," $i; gsub(/%!\(PACKER_COMMA\)/, ",", m); gsub(/\\n/, "\n", m); print m; fflush() }' \
   || PK_RC=$?
-kill "$WATCH_PID" 2>/dev/null || true
-wait "$WATCH_PID" 2>/dev/null || true
+stop_watch
 [ ! -e "$W/build-failed" ] \
   || die "$(cat "$W/build-failed") (its console is above); Packer was interrupted, so it terminates the instance and deletes its key pair — no image, no record"
 [ "$PK_RC" = 0 ] \

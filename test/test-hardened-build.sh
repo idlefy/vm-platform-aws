@@ -47,7 +47,7 @@ check() { if [ "$2" = "0" ]; then PASS=$((PASS+1)); echo "  ok   $1"; else FAIL=
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 R="$T/r"
 mkdir -p "$T/bin" "$T/state" "$R/scripts" "$R/image" "$R/cinc/policyfiles" "$R/cinc/cookbooks/base"
-cp "$ROOT/scripts/hardened-image-build.sh" "$ROOT/scripts/hardened-image-leftovers.sh" "$R/scripts/" 2>/dev/null
+cp "$ROOT/scripts/hardened-image-build.sh" "$ROOT/scripts/hardened-image-leftovers.sh" "$ROOT/scripts/hardened-guard-check.sh" "$R/scripts/"
 cp -R "$ROOT/image/hardened" "$ROOT/image/files" "$R/image/"
 cp "$ROOT/cinc/policyfiles/solo.rb" "$R/cinc/policyfiles/solo.rb"
 printf "name 'base'\nversion '2.1.0'\n" > "$R/cinc/cookbooks/base/metadata.rb"
@@ -172,7 +172,13 @@ if [ -n "${PACKER_SLEEP:-}" ]; then : > "$PACKER_STARTED"; sleep "$PACKER_SLEEP"
 # interrupt (SIGINT, as the console watcher sends) ends it as Packer's does.
 if [ -n "${PACKER_HOLD:-}" ]; then
   echo '1697000000,,ui,message,    amazon-ebs.hardened: Instance ID: i-0123456789abcdef0'
-  trap 'echo interrupted >> "$PACKER_LOG"; echo "1697000002,,ui,error,Build was cancelled." ; exit 1' INT
+  # PACKER_INT_OK: a Packer that takes the interrupt, yet reports a complete
+  # artifact and exits 0 — the driver must still fail on what it saw.
+  if [ -n "${PACKER_INT_OK:-}" ]; then
+    trap 'echo interrupted >> "$PACKER_LOG"; end=0' INT
+  else
+    trap 'echo interrupted >> "$PACKER_LOG"; echo "1697000002,,ui,error,Build was cancelled." ; exit 1' INT
+  fi
   end=$((SECONDS + PACKER_HOLD))
   while [ "$SECONDS" -lt "$end" ]; do sleep 0.1; done
 fi
@@ -219,7 +225,20 @@ run_build() {
   [ -z "${PUBLIC:-}" ] || e+=(HARDENED_PUBLIC="$PUBLIC")
   [ -z "${ORG:-}" ] || e+=(HARDENED_ATTACHED_ORG_ID="$ORG")
   local rc
-  if [ -z "${TERM_MID_PACKER:-}" ]; then
+  if [ -n "${INT_EARLY:-}" ]; then
+    # Ctrl-C to the whole session right after Packer starts, before the console
+    # watcher's first poll. The wrapper resets SIGINT to its default: a
+    # backgrounded bash would hand the driver an ignored SIGINT.
+    ( cd "$T" && exec python3 -I -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+        env -u HARDENED_SECURITY_GROUP_ID -u HARDENED_PUBLIC -u HARDENED_ATTACHED_ORG_ID \
+        -u HARDENED_SUBNET_ID -u HARDENED_INSTANCE_TYPE -u GH_REPO "${e[@]}" \
+        "$R/scripts/hardened-image-build.sh" > "$T/stdout" 2> "$T/stderr" ) &
+    local pid=$! n=0
+    while ! grep -q '^ami_name=' "$T/packer.log" && [ $n -lt 600 ]; do sleep 0.05; n=$((n+1)); done
+    kill -INT -- "-$pid" 2>/dev/null
+    wait "$pid"; rc=$?
+    SESSION=$pid
+  elif [ -z "${TERM_MID_PACKER:-}" ]; then
     ( cd "$T" && env -u HARDENED_SECURITY_GROUP_ID -u HARDENED_PUBLIC -u HARDENED_ATTACHED_ORG_ID \
         -u HARDENED_SUBNET_ID -u HARDENED_INSTANCE_TYPE -u GH_REPO "${e[@]}" \
         "$R/scripts/hardened-image-build.sh" > "$T/stdout" 2> "$T/stderr" )
@@ -483,6 +502,22 @@ check "a refused terminate → exit 1, named; the key pair is still deleted" \
 : > "$T/aws.log"; INSTANCES_FAIL=1 BUILD_KEYS="packer_6740c0de" lo --clean-build
 check "instances it cannot list → exit 1, named, nothing terminated" \
   "$([ $? -eq 1 ] && grep -qF 'instances: could not list' "$T/lo.out" && ! grep -qF 'terminate-instances' "$T/aws.log"; echo $?)"
+: > "$T/aws.log"; BUILD_INSTANCES="i-0abc:running" BUILD_KEYS="packer_6740c0de" AWS_ACCOUNT=111122223333 lo --clean-build
+check "--clean-build with another account's credentials → exit 1, says so, nothing listed or removed" \
+  "$([ $? -eq 1 ] && grep -qF "these credentials are for account '111122223333', not the publisher account 995603458290" "$T/lo.err" \
+     && [ "$(grep -c . "$T/aws.log")" = 1 ] && grep -q '^aws sts get-caller-identity' "$T/aws.log"; echo $?)"
+: > "$T/aws.log"; BUILD_INSTANCES="i-0abc:running" BUILD_KEYS="packer_6740c0de" STS_FAIL=1 lo --clean-build
+check "--clean-build with an unreadable identity → exit 1, says so, nothing removed" \
+  "$([ $? -eq 1 ] && grep -qF 'could not read the AWS account' "$T/lo.err" && ! grep -qE 'terminate-instances|delete-key-pair' "$T/aws.log"; echo $?)"
+cp "$R/scripts/hardened-guard-check.sh" "$T/guard.orig"
+python3 -I -c 'import sys; p=sys.argv[1]; s=open(p).read(); open(p,"w").write(s.replace("\nACCOUNT_ID=", "\nACCOUNTID=", 1))' "$R/scripts/hardened-guard-check.sh"
+: > "$T/aws.log"; BUILD_INSTANCES="i-0abc:running" lo --clean-build
+check "--clean-build when the guard's ACCOUNT_ID cannot be read → exit 1, no AWS call" \
+  "$([ $? -eq 1 ] && grep -qF 'cannot read the publisher account id' "$T/lo.err" && [ ! -s "$T/aws.log" ]; echo $?)"
+cp "$T/guard.orig" "$R/scripts/hardened-guard-check.sh"
+check "the leftovers script holds no copy of the account id" "$(! grep -qE '[0-9]{12}' "$R/scripts/hardened-image-leftovers.sh"; echo $?)"
+: > "$T/aws.log"; BUILD_INSTANCES="i-0abc:running" lo "$P-01"
+check "listing alone reads no identity (read-only, as before)" "$([ $? -eq 0 ] && ! grep -q 'get-caller-identity' "$T/aws.log"; echo $?)"
 : > "$T/aws.log"; lo --terminate-everything
 check "an unknown option → exit 1, no AWS call" "$([ $? -eq 1 ] && [ ! -s "$T/aws.log" ]; echo $?)"
 BUILD_INSTANCES="i-0abc:running" PACKER_RC=1 run_build
@@ -535,6 +570,39 @@ check "an empty console (a stopped instance) → nothing happens, exit 0" "$([ $
 CONSOLE_FAIL=1 HARDENED_CONSOLE_POLL=0.2 PACKER_HOLD=3 run_build; rc=$?
 check "console read errors are tolerated: exit 0, a record, one note" \
   "$([ $rc -eq 0 ] && [ -f "$RECORD" ] && [ "$(grep -c 'cannot read the console of i-0123456789abcdef0' "$T/stderr")" = 1 ]; echo $?)"
+
+CONSOLE_OUTPUT='[  12.3] cloud-init[812]: + echo "BOOTSTRAP FAILED: no image will be taken. Log follows."\nsee BOOTSTRAP FAILED: no image will be taken. Log follows. in the docs\n  dev-vm-image-scrub: refusing: quoted\ndev-vm-image-scrub: note: rsyslog not stopped' \
+  HARDENED_CONSOLE_POLL=0.2 PACKER_HOLD=3 run_build; rc=$?
+check "a healthy console that only quotes the markers inside other lines → no interrupt, exit 0" \
+  "$([ $rc -eq 0 ] && ! grep -qx interrupted "$T/packer.log" && [ -f "$RECORD" ] && grep -q 'get-console-output' "$T/aws.log"; echo $?)"
+CONSOLE_OUTPUT='boot\r\nBOOTSTRAP FAILED: no image will be taken. Log follows.\r\nE: oops\r' HARDENED_CONSOLE_POLL=0.2 PACKER_HOLD=30 run_build; rc=$?
+check "the banner as a whole line ending in CR LF → interrupted" "$([ $rc -ne 0 ] && grep -qx interrupted "$T/packer.log"; echo $?)"
+for msg in "internal error: unknown profile 'solo'" "internal error: expected a revision id, got 'x'" \
+           "internal error: not root and DEV_VM_IMAGE_ROOT unset; this runs only on a build instance" \
+           "internal error at line 77; no image will be taken" \
+           "refusing: status is 'converge-failed x', expected 'ok y'; no image will be taken"; do
+  CONSOLE_OUTPUT="solo converge complete\ndev-vm-image-scrub: $msg" HARDENED_CONSOLE_POLL=0.2 PACKER_HOLD=30 run_build; rc=$?
+  check "the scrub's '$msg' → interrupted, named" \
+    "$([ $rc -ne 0 ] && grep -qx interrupted "$T/packer.log" && grep -qF 'the image scrub refused the image' "$T/stderr"; echo $?)"
+done
+check "every exit-70 message of the scrubs starts 'internal error' or 'refusing'" \
+  "$(! grep -hoE 'log "[^"]*"' "$R/image/files/dev-vm-image-scrub" "$R/image/files/dev-vm-image-scrub-solo" \
+       | grep -vE '^log "(internal error|refusing)[ :]|^log "note: ' | grep -q .; echo $?)"
+check "the banner the watcher matches is the one bootstrap-solo prints" \
+  "$(grep -qxF '    echo "BOOTSTRAP FAILED: no image will be taken. Log follows."' "$R/image/files/bootstrap-solo" \
+     && grep -qF "'BOOTSTRAP FAILED: no image will be taken. Log follows.'" "$R/scripts/hardened-image-build.sh"; echo $?)"
+CONSOLE_OUTPUT='BOOTSTRAP FAILED: no image will be taken. Log follows.' PACKER_INT_OK=1 HARDENED_CONSOLE_POLL=0.2 PACKER_HOLD=30 run_build; rc=$?
+check "Packer takes the interrupt yet exits 0 with a full artifact → the driver still fails, no record" \
+  "$([ $rc -ne 0 ] && grep -qx interrupted "$T/packer.log" && [ ! -e "$RECORD" ] \
+     && ! grep -q 'release upload .*\.json' "$T/gh.log" && grep -qF 'the bootstrap failed on the build instance' "$T/stderr"; echo $?)"
+
+echo "== the console watcher never outlives the driver =="
+SESSION=""; HARDENED_CONSOLE_POLL=1 PACKER_HOLD=30 INT_EARLY=1 run_build; rc=$?
+check "SIGINT to the session before the first poll → exit 130" "$([ $rc -eq 130 ]; echo $?)"
+sleep 3
+check "...and after three polls' time no process of the session is left" \
+  "$([ -n "$SESSION" ] && [ -z "$(ps -s "$SESSION" -o pid= 2>/dev/null)" ]; echo $?)"
+[ -z "$SESSION" ] || pkill -s "$SESSION" 2>/dev/null || true
 
 echo "== public=false and an attached org =="
 PUBLIC=false ORG=0b7c3c1e-5f0e-4b8e-9a51-3f0c2d1e4a5b run_build; check "exits 0" "$?"

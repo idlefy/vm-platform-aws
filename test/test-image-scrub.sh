@@ -43,6 +43,10 @@ exit 0
 SHIM
 # shellcheck disable=SC2016
 printf '[ -n "${SHIM_FAIL_CLOUDINIT:-}" ] && exit 1\nexit 0\n' >> "$T/bin/cloud-init"
+# fstrim -v <root> (the solo profile's strict trim) answers SHIM_FSTRIM_ROOT_RC;
+# the shared scrub's `fstrim -av` always succeeds here.
+# shellcheck disable=SC2016
+printf '[ "$1" = -v ] && exit "${SHIM_FSTRIM_ROOT_RC:-0}"\nexit 0\n' >> "$T/bin/fstrim"
 # The solo profile's shims. Each logs like the others, then answers from the
 # environment: by default a clean solo build (cinc purged and gone, sudoers
 # valid, ubuntu in no admin group, no SSM snap).
@@ -62,7 +66,11 @@ printf '[ -n "${SHIM_FAIL_CLOUDINIT:-}" ] && exit 1\nexit 0\n' >> "$T/bin/cloud-
   printf '[ "${*: -1}" = snapd ] && [ -n "${SHIM_SNAPD_STILL_INSTALLED:-}" ] && { printf installed; exit 0; }\n' >> "$T/bin/dpkg-query"
   printf '[ "${*: -1}" = amazon-ssm-agent ] && [ -n "${SHIM_SSM_DEB_INSTALLED:-}" ] && { printf installed; exit 0; }\n' >> "$T/bin/dpkg-query"
   # A purged package dpkg still remembers answers not-installed.
-  printf '[ "${*: -1}" = snapd ] && { printf not-installed; exit 0; }\nexit 1\n' >> "$T/bin/dpkg-query"
+  # SHIM_DPKGQ_ERR=<package>: dpkg-query cannot answer for it (exit 2).
+  printf '[ "${*: -1}" = "${SHIM_DPKGQ_ERR:-}" ] && { echo "dpkg-query: error: cannot access archive: Permission denied" >&2; exit 2; }\n' >> "$T/bin/dpkg-query"
+  printf '[ "${*: -1}" = snapd ] && { printf not-installed; exit 0; }\n' >> "$T/bin/dpkg-query"
+  # Any other package is unknown to dpkg, as on a real image.
+  printf 'echo "dpkg-query: no packages found matching ${*: -1}" >&2\nexit 1\n' >> "$T/bin/dpkg-query"
   printf '[ "$1" = -c ] && exit "${SHIM_VISUDO_RC:-0}"\nexit 0\n' >> "$T/bin/visudo"
   printf '[ "$*" = "list amazon-ssm-agent" ] && [ -n "${SHIM_SSM_SNAP_PRESENT:-}" ] && exit 0\nexit 1\n' >> "$T/bin/snap"
   # Anything but `id -nG ubuntu` is the real id (the non-root check runs id -u).
@@ -256,6 +264,8 @@ SNAPD_PURGE='apt-get purge -y -o DPkg::Lock::Timeout=300 snapd'
 check "purges snapd, waiting for the dpkg lock" "$(grep -qx "$SNAPD_PURGE" "$T/log"; echo $?)"
 check "  …after the SSM snap check and the cinc purge" \
   "$([ "$(lineno '^snap list amazon-ssm-agent')" -lt "$(lineno "^$SNAPD_PURGE\$")" ] && [ "$(lineno "^$PURGE\$")" -lt "$(lineno "^$SNAPD_PURGE\$")" ]; echo $?)"
+check "trims the root filesystem strictly, after the checks, before cloud-init clean" \
+  "$(between "$(lineno "^fstrim -v $R/\$")" "$(lineno '^visudo -c')" "$(lineno 'cloud-init clean')"; echo $?)"
 check "  …then cleans apt's cache" "$([ "$(lineno "^$SNAPD_PURGE\$")" -lt "$(lineno '^apt-get clean$')" ]; echo $?)"
 check "checks snapd and an SSM package are gone after the purge" \
   "$(between "$(lineno '^dpkg-query .*snapd$')" "$(lineno "^$SNAPD_PURGE\$")" "$(lineno 'cloud-init clean')" \
@@ -374,6 +384,21 @@ solo_refuses "snapd purge fails"            "snapd purge failed" ":" SHIM_SNAPD_
 solo_refuses "apt-get clean fails"          "apt-get clean failed" ":" SHIM_CLEAN_RC=1
 solo_refuses "snapd still installed"        "snapd still installed" ":" SHIM_SNAPD_STILL_INSTALLED=1
 solo_refuses "an SSM agent package"         "amazon-ssm-agent still installed" ":" SHIM_SSM_DEB_INSTALLED=1
+for pkg in cinc snapd amazon-ssm-agent; do
+  solo_refuses "dpkg-query cannot answer for $pkg (exit 2)" "$pkg still installed, or dpkg cannot say" ":" SHIM_DPKGQ_ERR=$pkg
+done
+for f in usr/bin/snap usr/lib/snapd/snapd; do
+  solo_refuses "/$f left behind"            "/$f is still on disk" "mkdir -p \"\$(dirname $f)\" && touch $f"
+done
+solo_refuses "a user unit left: snapd.session-agent.socket" "snap or SSM units are left" \
+  "mkdir -p usr/lib/systemd/user && touch usr/lib/systemd/user/snapd.session-agent.socket"
+solo_refuses "a user enablement link left" "snap or SSM units are left" \
+  "mkdir -p etc/systemd/user/sockets.target.wants && ln -s /usr/lib/systemd/user/snapd.session-agent.socket etc/systemd/user/sockets.target.wants/snapd.session-agent.socket"
+solo_refuses "a unit directory find cannot read" "cannot scan /etc/systemd/user" \
+  "mkdir -p etc/systemd/user/x && chmod 000 etc/systemd/user"
+chmod 755 "$R/etc/systemd/user"   # so the next build_root can remove it
+solo_passes "a directory named like a unit is not a unit" "mkdir -p etc/systemd/system/snap.d-not-a-unit"
+solo_refuses "the strict root trim fails" "fstrim of the root filesystem failed" ":" SHIM_FSTRIM_ROOT_RC=1
 for u in etc/systemd/system/snap-core22-1380.mount etc/systemd/system/multi-user.target.wants/snap-lxd-1.mount \
          usr/lib/systemd/system/snapd.service etc/systemd/system/snap.amazon-ssm-agent.amazon-ssm-agent.service \
          lib/systemd/system/amazon-ssm-agent.service; do

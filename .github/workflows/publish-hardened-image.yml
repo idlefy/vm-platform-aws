@@ -115,7 +115,8 @@ jobs:
             | sudo bash -s -- -P cinc-workstation -v 26
           chef --version
 
-      - uses: aws-actions/configure-aws-credentials@00943011d9042930efac3dcd3a170e4273319bc8 # v5.1.0
+      - id: aws-creds
+        uses: aws-actions/configure-aws-credentials@00943011d9042930efac3dcd3a170e4273319bc8 # v5.1.0
         with:
           role-to-assume: ${{ vars.HARDENED_PUBLISH_ROLE_ARN }}
           aws-region: us-east-1
@@ -143,12 +144,22 @@ jobs:
       # deletes Packer's packer_* key pair (both tagged
       # Name=idlefy-hardened-image-build, in the build region) — whether or
       # not a name was chosen: only build resources carry that tag, and the
-      # concurrency group lets no other publish run be live. Images are never
-      # removed here; that is the owner's call (docs/runbook.md).
+      # concurrency group lets no other publish run be live. --clean-build
+      # first checks the credentials are the publisher account's. Images are
+      # never removed here; that is the owner's call (docs/runbook.md).
       - name: leftovers
         if: failure() || cancelled()
+        env:
+          # Without credentials nothing was launched, and every read would
+          # only report "could not list".
+          AWS_CREDS: ${{ steps.aws-creds.outcome }}
         run: |
           set +e -uo pipefail
+          if [ "$AWS_CREDS" != success ]; then
+            msg="No AWS credentials were configured: nothing could have been launched."
+            echo "$msg"; echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           args=(--clean-build)
           if [ -s dist/hardened-ami-name ]; then
             args+=("$(head -n 1 dist/hardened-ami-name)")
