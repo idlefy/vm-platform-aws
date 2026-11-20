@@ -185,6 +185,8 @@ check "ran the image-template gate" "$(echo "$OUT" | grep -q 'image-template stu
 check "ran the image-scrub gate" "$(echo "$OUT" | grep -q 'image-scrub stub' && echo 0 || echo 1)"
 check "ran the hardened-template gate" "$(echo "$OUT" | grep -q 'hardened-template stub' && echo 0 || echo 1)"
 check "ran the hardened-build gate" "$(echo "$OUT" | grep -q 'hardened-build stub' && echo 0 || echo 1)"
+check "ran the hardened-guard gate" "$(echo "$OUT" | grep -q 'hardened-guard stub' && echo 0 || echo 1)"
+check "ran the hardened-retire gate" "$(echo "$OUT" | grep -q 'hardened-retire stub' && echo 0 || echo 1)"
 check "ran the ami-build gate" "$(echo "$OUT" | grep -q 'ami-build stub' && echo 0 || echo 1)"
 check "ran the fetch-sync guard" "$(echo "$OUT" | grep -q 'fetch-sync stub' && echo 0 || echo 1)"
 check "no chefspec on the v path" "$(echo "$OUT" | grep -q 'chefspec stub' && echo 1 || echo 0)"
@@ -213,6 +215,8 @@ check "ran the chefspec gate" "$(echo "$OUT" | grep -q 'chefspec stub' && echo 0
 check "no image-template gate on the cookbook path" "$(echo "$OUT" | grep -q 'image-template stub' && echo 1 || echo 0)"
 check "no image-scrub gate on the cookbook path" "$(echo "$OUT" | grep -q 'image-scrub stub' && echo 1 || echo 0)"
 check "no hardened-template gate on the cookbook path" "$(echo "$OUT" | grep -q 'hardened-template stub' && echo 1 || echo 0)"
+check "no hardened-guard gate on the cookbook path" "$(echo "$OUT" | grep -q 'hardened-guard stub' && echo 1 || echo 0)"
+check "no hardened-retire gate on the cookbook path" "$(echo "$OUT" | grep -q 'hardened-retire stub' && echo 1 || echo 0)"
 check "no ami-build gate on the cookbook path" "$(echo "$OUT" | grep -q 'ami-build stub' && echo 1 || echo 0)"
 check "ran the fetch-sync guard on the cookbook path" "$(echo "$OUT" | grep -q 'fetch-sync stub' && echo 0 || echo 1)"
 teardown
