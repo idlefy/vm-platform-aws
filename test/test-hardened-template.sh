@@ -37,7 +37,14 @@ check "the name is an input, not a timestamp" "$(grep -q 'ami_name *= *var.ami_n
 check "Canonical noble amd64 source" "$(grep -q '099720109477' "$S" && grep -qF 'ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*' "$S"; echo $?)"
 check "the fence tag" "$(grep -q 'IdlefyPublishedImage *= *"true"' "$S"; echo $?)"
 check "no PolicyGroup run tag" "$(! grep -q PolicyGroup "$S"; echo $?)"
-check "the build instance is tagged for the IAM fence" "$(grep -q 'Name *= *"idlefy-hardened-image-build"' "$S"; echo $?)"
+# block NAME — the lines of the first `NAME = {` or `NAME {` block of the
+# comment-stripped template, up to its first closing brace (none is nested).
+block() { awk -v n="$1" '$0 ~ "^[[:space:]]*" n "[[:space:]]*(=[[:space:]]*)?[{]" { on = 1; next } on && /^[[:space:]]*[}]/ { exit } on' "$S"; }
+check "the build instance is tagged for the IAM fence" "$(block run_tags | grep -q 'Name *= *"idlefy-hardened-image-build"'; echo $?)"
+check "...and so is its volume" "$(block run_volume_tags | grep -q 'Name *= *"idlefy-hardened-image-build"'; echo $?)"
+check "the AMI and its snapshots carry the provenance tags" "$(grep -q '^[[:space:]]*tags *= *local.tags$' "$S" && grep -q '^[[:space:]]*snapshot_tags *= *local.tags$' "$S"; echo $?)"
+check "only # comments (the strip above knows no other kind)" "$(! grep -q '//\|/[*]' "$S"; echo $?)"
+check "ami_name is validated against the published pattern" "$(block 'validation' | grep -qF 'can(regex("^idlefy-hardened-agent-ubuntu-24\\.04-amd64-[0-9]{8}-[0-9]{2}$", var.ami_name))'; echo $?)"
 check "a fixed security group, never a temporary one" "$(grep -q 'security_group_ids *= *\[var.security_group_id\]' "$S" && ! grep -q temporary_security_group "$S"; echo $?)"
 check "its own directory" "$([ ! -e "$ROOT/image/hardened.pkr.hcl" ] && [ "$(ls "$DIR"/*.pkr.hcl 2>/dev/null | wc -l)" = 1 ] && [ "$(ls "$ROOT"/image/*.pkr.hcl | wc -l)" = 1 ] && echo 0 || echo 1)"
 check "regions file: build region first, one region per line, no duplicates" "$(R="$(grep -v '^[[:space:]]*\(#\|$\)' "$DIR/regions" 2>/dev/null)" \

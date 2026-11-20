@@ -30,7 +30,14 @@ variable "aws_profile" {
 }
 variable "build_region" { type = string }
 variable "ami_regions" { type = list(string) }
-variable "ami_name" { type = string }
+# The name consumers match on: the driver computes it, and nothing else may.
+variable "ami_name" {
+  type = string
+  validation {
+    condition     = can(regex("^idlefy-hardened-agent-ubuntu-24\\.04-amd64-[0-9]{8}-[0-9]{2}$", var.ami_name))
+    error_message = "The ami_name must be idlefy-hardened-agent-ubuntu-24.04-amd64-YYYYMMDD-NN."
+  }
+}
 variable "user_data_file" { type = string }
 variable "instance_type" {
   type    = string
