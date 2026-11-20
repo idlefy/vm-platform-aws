@@ -26,6 +26,7 @@ log() {
 # Under set -e any other failure would end the script with nothing on the
 # console and the bootstrap's own ERR trap already cleared.
 trap 'log "internal error at line $LINENO; no image will be taken"' ERR
+# shellcheck disable=SC1090
 case $P in
   fleet) ;;
   solo) . "$0-solo" || { log "internal error: cannot read $0-solo; no image will be taken"; exit 70; } ;;

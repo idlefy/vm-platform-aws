@@ -30,13 +30,21 @@ trap bootstrap_failed ERR
 # First, before anything reaches the network: the stock image's SSM agent would
 # register this build instance with SSM while the converge that removes it
 # (base::no_ssm_agent) is still minutes away. The scrub checks the snap is gone.
+# While snapd is still seeding — as it is this early on a fresh instance, the
+# case no_ssm_agent.rb documents — the snap is not listed yet and `snap stop`
+# is a silent no-op; the agent then starts and runs through the whole build.
+# So wait for the seed (local, no network), then stop and disable it, and stop
+# its unit directly in case the snap command still misses it.
+timeout 600 snap wait system seed.loaded || true
 snap stop --disable amazon-ssm-agent || true
+systemctl stop snap.amazon-ssm-agent.amazon-ssm-agent.service || true
 
 # The build instance is a VM too: drop cloud-init's NOPASSWD grant to ubuntu.
 rm -f /etc/sudoers.d/90-cloud-init-users
 
 # An unrendered file fails here, before any download.
 [[ $ARCHIVE_SHA256 =~ ^[0-9a-f]{64}$ ]] || { echo "ARCHIVE_SHA256 is not a sha256: '$ARCHIVE_SHA256'"; false; }
+[[ $ARCHIVE_URL == https://* ]] || { echo "ARCHIVE_URL is not an https URL: '$ARCHIVE_URL'"; false; }
 
 W=/run/dev-vm/solo
 install -d -m 0700 /run/dev-vm "$W"

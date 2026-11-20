@@ -48,13 +48,14 @@ printf '[ -n "${SHIM_FAIL_CLOUDINIT:-}" ] && exit 1\nexit 0\n' >> "$T/bin/cloud-
 # valid, ubuntu in no admin group, no SSM snap).
 # shellcheck disable=SC2016
 {
-  for c in dpkg dpkg-query visudo snap; do
+  for c in apt-get dpkg dpkg-query visudo snap; do
     printf '#!/usr/bin/env bash\necho "%s $*" >> "$SHIM_LOG"\n' "$c" > "$T/bin/$c"; chmod +x "$T/bin/$c"
   done
   # id logs only the call it answers: the scrub's own `id -u` (the non-root
   # guard) must stay invisible to the fleet sections' "ran nothing" checks.
   printf '#!/usr/bin/env bash\n' > "$T/bin/id"; chmod +x "$T/bin/id"
-  printf 'exit "${SHIM_DPKG_RC:-0}"\n' >> "$T/bin/dpkg"
+  printf 'exit "${SHIM_PURGE_RC:-0}"\n' >> "$T/bin/apt-get"
+  printf 'exit 0\n' >> "$T/bin/dpkg"
   printf '[ "${*: -1}" = cinc ] && [ -n "${SHIM_CINC_STILL_INSTALLED:-}" ] && exit 0\nexit 1\n' >> "$T/bin/dpkg-query"
   printf '[ "$1" = -c ] && exit "${SHIM_VISUDO_RC:-0}"\nexit 0\n' >> "$T/bin/visudo"
   printf '[ "$*" = "list amazon-ssm-agent" ] && [ -n "${SHIM_SSM_SNAP_PRESENT:-}" ] && exit 0\nexit 1\n' >> "$T/bin/snap"
@@ -118,7 +119,7 @@ check "checks the timers are off before powering off" "$(grep -q 'systemctl is-e
 check "cleans cloud-init with the machine id" "$(grep -q 'cloud-init clean --logs --machine-id' "$T/log"; echo $?)"
 check "powers off last" "$(tail -1 "$T/log" | grep -q '^poweroff'; echo $?)"
 echo "== fleet mode never purges cinc or runs the solo checks =="
-check "no dpkg/visudo/snap/id in fleet mode" "$(! grep -qE '^(dpkg|dpkg-query|visudo|snap|id) ' "$T/log"; echo $?)"
+check "no dpkg/visudo/snap/id in fleet mode" "$(! grep -qE '^(apt-get|dpkg|dpkg-query|visudo|snap|id) ' "$T/log"; echo $?)"
 
 echo "== a unit still enabled at the end means no image =="
 : > "$T/log"; build_root "$R" "2026-10-16T00:00:00Z ok $REV"
@@ -191,6 +192,10 @@ LIST_SOLO="$ROOT/test/fixtures/image-scrub-paths-solo"
 # policy is a `:INPUT DROP` chain header, never a `-P` line).
 seed_solo() {  # seed_solo DIR
   chmod 0755 "$1/usr/local/sbin/idlefy-share"
+  # `systemctl enable` makes the wants entry a symlink (relative here, so -s
+  # can follow it inside the fake root).
+  ln -sfn ../idlefy-hardened-firstboot.service \
+    "$1/etc/systemd/system/multi-user.target.wants/idlefy-hardened-firstboot.service"
   cat > "$1/etc/iptables/rules.v6" <<'V6'
 *filter
 :INPUT DROP [0:0]
@@ -218,13 +223,14 @@ while read -r verb path _; do
     keep)   check "kept: $path"    "$(rc [ -s "$p" ])" ;;
   esac
 done < <(grep -v '^\s*#' "$LIST_SOLO" | grep -E '^(remove|empty|keep) ')
-check "purges cinc" "$(grep -q '^dpkg --purge cinc$' "$T/log"; echo $?)"
-check "purge comes before cloud-init clean" "$(rc between "$(lineno 'dpkg --purge cinc')" 0 "$(lineno 'cloud-init clean')")"
+PURGE='apt-get purge -y -o DPkg::Lock::Timeout=300 cinc'
+check "purges cinc, waiting for the dpkg lock" "$(grep -qx "$PURGE" "$T/log"; echo $?)"
+check "purge comes before cloud-init clean" "$(rc between "$(lineno '^apt-get purge')" 0 "$(lineno 'cloud-init clean')")"
 check "checks the first-boot unit is enabled" "$(grep -q "systemctl is-enabled --quiet $FIRSTBOOT" "$T/log"; echo $?)"
 check "checks sudoers with visudo -c" "$(grep -q '^visudo -c' "$T/log"; echo $?)"
 check "checks ubuntu's groups" "$(grep -q '^id -nG ubuntu' "$T/log"; echo $?)"
 check "checks the SSM snap is gone" "$(grep -q '^snap list amazon-ssm-agent' "$T/log"; echo $?)"
-check "checks cinc is gone after the purge" "$(rc between "$(lineno '^dpkg-query .*cinc')" "$(lineno 'dpkg --purge cinc')" "$(lineno 'cloud-init clean')")"
+check "checks cinc is gone after the purge" "$(rc between "$(lineno '^dpkg-query .*cinc')" "$(lineno '^apt-get purge')" "$(lineno 'cloud-init clean')")"
 check "records the sha" "$(grep -qx "$REV" "$R/etc/dev-vm/image-revision"; echo $?)"
 check "powers off last" "$(tail -1 "$T/log" | grep -q '^poweroff'; echo $?)"
 check "the status default is /run/dev-vm/solo" "$(grep -qF 'DEV_VM_POLICY_STATE:-/run/dev-vm/solo' "$SOLO"; echo $?)"
@@ -243,9 +249,13 @@ solo_refuses() {
   check "  …no poweroff" "$(! grep -q '^poweroff' "$T/log"; echo $?)"
   check "  …no cloud-init clean" "$(! grep -q 'cloud-init clean' "$T/log"; echo $?)"
 }
-solo_refuses "cinc purge fails"             "cinc purge failed"   ":" SHIM_DPKG_RC=1
+solo_refuses "cinc purge fails"             "cinc purge failed"   ":" SHIM_PURGE_RC=1
 solo_refuses "cinc still installed"         "cinc still installed" ":" SHIM_CINC_STILL_INSTALLED=1
+solo_refuses "cinc-client on disk though dpkg says gone" "/opt/cinc/bin/cinc-client" \
+  "rm opt/cinc && mkdir -p opt/cinc/bin && echo x > opt/cinc/bin/cinc-client"
 solo_refuses "first-boot unit not enabled"  "idlefy-hardened-firstboot" ":" SHIM_ENABLED_UNITS=
+solo_refuses "unit enabled but no wants link on disk" "multi-user.target.wants" \
+  "rm etc/systemd/system/multi-user.target.wants/idlefy-hardened-firstboot.service"
 solo_refuses "no cloud-init override"       "90-idlefy-hardened.cfg" "rm etc/cloud/cloud.cfg.d/90-idlefy-hardened.cfg"
 solo_refuses "no tailscale grant"           "50-tailscale-login" "rm etc/sudoers.d/50-tailscale-login"
 solo_refuses "no share grant"               "51-idlefy-share"    "rm etc/sudoers.d/51-idlefy-share"
@@ -258,7 +268,14 @@ for g in sudo adm admin lxd; do
 done
 solo_refuses "rules.v6 without INPUT DROP"  "rules.v6" "printf '%s\n' '*filter' ':INPUT ACCEPT [0:0]' '-A OUTPUT -d fd00:ec2::254/128 -j DROP' > etc/iptables/rules.v6"
 solo_refuses "rules.v6 without the IMDS drop" "rules.v6" "printf '%s\n' '*filter' ':INPUT DROP [0:0]' '-A OUTPUT -d fd00:ec2::254/128 -m owner --uid-owner 0 -j ACCEPT' > etc/iptables/rules.v6"
+solo_refuses "INPUT DROP only in *mangle"   "rules.v6" "printf '%s\n' '*mangle' ':INPUT DROP [0:0]' 'COMMIT' '*filter' ':INPUT ACCEPT [0:0]' '-A OUTPUT -d fd00:ec2::254/128 -j DROP' 'COMMIT' > etc/iptables/rules.v6"
+solo_refuses "IMDS drop in another chain"   "rules.v6" "printf '%s\n' '*filter' ':INPUT DROP [0:0]' '-A FORWARD -d fd00:ec2::254/128 -j DROP' 'COMMIT' > etc/iptables/rules.v6"
+solo_refuses "IMDS drop only in *mangle"    "rules.v6" "printf '%s\n' '*mangle' '-A OUTPUT -d fd00:ec2::254/128 -j DROP' 'COMMIT' '*filter' ':INPUT DROP [0:0]' 'COMMIT' > etc/iptables/rules.v6"
 solo_refuses "SSM snap still installed"     "amazon-ssm-agent"   ":" SHIM_SSM_SNAP_PRESENT=1
+# snap list fails when snapd is unreachable; the disk still tells.
+solo_refuses "SSM snap mounted though snap list fails" "amazon-ssm-agent" "mkdir -p snap/amazon-ssm-agent/current"
+solo_refuses "SSM snap file though snap list fails"    "amazon-ssm-agent" \
+  "mkdir -p var/lib/snapd/snaps && echo x > var/lib/snapd/snaps/amazon-ssm-agent_1234.snap"
 solo_refuses "no /etc/dev-vm"               "/etc/dev-vm"        "rm -r etc/dev-vm"
 check "  …and no image-revision written" "$(rc [ ! -e "$R/etc/dev-vm/image-revision" ])"
 
@@ -282,7 +299,7 @@ echo "== the solo status file is checked like the fleet's =="
 build_root "$R" "2026-11-01T00:00:00Z converge-failed $REV" "$LIST_SOLO"; seed_solo "$R"; : > "$T/log"
 DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$FIRSTBOOT" run_scrub "$R" solo; got=$?
 check "a failed solo converge → exit 65" "$(rc [ "$got" = 65 ])"
-check "  …and purges nothing" "$(! grep -q '^dpkg' "$T/log"; echo $?)"
+check "  …and purges nothing" "$(! grep -qE '^(apt-get|dpkg)' "$T/log"; echo $?)"
 
 echo "== an unknown profile is an internal error =="
 : > "$T/log"
@@ -298,7 +315,10 @@ check "REMOVE_SOLO/EMPTY_SOLO equal the solo fixture's remove/empty lines" "$([ 
 
 echo "== the fleet's scrub carries no solo code (its user data is capped at 16 KB) =="
 check "no solo lists, purge or invariants in dev-vm-image-scrub" \
-  "$(! grep -qE 'REMOVE_SOLO|EMPTY_SOLO|dpkg --purge|dpkg-query|visudo|snap list|id -nG|rules\.v6|idlefy-|sudoers\.d|fd00:ec2|/run/dev-vm/solo' "$SCRUB"; echo $?)"
+  "$(! grep -qE 'REMOVE_SOLO|EMPTY_SOLO|apt-get|dpkg --purge|dpkg-query|visudo|snap list|id -nG|rules\.v6|idlefy-|sudoers\.d|fd00:ec2|/run/dev-vm/solo' "$SCRUB"; echo $?)"
+echo "== the solo file's embed contract (Task 2b writes it with a heredoc) =="
+check "solo file: no DEV_VM_IMAGE_SCRUB line" "$(! grep -qx 'DEV_VM_IMAGE_SCRUB' "$SOLO" && [ -f "$SOLO" ]; echo $?)"
+check "solo file: ends in a newline" "$([ -s "$SOLO" ] && [ "$(tail -c1 "$SOLO" | od -An -c | tr -d ' ')" = '\n' ]; echo $?)"
 # ---- bootstrap-solo: the build's user data ----------------------------------------
 BOOT="$ROOT/image/files/bootstrap-solo"
 UD="$ROOT/vms/modules/ec2/user_data.tf"
@@ -315,8 +335,42 @@ check "line 3 is the URL placeholder" "$(rc [ "$(sed -n 3p "$BOOT" 2>/dev/null)"
 check "line 4 is the sha placeholder" "$(rc [ "$(sed -n 4p "$BOOT" 2>/dev/null)" = "ARCHIVE_SHA256='__ARCHIVE_SHA256__'" ])"
 check "no DEV_VM_IMAGE_SCRUB line (Task 2b's heredoc terminator)" "$(! grep -qx 'DEV_VM_IMAGE_SCRUB' "$BOOT" 2>/dev/null && [ -f "$BOOT" ]; echo $?)"
 check "ends in a newline" "$([ -s "$BOOT" ] && [ "$(tail -c1 "$BOOT" | od -An -c | tr -d ' ')" = '\n' ]; echo $?)"
-check "stops the SSM agent before any download" \
-  "$(a=$(grep -n 'snap stop --disable amazon-ssm-agent' "$BOOT" | head -1 | cut -d: -f1); b=$(grep -n '^ *curl ' "$BOOT" | head -1 | cut -d: -f1); [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]; echo $?)"
+first_line() { grep -n "$1" "$BOOT" | head -1 | cut -d: -f1; }
+before_curl() { local a b; a=$(first_line "$1"); b=$(first_line '^ *curl '); [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]; }
+check "waits for snapd's seed before any download" "$(rc before_curl '^timeout 600 snap wait system seed.loaded')"
+check "stops the SSM agent before any download" "$(rc before_curl 'snap stop --disable amazon-ssm-agent')"
+check "  …after the seed wait" \
+  "$(rc [ "$(first_line '^timeout 600 snap wait')" -lt "$(first_line 'snap stop --disable amazon-ssm-agent')" ])"
+check "  …and stops its unit directly too" "$(rc before_curl '^systemctl stop snap.amazon-ssm-agent.amazon-ssm-agent.service')"
+
+# Run a rendered copy up to its guards: every absolute path it writes is moved
+# under $T, every command it would run before them is a shim.
+echo "== bootstrap-solo refuses an unrendered placeholder before any network call =="
+mkdir -p "$T/bb"
+# shellcheck disable=SC2016
+for c in snap systemctl timeout curl install; do
+  printf '#!/usr/bin/env bash\necho "%s $*" >> "$SHIM_LOG"\n' "$c" > "$T/bb/$c"; chmod +x "$T/bb/$c"
+done
+boot_run() {  # boot_run URL SHA → exit status; the log is $T/blog
+  local s
+  s=$(<"$BOOT")
+  s=${s//__ARCHIVE_URL__/$1}; s=${s//__ARCHIVE_SHA256__/$2}
+  s=${s//\/var\/log\//$T/bv/}; s=${s//\/dev\/console/$T/bconsole}
+  s=${s//\/etc\//$T/be/}; s=${s//\/run\/dev-vm/$T/br}
+  mkdir -p "$T/bv" "$T/be"; : > "$T/blog"; : > "$T/bconsole"
+  printf '%s\n' "$s" > "$T/boot.sh"
+  SHIM_LOG="$T/blog" PATH="$T/bb:$PATH" bash "$T/boot.sh" >/dev/null 2>&1
+}
+boot_run '__ARCHIVE_URL__' "$REV"; got=$?
+check "unrendered URL, rendered sha → fails" "$(rc [ "$got" != 0 ])"
+check "  …before any curl" "$(! grep -q '^curl' "$T/blog"; echo $?)"
+check "  …and says why on the console" "$(grep -q 'ARCHIVE_URL is not an https URL' "$T/bconsole"; echo $?)"
+boot_run 'https://example.invalid/solo.tgz' '__ARCHIVE_SHA256__'; got=$?
+check "rendered URL, unrendered sha → fails" "$(rc [ "$got" != 0 ])"
+check "  …before any curl" "$(! grep -q '^curl' "$T/blog"; echo $?)"
+check "  …and says why on the console" "$(grep -q 'ARCHIVE_SHA256 is not a sha256' "$T/bconsole"; echo $?)"
+boot_run 'https://example.invalid/solo.tgz' "$REV"
+check "both rendered → reaches the CINC download (the guards pass)" "$(grep -q '^curl .*cinc' "$T/blog"; echo $?)"
 check "refuses an archive that is not the solo policy" "$(grep -qF '.get("name") != "solo"' "$BOOT" 2>/dev/null; echo $?)"
 
 echo; echo "passed: $PASS  failed: $FAIL"

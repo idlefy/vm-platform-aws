@@ -1,4 +1,4 @@
-# shellcheck shell=bash
+# shellcheck shell=bash disable=SC2154,SC2034 # R comes from, and STATE/REMOVE/EMPTY go to, dev-vm-image-scrub
 # The solo profile of dev-vm-image-scrub: Idlefy's hardened public image,
 # converged once by image/files/bootstrap-solo (docs/design/ami-image.md).
 #
@@ -89,10 +89,21 @@ solo_dir() {
 # Hook 2, after the stops and before the removals: purge CINC (fatal, never a
 # note — an image with CINC on it is the thing law A1 forbids), then swap in
 # the solo lists, which mop up whatever the purge leaves.
+# apt-get waits for a dpkg lock unattended-upgrades may still hold.
+# The cinc-client check is here, not in solo_check: the lists remove /opt/cinc
+# defensively, so after them its absence would prove nothing.
 solo_prep() {
-  dpkg --purge cinc || refuse "cinc purge failed"
+  DEBIAN_FRONTEND=noninteractive apt-get purge -y -o DPkg::Lock::Timeout=300 cinc \
+    || refuse "cinc purge failed"
+  [ ! -e "$R/opt/cinc/bin/cinc-client" ] || refuse "cinc still installed (/opt/cinc/bin/cinc-client is on disk)"
   REMOVE=("${REMOVE_SOLO[@]}")
   EMPTY=("${EMPTY_SOLO[@]}")
+}
+
+# filter_has ERE: a line of rules.v6's *filter table matches.
+filter_has() {
+  awk -v re="$1" '/^\*/ { t = $0 } /^COMMIT$/ { t = "" } t == "*filter" && $0 ~ re { f = 1 } END { exit !f }' \
+    "$R/etc/iptables/rules.v6" 2>/dev/null
 }
 
 # Hook 3, immediately before cloud-init clean, on the disk Packer is about to
@@ -102,18 +113,23 @@ solo_check() {
   local f g grp st mode own
   local h=/usr/local/sbin/idlefy-share v6="$R/etc/iptables/rules.v6"
   # 1. The oneshot that strips cloud-init's re-grants to ubuntu on first boot.
+  #    Enabled on the disk: `enabled-runtime` lives in /run, not in the image.
   systemctl is-enabled --quiet idlefy-hardened-firstboot.service \
     || refuse "idlefy-hardened-firstboot.service is not enabled"
+  [ -L "$R/etc/systemd/system/multi-user.target.wants/idlefy-hardened-firstboot.service" ] \
+    || refuse "idlefy-hardened-firstboot.service has no multi-user.target.wants link on disk"
   # 2. What base::solo bakes and the first boot relies on.
   for f in /etc/cloud/cloud.cfg.d/90-idlefy-hardened.cfg /etc/sudoers.d/50-tailscale-login \
            /etc/sudoers.d/51-idlefy-share "$h"; do
     [ -f "$R$f" ] || refuse "$f is missing"
   done
   # sudoers grants the helper with `*`: whoever can write it is root.
-  mode=$(stat -c %a "$R$h")
+  # The main scrub has no set -E: a bare failure in here would exit with
+  # nothing on the console, so every command that can fail names itself.
+  mode=$(stat -c %a "$R$h") || refuse "cannot stat $h"
   [ "$mode" = 755 ] || refuse "$h has mode $mode, expected 755"
   if [ -z "$R" ]; then
-    own=$(stat -c %u:%g "$h")
+    own=$(stat -c %u:%g "$h") || refuse "cannot stat $h"
     [ "$own" = 0:0 ] || refuse "$h is owned by $own, expected 0:0"
   fi
   # 3. A sudoers syntax error locks out the admin too.
@@ -125,15 +141,21 @@ solo_check() {
   for g in $grp; do
     case $g in sudo | admin | adm | lxd) refuse "ubuntu is in group $g" ;; esac
   done
-  # 6. The persisted v6 rules as ip6tables-save writes them: the INPUT policy
-  #    is a chain header (never a -P line), and base::imds's IMDS drop
-  #    (`ip6tables -I OUTPUT 3 -d fd00:ec2::254 -j DROP`) is saved with its /128.
-  grep -qE '^:INPUT DROP( |$)' "$v6" 2>/dev/null || refuse "/etc/iptables/rules.v6 has no INPUT DROP policy"
-  grep -qF -- '-d fd00:ec2::254/128 -j DROP' "$v6" 2>/dev/null \
-    || refuse "/etc/iptables/rules.v6 does not drop fd00:ec2::254 (IMDS v6)"
-  # 7. The SSM agent is an inbound instruction channel.
+  # 6. The persisted v6 rules as ip6tables-save writes them, in the filter
+  #    table only (*filter … COMMIT): the INPUT policy is a chain header (never
+  #    a -P line), and base::imds's IMDS drop (`ip6tables -I OUTPUT 3 -d
+  #    fd00:ec2::254 -j DROP`) is saved as an OUTPUT rule with its /128.
+  filter_has '^:INPUT DROP( |$)' || refuse "/etc/iptables/rules.v6 has no INPUT DROP policy in *filter"
+  filter_has '^-A OUTPUT -d fd00:ec2::254/128 -j DROP$' \
+    || refuse "/etc/iptables/rules.v6 does not drop fd00:ec2::254 (IMDS v6) in *filter OUTPUT"
+  # 7. The SSM agent is an inbound instruction channel. `snap list` also fails
+  #    when snapd is unreachable, so the disk is checked as well.
   if snap list amazon-ssm-agent >/dev/null 2>&1; then refuse "the amazon-ssm-agent snap is still installed"; fi
-  # 8. So is CINC. A purged package dpkg still remembers reads not-installed.
+  if [ -e "$R/snap/amazon-ssm-agent" ] || compgen -G "$R/var/lib/snapd/snaps/amazon-ssm-agent_*.snap" >/dev/null; then
+    refuse "the amazon-ssm-agent snap is still on disk"
+  fi
+  # 8. So is CINC (its files on disk were checked in solo_prep, after the
+  #    purge). A purged package dpkg still remembers reads not-installed.
   # shellcheck disable=SC2016 # dpkg-query's format, not a shell expansion
   if st=$(dpkg-query -W -f='${db:Status-Status}' cinc 2>/dev/null) && [ "$st" != not-installed ]; then
     refuse "cinc still installed (dpkg status '${st:-?}')"
