@@ -4,10 +4,12 @@
 > build has been inspected, before the first public one.
 
 **Date:** 2026-11-20
-**Status:** implemented; the first Packer-built private image is pending
-(`v2.2.1` fixes what the first two runs and a hand-built image found)
+**Status:** implemented; a run from `v2.2.1` built and registered the image
+and was then refused at CopyImage (fixed in the publisher role, not yet
+proven by a real copy); `v2.2.2` builds on a 9 GiB root volume
 **Ships as:** `v2.2.0`, with the cookbook it converges at `base-2.2.0`;
-`v2.2.1` changes the build only (the cookbook stays `base-2.2.0`).
+`v2.2.1` and `v2.2.2` change the build only (the cookbook stays
+`base-2.2.0`).
 
 | Need | Where |
 |---|---|
@@ -226,7 +228,7 @@ reaches it only through what the customer's own account does to the instance
       "platform_sha": "<40 hex>",
       "platform_tag": "vX.Y.Z",
       "public": true,
-      "root_volume_gib": 20
+      "root_volume_gib": 9
     }
     ```
 
@@ -392,6 +394,26 @@ reaches it only through what the customer's own account does to the instance
     nor removed, and the watcher's instance is the one Packer names, so it
     needs no describe at all.
 
+    **CreateImage** (measured 2026-11-20, run from `v2.2.1`): the role had a
+    Deny on `CreateImage` when the request names an existing snapshot
+    (`CreateImageOnlyNewSnapshots`). EC2 fills `ec2:SnapshotID` for the
+    snapshot an ordinary CreateImage creates, so that Deny refused every
+    image; it was removed.
+
+    **CopyImage — owner ruling 2026-11-20.** The role denied any request tag
+    on a copy. With `CopyImageTags=true` EC2 presents the source image's
+    tags as request tags (`aws:TagKeys` is set), so every copy was refused,
+    in all 16 regions (measured). The role now allows a copy only when its
+    tags are exactly `Name=idlefy-hardened-image-build`: Deny unless
+    `aws:RequestTag/Name` equals that value, and Deny any other tag key.
+    **What this gives up:** a run that already controls the role could copy
+    another unencrypted private image of the publisher account under the
+    build's name and publish it. The guard's G4 refuses to publish while
+    such an image exists (any self-owned image or snapshot that is
+    unencrypted and not fenced). A dedicated publishing account, holding
+    nothing but this image, was the alternative and was not chosen. Applied
+    in the role; **not yet proven by a real copy**.
+
 14. **How the release gets created.** `make release TAG=vX.Y.Z` cuts and the
     owner pushes only the git **tag**; nothing in this repository creates a
     GitHub release. The release flow is: push the tag, then create the
@@ -420,7 +442,9 @@ not the first, and a denied or unreadable read is a failure, never a pass.
 
 G4 exists because the publisher role can copy images inside the account, and
 an unencrypted private disk is the only thing a compromised run could make
-public. While none exists, nothing can leak.
+public. While none exists, nothing can leak. The CopyImage rule of decision
+13 (a copy's tags must be exactly the build's `Name`) leans on this: it does
+not stop a copy of another such image, G4 does.
 
 G2's block-public-access check follows `HARDENED_PUBLIC` (the publish job
 passes the build's value; unset means `true`, anything but `true`/`false` is
@@ -721,13 +745,23 @@ trailing comment. No input or ref name is interpolated into a `run:` script.
       (nothing left to delete; it rewrites `/etc/machine-id`), its no-op
       `fstrim`, and what shutdown and cloud-init's final modules write
       (written, not freed — for example the instance-id directory below).
-  - The cost, measured by hand on `1d6180e` (a real build instance, not yet
-    a Packer build): the build took about 5.5 minutes, 2.5 of them before
-    the fill — about **3 minutes more**; **taking the snapshot** afterwards
-    took **10–17 minutes instead of under 2**, because the whole disk had
-    been written. A box from that image was healthy, with the fill file gone
-    and 15 of 19 GB free. The snapshot's storage growth (roughly 16 GB more
-    per region for the 20 GB root) is still an estimate.
+  - The cost: a snapshot of the zero-filled volume stores **every block**
+    (measured 2026-11-20 through the EBS direct API: an 8 GiB volume gave
+    16384 blocks × 512 KiB), so the stored size is the whole volume, in
+    each of the 17 regions. That is why the image is built on a small root
+    volume (owner decision 2026-11-20; it was 20). Measured by hand on
+    **8 GiB** with the `v2.2.1` files: the build fits (3.9 GB used at the
+    end), takes about 3.5 minutes instead of 5.5, and the snapshot about 6.5
+    minutes instead of 10–17; a box launched from that image on a 40 GiB
+    disk grows its root filesystem to 38G at first boot, and rootless
+    Docker, the agent CLIs and the sudo fence work. **9 GiB** was chosen,
+    not 8: the publisher role's fence for tagging copied snapshots uses
+    `ec2:VolumeSize` as one of its discriminators, and 8 GiB is the default
+    root size of stock Ubuntu images, so 8 would match ordinary snapshots;
+    9 is unusual and stores about 12 % more than 8. The role's
+    `ec2:VolumeSize` fence is 9 (`hardened_volume_gib` in idlefy/infra
+    `terraform/aws/account/github_hardened_image.tf`; it changes with
+    `VOLUME_GIB` in the driver).
 - **The build instance's id directory.** `/var/lib/cloud/instances/<id>`
   (three semaphore files) stays in the image: cloud-init's final modules write
   it after the scrub returns. It names a terminated instance and nothing
@@ -815,6 +849,10 @@ trailing comment. No input or ref name is interpolated into a `run:` script.
 
 ## To verify on the first private build
 
+Status 2026-11-20: a run from `v2.2.1` built the image and registered it,
+then was refused at CopyImage (decision 13). What it proved moved to
+"Measured" below; what is left is at the end of this section.
+
 Status after the first two runs and one hand-built image (2026-11-20). The
 hand test rendered the same user data (with `apt-get update`), launched it by
 hand in the publisher account, made a private image from the stopped
@@ -855,25 +893,11 @@ instance's id directory under `/var/lib/cloud/instances` (three semaphore
 files) — cloud-init's final modules write it after the scrub returns, so the
 scrub cannot remove it (Security notes).
 
-Still to verify on the first Packer-built private image, before any public
-build — none of it was exercised by hand:
+Still to verify on the next run, before any public build:
 
-- **snapd is gone** from the image: no `snapd` package, no
-  `/var/lib/snapd`, no `snap` command, and nothing else the purge removed
-  matters (read the purge's package list on the console);
-- **The zero-fill as changed after the hand test** (`O_DIRECT`, the ext4
-  reserve at 0, the 1 MiB free-space bound, the fsync) passes on a real
-  instance: both passes end on "No space left on device", the free space
-  left is within the bound (note the number), and the reserve is back to
-  its value afterwards; how much the snapshot grows (estimate above,
-  roughly 16 GB per region);
-- **The deleted-but-open check** passes on a real instance: no process
-  holds a deleted file of non-zero size on `/` once the user data's last
-  line has exec'd the scrub and cloud-init's two logs are truncated (a
-  refusal names the file and holder: add the holder to the scrub, never an
-  exception to the check);
-- **CreateImage** under the publisher role, and **CopyImage** to every
-  region under the fence deny;
+- **A real copy under the new CopyImage rule** (decision 13): CopyImage to
+  every region succeeds with the copy's tags exactly
+  `Name=idlefy-hardened-image-build`;
 - **Tags on the copies and their snapshots**: every copy and its snapshot
   carries `IdlefyPublishedImage=true` and the rest of the template's
   `snapshot_tags` — the tag fingerprint the fence and G4 depend on;
@@ -882,12 +906,30 @@ build — none of it was exercised by hand:
   `ModifyImageAttribute` on the copies (so the publisher role needs that
   action for a private build too), and a retire dry run plans the region
   without a doubt;
-- **The console watcher** stays silent through a good build;
-- **The publisher role can make every guard read** (G1–G4): a guard run
-  under the role ends with no "the call failed" line (passed on runs 1 and
-  2).
+- **StepCreateTags in every region**: Packer's last step tags the image and
+  its snapshot in each of the 17 regions under the role;
+- **The 9 GiB build under Packer**: the same as the 8 GiB hand test below,
+  through the workflow, with the role's `ec2:VolumeSize` fence at 9.
 
 ## Measured
+
+- Run from `v2.2.1` through the workflow (2026-11-20): the guard passes
+  (every G1–G4 read under the role); bootstrap and scrub run under Packer,
+  the console watcher stays silent, and the instance stops itself about 6
+  minutes after launch; **CreateImage** succeeds once the role's
+  `CreateImageOnlyNewSnapshots` Deny was removed (decision 13); **CopyImage**
+  was then refused in all 16 regions by the role's Deny on any request tag
+  (decision 13's ruling). After each failure Packer removed the instance,
+  the key pair and, on the copy failure, the image itself; nothing was left,
+  and the workflow's `leftovers` step confirmed it.
+- A snapshot of the zero-filled volume stores every block: an 8 GiB volume
+  gave 16384 blocks × 512 KiB through the EBS direct API (2026-11-20).
+- An 8 GiB root (hand test with the `v2.2.1` files, 2026-11-20; the image
+  ships on 9 GiB for the role's fence, decision 13 and Security notes): the build
+  fits with 3.9 GB used at the end, takes about 3.5 minutes (5.5 on 20 GiB),
+  the snapshot about 6.5 minutes (10–17 on 20 GiB); a box from the image on
+  a 40 GiB disk grows its root filesystem to 38G at first boot, and rootless
+  Docker, the agent CLIs and the sudo fence work.
 
 - EBS root volumes accept no discard: `fstrim: /: the discard operation is
   not supported` (c7a.xlarge, gp3 root, a real build instance on
