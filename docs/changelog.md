@@ -10,9 +10,10 @@ the cookbook does not. No base release: the image still converges
 
 **`v2.2.1`**
 
-- `bootstrap-solo` runs `apt-get update` before the converge. A stock image
-  ships no apt lists, so the first package had no candidate version and the
-  bootstrap failed.
+- `bootstrap-solo` runs `apt-get update --error-on=any` before the converge.
+  A stock image ships no apt lists, so the first package had no candidate
+  version and the bootstrap failed. A list that fails to download fails the
+  bootstrap there, with the banner, instead of a warning.
 - The solo scrub purges snapd. The hand-built image carried the build
   instance's snapd device key and serial, which every box from a public
   image would have shared. The amazon-ssm-agent snap is now checked before
@@ -36,7 +37,16 @@ the cookbook does not. No base release: the image still converges
   instance and its key pair are removed. The build then fails with the
   reason, whatever Packer reports. Before this, a build that failed in 28 s
   waited out Packer's 2-hour budget. A console read error is noted, never
-  fatal. The watcher never outlives the driver.
+  fatal. The watcher never outlives the driver. Packer runs in a process
+  group of its own and is interrupted as a group: Packer 1.11.2's panicwrap
+  wrapper drops a SIGINT sent to it alone. On INT, TERM or a failure the
+  driver passes SIGINT to that group and waits for Packer's clean-up before
+  it lists leftovers. A cancel no longer breaks the pipe Packer logs to.
+- The publish workflow's `build` step times out at 210 minutes, leaving the
+  `leftovers` and `record` steps at least 15 of the job's 240.
+- The solo scrub's unit check also covers `/usr/local/lib/systemd/{system,user}`
+  and every account's `~/.config/systemd/user` (`/root` and each home found
+  under `/home`).
 - `scripts/hardened-image-leftovers.sh` also lists the build instance and
   Packer's `packer_*` key pair, and `--clean-build` removes exactly those.
   It refuses unless the credentials are the publisher account's. The

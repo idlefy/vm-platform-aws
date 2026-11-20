@@ -120,6 +120,8 @@ jobs:
         with:
           role-to-assume: ${{ vars.HARDENED_PUBLISH_ROLE_ARN }}
           aws-region: us-east-1
+          # 4 h, the job's timeout-minutes: credentials taken here outlive
+          # every later step, the leftovers step after a build timeout too.
           role-duration-seconds: 14400
 
       - name: guard
@@ -127,7 +129,15 @@ jobs:
           HARDENED_CI_ROLE_ARN: ${{ vars.HARDENED_PUBLISH_ROLE_ARN }}
         run: scripts/hardened-guard-check.sh
 
+      # 210 minutes, under the job's 240: Packer may wait 2 h for the instance
+      # to stop, then copies to every region. A build that hits this limit is
+      # cancelled while the job still has 30 minutes, less the few the steps
+      # above took, for the leftovers step (it terminates the instance and
+      # deletes the key pair Packer may not have had time to remove) and the
+      # record — never less than 15. The role session (14400 s, above) covers
+      # the whole job, so those steps still hold valid credentials.
       - name: build
+        timeout-minutes: 210
         env:
           PLATFORM_TAG: ${{ needs.resolve.outputs.tag }}
           PLATFORM_SHA: ${{ needs.resolve.outputs.sha }}

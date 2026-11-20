@@ -301,7 +301,10 @@ reaches it only through what the customer's own account does to the instance
          `/usr/bin/snap` and `/usr/lib/snapd/snapd` are gone; no file or link
          named `snap-*.mount`, `snapd.*`, `snap.*` or `amazon-ssm-agent*` is
          left in a system or user unit directory (`/etc/systemd/system`,
-         `/etc/systemd/user`, `/lib/…` and `/usr/lib/systemd/{system,user}`,
+         `/etc/systemd/user`, `/lib/…`, `/usr/lib/systemd/{system,user}`,
+         `/usr/local/lib/systemd/{system,user}`, and each account's
+         `~/.config/systemd/user` for `/root` and every directory found
+         under `/home` — rootless Docker's `docker.service` there passes —
          enablement links included — snapd ships
          `snapd.session-agent.{service,socket}` as user units); an absent
          directory is skipped by name, and one `find` cannot read refuses
@@ -456,8 +459,9 @@ line is not a failure:
   (a test holds every `log` call of both scrubs to those prefixes or
   `note:`). The fleet scrub's wording is matched, not changed.
 
-On a marker it prints the console's tail into the job log, sends Packer
-SIGINT — Packer then terminates the instance and deletes its key pair — and
+On a marker it prints the console's tail into the job log, sends SIGINT to
+Packer's process group — Packer then terminates the instance and deletes its
+key pair — and
 fails with "the bootstrap failed on the build instance" (or "the image scrub
 refused the image …") **whatever Packer's own exit status**: a Packer that
 took the interrupt and still reported an artifact writes no record. A console
@@ -467,13 +471,49 @@ nothing: a stopped instance's console reads empty (measured).
 The watcher's lifetime: it runs in the background and is stopped and reaped
 on every way out of the driver — after `packer build` returns, and in the
 EXIT trap on a failure, INT or TERM, before the temporary directory is
-removed; stopping it also kills its pending sleep or in-flight console read,
-so no orphan holds the job's output open. As a backstop it returns on its own
-once that directory or the driver's process is gone. A test sends SIGINT to
-the whole session before the first poll and finds no process of it left.
-Packer runs in the foreground of the pipeline, its pid written to a file for
-the watcher: started as a background job it would inherit an ignored SIGINT,
-which a Go program keeps.
+removed; its TERM trap kills every job it has running (`jobs -p`: the
+pending sleep or in-flight console read, with no window where one is not yet
+recorded) and reaps them, so no orphan holds the job's output open. As a
+backstop it returns on its own once that directory or the driver's process
+is gone.
+
+**How Packer is interrupted.** Packer 1.11.2 runs under panicwrap v1.0.0: the
+`packer` process re-executes itself as a worker and only watches it. Packer's
+`main.go` sets `wrapConfig.ForwardSignals = []os.Signal{syscall.SIGTERM}` and
+no `IgnoreSignals`, so panicwrap defaults that to `os.Interrupt` and the
+wrapper catches SIGINT and drops it (`case <-sigCh:` does nothing), on the
+assumption that a terminal's Ctrl-C reaches the worker through the process
+group anyway. A SIGINT to the wrapper's pid alone is therefore lost, and the
+worker — whose `handleTermInterrupt` cancels the build on SIGINT or SIGTERM
+and cleans up — never hears it. So:
+
+- `packer build` starts in a session of its own (`setsid`, through a small
+  launcher that also resets SIGINT and SIGTERM to their defaults, since a
+  background job inherits SIGINT ignored) and writes its pid — its process
+  group — to a file;
+- the watcher sends SIGINT to that **group**, so wrapper and worker both get
+  it; the wrapper drops its copy, the worker cancels;
+- the driver waits for the pipeline in the background (`wait` returns to a
+  trap at once; a foreground pipeline would hold the trap until Packer ended
+  by itself). Its EXIT path — reached on INT, TERM or any failure — stops
+  the watcher, then sends SIGINT to Packer's group and **waits** for Packer
+  to finish its clean-up before listing leftovers. There is no escalation to
+  SIGKILL: Packer's clean-up is what removes the instance and the key pair;
+  a runner that will not wait kills the job itself, and the workflow's
+  `leftovers` step removes what is left;
+- the rest of the pipeline (its subshell, `tee`, `awk`) stays in the
+  driver's group but ignores INT and TERM and ends when Packer closes its
+  output. A cancel that signals the driver's group must not end the `wait`
+  early, nor break the pipe Packer writes its clean-up to — a write to a
+  broken stdout would kill it with SIGPIPE mid-clean-up (a test caught
+  exactly that under SIGTERM).
+
+The tests stand in for Packer with a wrapper that swallows SIGINT and
+forwards only SIGTERM, plus a worker: a marker, and SIGINT or SIGTERM to the
+driver's session (with the watcher in a long sleep, or in a hung console
+read), each reach the worker; its clean-up ends before the leftovers are
+listed; wrapper, worker and every process of the driver's session are gone
+when the driver returns, checked at once.
 
 **Nothing the bootstrap or the converge prints may be a secret**: a failure's
 console tail — up to 80 lines, the last 56 kB of the bootstrap's log behind
@@ -489,7 +529,8 @@ UTC):
 - `resolve` (no AWS, no environment, `contents: read`): a dispatch must run on
   a `vX.Y.Z` tag ref, else it fails with "run this on a vX.Y.Z tag"; the
   schedule takes the newest `vX.Y.Z` tag on origin, peeled to its commit.
-- `publish` (`environment: hardened-publish`, 240 minutes): checkout of the
+- `publish` (`environment: hardened-publish`, 240 minutes; its `build` step
+  210): checkout of the
   tag with `persist-credentials: false`, Packer 1.11.2, Cinc Workstation,
   OIDC credentials for `HARDENED_PUBLISH_ROLE_ARN` (4 hours), then the guard,
   then the build. One approval covers both. `HARDENED_PUBLIC` is set once,
@@ -498,7 +539,17 @@ UTC):
   of the chosen name into the job summary (without a name file it says the
   build chose no name, or its record was uploaded, and lists no images),
   terminates the build instance and deletes Packer's key pair if a killed
-  run left them, and the `record` step prints any record written.
+  run left them, and the `record` step prints any record written. The build
+  step's own `timeout-minutes: 210` keeps at least 15 minutes of the job's
+  240 for those two steps (30, less what the steps before the build took);
+  without it a build that ran out the job's clock would leave them no time.
+  The role session (`role-duration-seconds: 14400`, the job's 240 minutes)
+  outlives every step, so the leftovers step still has credentials after a
+  build timeout. A test pins the 15-minute margin and the session length.
+  On a cancel or a step timeout the runner signals the driver, which passes
+  SIGINT to Packer, but kills the job's processes seconds later — usually
+  before Packer's clean-up ends; the leftovers step is what removes the
+  instance and key pair then.
 - `permissions: {}` at workflow level; `resolve` gets `contents: read`, and
   only the `publish` job gets `contents: write, id-token: write`. The retire
   workflow is the same: nothing at workflow level, its job `contents: read,
@@ -627,7 +678,8 @@ trailing comment. No input or ref name is interpolated into a `run:` script.
   release created when missing, the record, NN across every region, the
   leftover listing after a failure past `packer build`, the console watcher
   (a failure marker interrupts Packer and prints the tail; no marker, an
-  empty console or a read error changes nothing), the leftovers script's
+  empty console or a read error changes nothing), Packer's interrupt through
+  a panicwrap-like wrapper on a marker, INT and TERM, the leftovers script's
   build-instance and key-pair listing and `--clean-build`, and the real solo
   user data measured against EC2's 16 KB.
 - `test/test-hardened-guard.sh` — G1–G4 against a shimmed `aws`, including

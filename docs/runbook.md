@@ -644,7 +644,9 @@ terminates the instance and deletes its key pair. No image is taken and
 nothing needs cleaning. Fix the cause the console names (it is the converge
 or the scrub, on the instance), cut a new `v` release and publish again.
 
-If the run was **cancelled or timed out** instead, Packer never cleaned up.
+If the run was **cancelled or timed out** instead (the `build` step stops
+at 210 minutes, the job at 240), Packer was interrupted but usually killed
+before it cleaned up.
 The workflow's `leftovers` step then terminates every instance tagged
 `Name=idlefy-hardened-image-build` that is still alive in the build region
 and deletes every `packer_*` key pair with that tag, and lists both in the

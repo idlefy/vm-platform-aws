@@ -22,7 +22,7 @@
 #   gh      also: the record upload fails when ${GH_RECORD_UPLOAD_FAIL}, the
 #           notes edit when ${GH_NOTES_FAIL}.
 #   aws     ec2 get-console-output prints ${CONSOLE_OUTPUT} (printf %b), or
-#           fails when ${CONSOLE_FAIL}; describe-instances answers
+#           fails when ${CONSOLE_FAIL}, hangs when ${CONSOLE_HANG}; describe-instances answers
 #           ${BUILD_INSTANCES} ("i-…:state …"), describe-key-pairs ${BUILD_KEYS}
 #           (names); terminate-instances and delete-key-pair succeed unless
 #           ${TERMINATE_FAIL} / ${DELETEKEY_FAIL}; ${INSTANCES_FAIL} and
@@ -31,6 +31,9 @@
 #           ${ARTIFACT_REGIONS:-every region of ami_regions}; exits ${PACKER_RC:-0}.
 #           With ${PACKER_HOLD} it names its instance, then runs that many
 #           seconds unless SIGINT ends it ("interrupted" in its log).
+#           `packer build` runs as Packer 1.11 does under panicwrap: a wrapper
+#           that catches and swallows SIGINT and forwards only SIGTERM, and a
+#           child that does the work; both pids go to ${PACKER_PIDS}.
 # The last section measures the real solo user data against EC2's 16 KB.
 
 # The checks read `[ … ]; echo $?` and `run_build; check … "$?"` on purpose: the
@@ -157,12 +160,27 @@ print(json.dumps({"KeyPairs": [{"KeyName": k, "KeyPairId": "key-0%d" % n} for n,
     echo '{}' ;;
   "ec2 get-console-output")
     if [ -n "${CONSOLE_FAIL:-}" ]; then echo "An error occurred (UnauthorizedOperation) when calling the GetConsoleOutput operation" >&2; exit 254; fi
+    # A read that hangs, as a stalled API call does.
+    [ -z "${CONSOLE_HANG:-}" ] || exec sleep 600
     printf '%b\n' "${CONSOLE_OUTPUT:-}" ;;
   *) exit 9 ;;
 esac
 SH
+# The panicwrap stand-in (panicwrap v1.0.0 Wrap with Packer's config: SIGINT
+# is caught and dropped in the wrapper, SIGTERM is forwarded to the child).
+cat > "$T/packer-wrap.py" <<'PY'
+import os, signal, subprocess, sys
+signal.signal(signal.SIGINT, lambda *_: None)
+child = subprocess.Popen(sys.argv[1:], env=dict(os.environ, PACKER_CHILD="1"))
+signal.signal(signal.SIGTERM, lambda *_: child.send_signal(signal.SIGTERM))
+with open(os.environ["PACKER_PIDS"], "a") as f:
+    f.write("%d\n%d\n" % (os.getpid(), child.pid))
+rc = child.wait()
+sys.exit(rc if rc >= 0 else 128 - rc)
+PY
 cat > "$T/bin/packer" <<'SH'
 #!/usr/bin/env bash
+if [ "$1" = build ] && [ -z "${PACKER_CHILD:-}" ]; then exec python3 -I "$PACKER_WRAP" "$0" "$@"; fi
 echo "packer $1" >> "$ORDER_LOG"
 if [ "$1" = init ]; then echo "init $2" >> "$PACKER_LOG"; exit 0; fi
 printf '%s\n' "$@" >> "$PACKER_LOG"
@@ -177,7 +195,9 @@ if [ -n "${PACKER_HOLD:-}" ]; then
   if [ -n "${PACKER_INT_OK:-}" ]; then
     trap 'echo interrupted >> "$PACKER_LOG"; end=0' INT
   else
-    trap 'echo interrupted >> "$PACKER_LOG"; echo "1697000002,,ui,error,Build was cancelled." ; exit 1' INT
+    # Its clean-up (terminating the instance) takes a while; the driver must
+    # wait for it before it lists leftovers.
+    trap 'echo interrupted >> "$PACKER_LOG"; echo "1697000002,,ui,error,Build was cancelled."; sleep 1; echo "packer cleaned-up" >> "$ORDER_LOG"; exit 1' INT
   fi
   end=$((SECONDS + PACKER_HOLD))
   while [ "$SECONDS" -lt "$end" ]; do sleep 0.1; done
@@ -213,10 +233,10 @@ set +e
 # run_build — runs the driver with the shims; returns its status.
 run_build() {
   shimmed "$T/bin" aws gh packer chef
-  rm -rf "$T/state" "$T/out" "$T/ud.gz"; mkdir -p "$T/state"
+  rm -rf "$T/state" "$T/out" "$T/ud.gz" "$T/packer.pids"; mkdir -p "$T/state"
   : > "$T/chef.log"; : > "$T/gh.log"; : > "$T/gh.log.repo"; : > "$T/aws.log"; : > "$T/packer.log"; : > "$T/order.log"
   local e=(PATH="$T/bin:$PATH" CHEF_LOG="$T/chef.log" GH_LOG="$T/gh.log" AWS_LOG="$T/aws.log"
-           PACKER_LOG="$T/packer.log" ORDER_LOG="$T/order.log" UD_COPY="$T/ud.gz" GH_STATE="$T/state"
+           PACKER_LOG="$T/packer.log" ORDER_LOG="$T/order.log" PACKER_WRAP="$T/packer-wrap.py" PACKER_PIDS="$T/packer.pids" UD_COPY="$T/ud.gz" GH_STATE="$T/state"
            EXPORT_TREE="${EXPORT_TREE:-$T/tree-a}" REV="$REV"
            PLATFORM_TAG="${PLATFORM_TAG-v2.2.0}" PLATFORM_SHA="${PLATFORM_SHA-$SHA}"
            HARDENED_SKIP_TAG_CHECK="${SKIP_TAG-1}" HARDENED_OUT="$T/out" OTHER_TGZ="$T/other.tgz")
@@ -225,17 +245,19 @@ run_build() {
   [ -z "${PUBLIC:-}" ] || e+=(HARDENED_PUBLIC="$PUBLIC")
   [ -z "${ORG:-}" ] || e+=(HARDENED_ATTACHED_ORG_ID="$ORG")
   local rc
-  if [ -n "${INT_EARLY:-}" ]; then
-    # Ctrl-C to the whole session right after Packer starts, before the console
-    # watcher's first poll. The wrapper resets SIGINT to its default: a
-    # backgrounded bash would hand the driver an ignored SIGINT.
+  if [ -n "${SIG_EARLY:-}" ]; then
+    # SIGINT (a Ctrl-C) or SIGTERM (a runner's cancel) to the driver's whole
+    # session once ${SIG_WHEN:-^ami_name=} shows in ${SIG_LOG:-packer.log} —
+    # by default right after Packer starts. Packer runs in a session of its
+    # own, so only the driver can pass it on. The wrapper resets SIGINT to its
+    # default: a backgrounded bash would hand the driver an ignored SIGINT.
     ( cd "$T" && exec python3 -I -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
         env -u HARDENED_SECURITY_GROUP_ID -u HARDENED_PUBLIC -u HARDENED_ATTACHED_ORG_ID \
         -u HARDENED_SUBNET_ID -u HARDENED_INSTANCE_TYPE -u GH_REPO "${e[@]}" \
         "$R/scripts/hardened-image-build.sh" > "$T/stdout" 2> "$T/stderr" ) &
     local pid=$! n=0
-    while ! grep -q '^ami_name=' "$T/packer.log" && [ $n -lt 600 ]; do sleep 0.05; n=$((n+1)); done
-    kill -INT -- "-$pid" 2>/dev/null
+    while ! grep -q "${SIG_WHEN:-^ami_name=}" "$T/${SIG_LOG:-packer.log}" && [ $n -lt 600 ]; do sleep 0.05; n=$((n+1)); done
+    kill -"$SIG_EARLY" -- "-$pid" 2>/dev/null
     wait "$pid"; rc=$?
     SESSION=$pid
   elif [ -z "${TERM_MID_PACKER:-}" ]; then
@@ -596,13 +618,44 @@ check "Packer takes the interrupt yet exits 0 with a full artifact → the drive
   "$([ $rc -ne 0 ] && grep -qx interrupted "$T/packer.log" && [ ! -e "$RECORD" ] \
      && ! grep -q 'release upload .*\.json' "$T/gh.log" && grep -qF 'the bootstrap failed on the build instance' "$T/stderr"; echo $?)"
 
-echo "== the console watcher never outlives the driver =="
-SESSION=""; HARDENED_CONSOLE_POLL=1 PACKER_HOLD=30 INT_EARLY=1 run_build; rc=$?
-check "SIGINT to the session before the first poll → exit 130" "$([ $rc -eq 130 ]; echo $?)"
-sleep 3
-check "...and after three polls' time no process of the session is left" \
-  "$([ -n "$SESSION" ] && [ -z "$(ps -s "$SESSION" -o pid= 2>/dev/null)" ]; echo $?)"
-[ -z "$SESSION" ] || pkill -s "$SESSION" 2>/dev/null || true
+# packer_gone — every process of the Packer stand-in (wrapper and child) has
+# ended.
+packer_gone() {
+  local p
+  [ -s "$T/packer.pids" ] || return 1
+  while read -r p; do ! kill -0 "$p" 2>/dev/null || return 1; done < "$T/packer.pids"
+}
+# before A B FILE — a line equal to A comes before the last line starting B.
+before() {
+  awk -v a="$1" -v b="$2" '$0 == a && !s { s = NR } index($0, b) == 1 { l = NR } END { exit !(s && l && s < l) }' "$3"
+}
+# session_gone — no process of the driver's session is left, checked at once.
+session_gone() { [ -n "$SESSION" ] && [ -z "$(ps -s "$SESSION" -o pid= 2>/dev/null)" ]; }
+CONSOLE_OUTPUT='BOOTSTRAP FAILED: no image will be taken. Log follows.' HARDENED_CONSOLE_POLL=0.2 PACKER_HOLD=30 run_build; rc=$?
+check "a marker reaches Packer's worker through its SIGINT-swallowing wrapper; both end" \
+  "$([ $rc -ne 0 ] && grep -qx interrupted "$T/packer.log" && [ "$(wc -l < "$T/packer.pids")" = 2 ] && packer_gone; echo $?)"
+
+echo "== the console watcher and Packer never outlive the driver =="
+for sig in INT TERM; do
+  want=$([ $sig = INT ] && echo 130 || echo 143)
+  # A watcher asleep in a long poll.
+  SESSION=""; HARDENED_CONSOLE_POLL=600 PACKER_HOLD=30 SIG_EARLY=$sig run_build; rc=$?
+  check "SIG$sig to the driver's session while Packer runs → exit $want" "$([ $rc -eq $want ]; echo $?)"
+  check "...Packer's worker got the interrupt through its wrapper; wrapper and worker ended" \
+    "$(grep -qx interrupted "$T/packer.log" && packer_gone; echo $?)"
+  check "...Packer was waited for: its clean-up ended before the leftovers were listed" \
+    "$(before 'packer cleaned-up' 'aws ec2 describe-images' "$T/order.log"; echo $?)"
+  check "...the pipe Packer writes to survived the signal: its cancel line reached the log" \
+    "$(grep -qxF 'Build was cancelled.' "$T/stdout"; echo $?)"
+  check "...no process of the session is left, checked at once (the watcher's long sleep too)" "$(session_gone; echo $?)"
+  [ -z "$SESSION" ] || pkill -s "$SESSION" 2>/dev/null || true
+  # A watcher waiting on a console read that hangs.
+  SESSION=""; CONSOLE_HANG=1 HARDENED_CONSOLE_POLL=0.2 PACKER_HOLD=30 SIG_EARLY=$sig SIG_LOG=aws.log SIG_WHEN=get-console-output run_build; rc=$?
+  check "SIG$sig while the watcher waits on a hung console read → exit $want, Packer interrupted and gone" \
+    "$([ $rc -eq $want ] && grep -qx interrupted "$T/packer.log" && packer_gone; echo $?)"
+  check "...no process of the session is left, checked at once (the hung read too)" "$(session_gone; echo $?)"
+  [ -z "$SESSION" ] || pkill -s "$SESSION" 2>/dev/null || true
+done
 
 echo "== public=false and an attached org =="
 PUBLIC=false ORG=0b7c3c1e-5f0e-4b8e-9a51-3f0c2d1e4a5b run_build; check "exits 0" "$?"
@@ -697,6 +750,20 @@ run_build; check "builds" "$?"
 size=$(stat -c %s "$T/ud.gz")
 echo "       bootstrap-solo + both scrub files, gzip -9: $size bytes (EC2 takes 16384)"
 check "it fits" "$([ "$size" -le 16384 ]; echo $?)"
+
+echo "== the publish workflow leaves time and credentials for the leftovers =="
+check "the build step's timeout is at least 15 minutes under the job's; the role session covers the job" \
+  "$(python3 -I - "$ROOT/.github/workflows/publish-hardened-image.yml" <<'PY'; echo $?
+import sys, yaml
+job = yaml.safe_load(open(sys.argv[1]))["jobs"]["publish"]
+steps = {s.get("name") or s.get("id"): s for s in job["steps"]}
+build, creds = steps["build"], steps["aws-creds"]
+ok = (int(build["timeout-minutes"]) + 15 <= int(job["timeout-minutes"])
+      and int(creds["with"]["role-duration-seconds"]) >= 60 * int(job["timeout-minutes"])
+      and "if" in steps["leftovers"] and steps["record"]["if"] == "always()")
+sys.exit(0 if ok else 1)
+PY
+)"
 
 echo
 echo "passed: $PASS  failed: $FAIL"

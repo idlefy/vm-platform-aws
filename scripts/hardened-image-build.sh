@@ -319,10 +319,11 @@ tmp PKLOG
 # to $HARDENED_OUT/hardened-ami-name first: a runner that kills this script
 # outright (an Actions cancel or timeout) leaves the listing to the workflow.
 IMAGES_MAY_EXIST=1
-# The console watcher's pid, once started (below). Every way out of this
-# script — a normal end, a failure, INT, TERM — passes through on_exit, which
-# stops and reaps it first.
-WATCH_PID=""
+# The console watcher's pid, and the background pipeline Packer runs in, once
+# started (below). Every way out of this script — a normal end, a failure,
+# INT, TERM — passes through on_exit, which stops and reaps the watcher, then
+# interrupts Packer and waits for it.
+WATCH_PID="" PIPE_PID=""
 # shellcheck disable=SC2317  # reached through on_exit and after packer build
 stop_watch() {
   [ -n "$WATCH_PID" ] || return 0
@@ -330,10 +331,38 @@ stop_watch() {
   wait "$WATCH_PID" 2>/dev/null || true
   WATCH_PID=""
 }
+# stop_packer — Packer runs in its own session (see below), so a Ctrl-C or a
+# runner's INT/TERM to this script's group no longer reaches it by itself:
+# forward SIGINT to Packer's whole group (its panicwrap wrapper ignores
+# SIGINT, its worker cancels the build on it and cleans up: terminates the
+# instance, deletes the key pair) and wait for the pipeline to end. No
+# escalation to KILL: Packer's clean-up is what removes the instance; a runner
+# that will not wait kills the job itself, and the workflow's leftovers step
+# then removes what is left.
+# shellcheck disable=SC2317  # reached through on_exit
+stop_packer() {
+  local pg="" n=0
+  [ -n "$PIPE_PID" ] || return 0
+  # Interrupted right as the pipeline started: give its launcher up to 5 s to
+  # record Packer's group.
+  while :; do
+    pg="$(cat "$W/packer.pid" 2>/dev/null)" || pg=""
+    [[ ! $pg =~ ^[0-9]+$ ]] || break
+    kill -0 "$PIPE_PID" 2>/dev/null && [ "$n" -lt 50 ] || break
+    n=$((n + 1)); sleep 0.1
+  done
+  if [[ $pg =~ ^[0-9]+$ ]] && kill -0 -- "-$pg" 2>/dev/null; then
+    echo "Interrupting Packer; waiting for it to terminate the build instance and delete its key pair…" >&2
+    kill -INT -- "-$pg" 2>/dev/null || true
+  fi
+  wait "$PIPE_PID" 2>/dev/null || true
+  PIPE_PID=""
+}
 # shellcheck disable=SC2317  # reached only through the trap
 on_exit() {
   local rc=$?
   stop_watch
+  stop_packer
   if [ "$rc" -ne 0 ] && [ "$IMAGES_MAY_EXIST" = 1 ]; then
     echo >&2
     "$ROOT/scripts/hardened-image-leftovers.sh" "$AMI_NAME" >&2 || true
@@ -362,13 +391,20 @@ printf '%s\n' "$AMI_NAME" > "$HARDENED_OUT/hardened-ami-name"
 # a failure of the build. A stopped instance's console reads empty (measured),
 # so a good build shows nothing here and the watcher just ends with Packer.
 # Its lifetime: stop_watch (after packer build, and in on_exit on any way
-# out) sends it TERM, which also kills its pending sleep or console read, so
-# no orphan holds the job's output open. As a backstop it returns on its own
-# once $W is gone (cleanup ran) or this script's process is.
+# out) sends it TERM; its trap kills every job it has running — the pending
+# sleep or console read, found by `jobs -p` rather than a recorded pid, so a
+# TERM between starting one and recording it leaves nothing — and reaps them,
+# so no orphan holds the job's output open. As a backstop it returns on its
+# own once $W is gone (cleanup ran) or this script's process is.
+# The interrupt goes to Packer's whole process group: Packer 1.11 runs as a
+# panicwrap wrapper and a worker, and the wrapper swallows SIGINT (it forwards
+# only SIGTERM), so a SIGINT to the wrapper's pid alone never reaches the
+# worker that holds the build.
 # shellcheck disable=SC2317  # runs in the background
 watch_console() {
   local pidfile=$1 driver=$$ pid="" iid="" noted=0 sp="" cp=""
-  trap '[ -z "$sp" ] || kill "$sp" 2>/dev/null; [ -z "$cp" ] || kill "$cp" 2>/dev/null; exit 0' TERM
+  # shellcheck disable=SC2046  # one pid per word
+  trap 'kill $(jobs -p) 2>/dev/null; wait 2>/dev/null; exit 0' TERM
   while :; do
     sleep "$CONSOLE_POLL" & sp=$!
     wait "$sp" || true
@@ -377,7 +413,7 @@ watch_console() {
     kill -0 "$driver" 2>/dev/null || return 0
     [ -n "$pid" ] || pid="$(cat "$pidfile" 2>/dev/null)" || pid=""
     [ -n "$pid" ] || continue
-    kill -0 "$pid" 2>/dev/null || return 0
+    kill -0 -- "-$pid" 2>/dev/null || return 0
     [ -n "$iid" ] || iid="$(grep -oE 'Instance ID: i-[0-9a-f]+' "$PKLOG" 2>/dev/null | head -n 1 | cut -d' ' -f3)" || iid=""
     [ -n "$iid" ] || continue
     aws ec2 get-console-output --region "$BUILD_REGION" --instance-id "$iid" --latest \
@@ -398,7 +434,7 @@ watch_console() {
     fi
     if [ -e "$W/build-failed" ]; then
       { echo; echo "!! $iid: $(cat "$W/build-failed"). The end of its console:"; tail -n 80 "$W/console.lf"; } >&2
-      kill -INT "$pid" 2>/dev/null || true
+      kill -INT -- "-$pid" 2>/dev/null || true
       return 0
     fi
   done
@@ -406,13 +442,26 @@ watch_console() {
 
 # -machine-readable: the artifact line is the only reliable source of the AMI
 # ids. The ui lines are echoed as they come, so the operator sees progress.
-# Packer runs in the foreground pipeline (an async job would start with SIGINT
-# ignored, and a Go program keeps an inherited ignore); its pid goes to a file
-# for the watcher, which runs in the background.
+# Packer starts in a session of its own (setsid, through a small launcher that
+# also resets SIGINT and SIGTERM to their defaults), and records its pid,
+# which is also its process group, for the watcher and for stop_packer.
+# The pipeline runs in the background and this script waits for it: a trapped
+# INT or TERM interrupts `wait` at once, where a foreground pipeline would
+# hold the trap until Packer ended by itself. The rest of the pipeline (its
+# subshell, tee, awk) stays in this script's group but ignores INT and TERM
+# and ends when Packer closes its output: a cancel that signals this group
+# must neither end the `wait` on Packer early nor break the pipe Packer writes
+# its clean-up to (a write to a broken stdout kills it with SIGPIPE).
 watch_console "$W/packer.pid" &
 WATCH_PID=$!
 PK_RC=0
-( echo "$BASHPID" > "$W/packer.pid"; exec packer build -machine-readable \
+{ trap '' INT TERM; python3 -I -c 'import os, signal, sys
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+signal.signal(signal.SIGTERM, signal.SIG_DFL)
+os.setsid()
+with open(sys.argv[1], "w") as f:
+    f.write("%d\n" % os.getpid())
+os.execvp(sys.argv[2], sys.argv[2:])' "$W/packer.pid" packer build -machine-readable \
   -var "ami_name=$AMI_NAME" \
   -var "build_region=$BUILD_REGION" \
   -var "ami_regions=$AMI_REGIONS" \
@@ -427,10 +476,12 @@ PK_RC=0
   -var "base_tag=$BASE_TAG" \
   -var "archive_sha256=$ARCHIVE_SHA256" \
   -var "attached_org_id=$HARDENED_ATTACHED_ORG_ID" \
-  "$IMG" ) \
+  "$IMG" \
   | tee "$PKLOG" \
-  | awk -F, '$3 == "ui" { m = $5; for (i = 6; i <= NF; i++) m = m "," $i; gsub(/%!\(PACKER_COMMA\)/, ",", m); gsub(/\\n/, "\n", m); print m; fflush() }' \
-  || PK_RC=$?
+  | awk -F, '$3 == "ui" { m = $5; for (i = 6; i <= NF; i++) m = m "," $i; gsub(/%!\(PACKER_COMMA\)/, ",", m); gsub(/\\n/, "\n", m); print m; fflush() }'; } &
+PIPE_PID=$!
+wait "$PIPE_PID" || PK_RC=$?
+PIPE_PID=""
 stop_watch
 [ ! -e "$W/build-failed" ] \
   || die "$(cat "$W/build-failed") (its console is above); Packer was interrupted, so it terminates the instance and deletes its key pair — no image, no record"
