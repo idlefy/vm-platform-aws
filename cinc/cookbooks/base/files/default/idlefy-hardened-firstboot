@@ -1,0 +1,58 @@
+#!/bin/bash
+# Managed by CINC — base::hardened_firstboot. Do not edit on the VM.
+#
+# Backstop for /etc/cloud/cloud.cfg.d/90-idlefy-hardened.cfg. Runs as root on
+# every boot, after cloud-init and before ssh, and strips any sudo cloud-init
+# (or anything else) handed to ubuntu. A clean boot logs "nothing to remove";
+# any "removed" line in the journal means the cfg override did not hold.
+#
+# The rm is the first command and depends on nothing: under `set -e` a lookup
+# that failed before it would leave the sudo rule in place. --verbose sits
+# after the operands (GNU option permutation) so the line still starts with
+# the rm itself; it prints one "removed '<path>'" line per file it actually
+# removed. lastpipe runs the while loop in this shell, so `removed` survives.
+#
+# The two halves are independent: a failed rm (read-only fs, I/O error, a
+# directory at the path) must not skip the group strip, and a failed group
+# lookup must not hide a fragment removal. Each failure is recorded and the
+# script exits non-zero at the end, so the unit shows failed.
+#
+# A root script on every boot: a fixed interpreter path, and PATH pinned
+# before any command runs, so nothing in the inherited environment picks the
+# rm, id or gpasswd that runs.
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+shopt -s lastpipe
+set -euo pipefail
+rm -f /etc/sudoers.d/90-cloud-init-users /etc/sudoers.d/ubuntu /etc/sudoers.d/ubuntu-debug --verbose \
+  | while IFS= read -r line; do
+      echo "idlefy-hardened-firstboot: $line"
+      removed=1
+    done \
+  || { echo 'idlefy-hardened-firstboot: FAILED to remove the sudoers fragments' >&2; failed=1; }
+
+# One lookup, then a pattern match. No id-into-grep pipeline: a quiet grep
+# closes the pipe early, the writer dies of SIGPIPE, and pipefail turns that
+# into exit 141.
+if groups=" $(id -nG ubuntu) "; then
+  for g in sudo admin adm lxd; do
+    if [[ $groups == *" $g "* ]]; then
+      if gpasswd -d ubuntu "$g" >/dev/null; then
+        echo "idlefy-hardened-firstboot: removed ubuntu from group $g"
+        removed=1
+      else
+        echo "idlefy-hardened-firstboot: FAILED to remove ubuntu from group $g" >&2
+        failed=1
+      fi
+    fi
+  done
+else
+  echo 'idlefy-hardened-firstboot: FAILED to read the groups of ubuntu' >&2
+  failed=1
+fi
+
+if [[ -n ${failed-} ]]; then
+  exit 1
+fi
+if [[ -z ${removed-} ]]; then
+  echo 'idlefy-hardened-firstboot: nothing to remove'
+fi

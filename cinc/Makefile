@@ -4,7 +4,7 @@ COOKBOOKS_DIR   := cookbooks
 POLICYFILES := $(wildcard $(POLICYFILES_DIR)/*.rb)
 LOCKFILES   := $(POLICYFILES:.rb=.lock.json)
 
-.PHONY: help lint test test-broker test-loki-token test-policy-fetch preflight add-region install push promote clean ssh
+.PHONY: help lint test test-broker test-loki-token test-share-helper test-policy-fetch preflight add-region install push promote clean ssh
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
@@ -41,6 +41,11 @@ test-loki-token: ## Run the Loki token script test (stubs aws, no AWS account ne
 	@echo "==> Testing dev-vm-loki-token..."
 	@test/test-loki-token.sh
 	@echo "✓ Token script tests passed"
+
+test-share-helper: ## Run the idlefy-share helper test (stubs tailscale; no tailnet needed)
+	@echo "==> Testing idlefy-share..."
+	@test/test-idlefy-share.sh
+	@echo "✓ Share helper tests passed"
 
 # The script under test lives in vms/modules/ec2/files/ — user_data installs it
 # at first boot, before any converge exists to deliver it — and the cookbook

@@ -108,6 +108,7 @@ release: ## Gate and cut an artifact tag (usage: make release TAG=base-X.Y.Z | v
 	           && $(MAKE) -C cinc test \
 	           && $(MAKE) -C cinc test-broker \
 	           && $(MAKE) -C cinc test-loki-token \
+	           && $(MAKE) -C cinc test-share-helper \
 	           && $(MAKE) -C cinc test-policy-fetch \
 	           && ./test/test-fetch-sync.sh ;; \
 	   v*)     ./scripts/boundary-check.sh \

@@ -122,27 +122,132 @@ execute 'iptables-allow-tailscale' do
 end
 
 # Allow SSH (port 22)
+#
+# Port guards here and below are `-C INPUT` with the same arguments as the
+# append: they hold only when that exact rule — TCP, any source, port N — is
+# in INPUT. The old `dport 22.*ACCEPT` was satisfied by a rule for 2222 (and
+# `dport 80.*` by 8080), and a `--dport N -j ACCEPT` substring still by a UDP
+# or source-restricted rule for N; each silently skipped opening the real
+# port (measured with real ip6tables in a network namespace). The rules the
+# old guards created are this exact rule, so a converged VM adds nothing.
 execute 'iptables-allow-ssh' do
   command 'iptables -A INPUT -p tcp --dport 22 -j ACCEPT'
-  not_if 'iptables-save | grep -q "dport 22.*ACCEPT"'
+  not_if 'iptables -C INPUT -p tcp --dport 22 -j ACCEPT'
   notifies :run, 'execute[save-iptables]', :delayed
 end
 
-# Allow HTTP (port 80)
-execute 'iptables-allow-http' do
-  command 'iptables -A INPUT -p tcp --dport 80 -j ACCEPT'
-  not_if 'iptables-save | grep -q "dport 80.*ACCEPT"'
-  notifies :run, 'execute[save-iptables]', :delayed
-end
-
-# Allow HTTPS (port 443)
-execute 'iptables-allow-https' do
-  command 'iptables -A INPUT -p tcp --dport 443 -j ACCEPT'
-  not_if 'iptables-save | grep -q "dport 443.*ACCEPT"'
-  notifies :run, 'execute[save-iptables]', :delayed
+# Public web ports, node['base']['firewall']['public_web_ports'] — [80, 443]
+# for the fleet (Traefik), [] for solo. These replace the old hard-coded
+# iptables-allow-http / iptables-allow-https; the guard matches the rules those
+# created, so a VM that already carries them recognises them and adds nothing.
+node['base']['firewall']['public_web_ports'].each do |port|
+  execute "iptables-allow-tcp-#{port}" do
+    command "iptables -A INPUT -p tcp --dport #{port} -j ACCEPT"
+    not_if "iptables -C INPUT -p tcp --dport #{port} -j ACCEPT"
+    notifies :run, 'execute[save-iptables]', :delayed
+  end
 end
 
 execute 'save-iptables' do
   command 'mkdir -p /etc/iptables && iptables-save > /etc/iptables/rules.v4'
+  action :nothing
+end
+
+# --- IPv6 -------------------------------------------------------------------
+#
+# The same policy on ip6tables, one resource per v4 resource above. Before
+# this block, ip6tables was never touched: INPUT stayed ACCEPT, so on a VM
+# with an IPv6 address the security group was the only filter in front of
+# every listening port. Every v6 accept guard is `ip6tables -C INPUT` with the
+# same arguments as its own insert, so only that exact rule satisfies it — a
+# look-alike (another interface, a narrower source, UDP instead of TCP) does
+# not; the policy guards match the whole `-P` line. There is no v6 dedupe
+# resource: nothing ever ran the v6 rules with the old broken guard shape, so
+# there is nothing to collapse.
+#
+# Two accepts have no v4 twin, and both are unconditional:
+#
+# - ICMPv6. IPv6 has no ARP; neighbour discovery and router advertisements are
+#   ICMPv6. With INPUT DROP and no ICMPv6 accept, neighbour resolution fails
+#   and the default route lapses with the RA lifetime — so v6 can look
+#   healthy right after the converge and die later.
+# - The DHCPv6 client port. AWS hands out the instance's IPv6 address by
+#   DHCPv6. The client's request goes to a multicast address and the
+#   server's reply comes back unicast from its link-local address, so
+#   conntrack never pairs the two: the reply is a NEW flow to port 546 and
+#   the ESTABLISHED,RELATED rule never admits it. Without this accept the
+#   lease cannot renew and the address is dropped at expiry. It is accepted
+#   only from a link-local source (fe80::/10) and only from server port 547:
+#   a DHCPv6 server on a link is always link-local, so nothing off-link can
+#   use this hole.
+
+execute 'ip6tables-allow-established' do
+  command 'ip6tables -I INPUT 1 -m state --state ESTABLISHED,RELATED -j ACCEPT'
+  not_if 'ip6tables -C INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT'
+  notifies :run, 'execute[save-ip6tables]', :delayed
+end
+
+execute 'ip6tables-allow-loopback' do
+  command 'ip6tables -I INPUT 2 -i lo -j ACCEPT'
+  not_if 'ip6tables -C INPUT -i lo -j ACCEPT'
+  notifies :run, 'execute[save-ip6tables]', :delayed
+end
+
+# `-C` compares the rule, not its spelling: a rule added as `-p icmpv6` (what
+# older ip6tables builds printed) satisfies it too.
+execute 'ip6tables-allow-icmpv6' do
+  command 'ip6tables -A INPUT -p ipv6-icmp -j ACCEPT'
+  not_if 'ip6tables -C INPUT -p ipv6-icmp -j ACCEPT'
+  notifies :run, 'execute[save-ip6tables]', :delayed
+end
+
+# Rendered as `-A INPUT -s fe80::/10 -p udp -m udp --sport 547 --dport 546 -j ACCEPT`.
+execute 'ip6tables-allow-dhcpv6' do
+  command 'ip6tables -A INPUT -p udp -s fe80::/10 --sport 547 --dport 546 -j ACCEPT'
+  not_if 'ip6tables -C INPUT -p udp -s fe80::/10 --sport 547 --dport 546 -j ACCEPT'
+  notifies :run, 'execute[save-ip6tables]', :delayed
+end
+
+# Same reason as iptables-allow-tailscale: tailscaled's ts-input chain does not
+# survive a netfilter-persistent reload, on v6 either.
+execute 'ip6tables-allow-tailscale' do
+  command 'ip6tables -A INPUT -i tailscale0 -j ACCEPT'
+  not_if 'ip6tables -C INPUT -i tailscale0 -j ACCEPT'
+  notifies :run, 'execute[save-ip6tables]', :delayed
+end
+
+execute 'ip6tables-allow-ssh' do
+  command 'ip6tables -A INPUT -p tcp --dport 22 -j ACCEPT'
+  not_if 'ip6tables -C INPUT -p tcp --dport 22 -j ACCEPT'
+  notifies :run, 'execute[save-ip6tables]', :delayed
+end
+
+node['base']['firewall']['public_web_ports'].each do |port|
+  execute "ip6tables-allow-tcp-#{port}" do
+    command "ip6tables -A INPUT -p tcp --dport #{port} -j ACCEPT"
+    not_if "ip6tables -C INPUT -p tcp --dport #{port} -j ACCEPT"
+    notifies :run, 'execute[save-ip6tables]', :delayed
+  end
+end
+
+# The default policies come LAST, after every v6 accept above: a converge that
+# fails midway must never leave v6 at INPUT DROP without its DHCPv6, ICMPv6 and
+# SSH accepts — that would lose the address at lease expiry and the admin path
+# with it. (Until this first converge, v6 INPUT was ACCEPT, so appending the
+# accepts before the DROP opens nothing new.)
+execute 'ip6tables-default-drop-input' do
+  command 'ip6tables -P INPUT DROP'
+  not_if "ip6tables -S INPUT | grep -qx -- '-P INPUT DROP'"
+  notifies :run, 'execute[save-ip6tables]', :delayed
+end
+
+execute 'ip6tables-default-accept-output' do
+  command 'ip6tables -P OUTPUT ACCEPT'
+  not_if "ip6tables -S OUTPUT | grep -qx -- '-P OUTPUT ACCEPT'"
+  notifies :run, 'execute[save-ip6tables]', :delayed
+end
+
+execute 'save-ip6tables' do
+  command 'mkdir -p /etc/iptables && ip6tables-save > /etc/iptables/rules.v6'
   action :nothing
 end

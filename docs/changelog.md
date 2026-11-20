@@ -1,5 +1,74 @@
 # Changelog
 
+## 2.2.0
+
+A second published policy, `solo`: one developer's box with an AI agent
+working as `ubuntu`, no fleet behind it — the run list for Idlefy's public
+image. Its inclusion rule is that nothing on the box takes instructions from
+Idlefy after launch, so it has no policy fetch, no credential broker, no
+Traefik, no Falco, no Alloy and no SSM agent. No `v` release.
+
+**`base-2.2.0`**
+
+- `policyfiles/solo.rb` and `base::solo`: `base::default` without
+  `cinc_client`, `aws_access`, `traefik`, `falco`, `alloy` and
+  `nvidia_docker`, plus `hardened_firstboot`, `share_helper` and
+  `no_ssm_agent`. The Policyfile sets `base.loki.enabled = false`,
+  `base.share_helper.enabled = true` and, as an `override`,
+  `base.firewall.public_web_ports = []`. An `override` because Chef unions
+  arrays across every default level: a Policyfile `default` of `[]` merged with
+  the cookbook's `[80, 443]` is still `[80, 443]` (measured, chef 19.3.14;
+  `spec/recipes/solo_spec.rb` keeps the case). It is converged once, during the
+  image build, and by no tenant fleet.
+- `base::hardened_firstboot`: cloud-init recreates the default user on every
+  new instance from an image, sudo rule included, and a solo box has no later
+  converge to take it away again. `/etc/cloud/cloud.cfg.d/90-idlefy-hardened.cfg`
+  makes that user sudo-less at the source with `sudo: null` (not `false`: on
+  Noble's cloud-init `false` is deprecated and leaves `cloud-init status`
+  degraded), and the `idlefy-hardened-firstboot.service` oneshot, after
+  cloud-init and before SSH, removes the cloud-init sudoers fragments and the
+  `sudo`/`admin`/`adm`/`lxd` groups from `ubuntu` on every boot.
+- `base::share_helper` installs `/usr/local/sbin/idlefy-share`, which publishes
+  one `127.0.0.1` port through Tailscale Funnel or turns the share off. A share
+  is published only after the previous one was reset; a failed reset publishes
+  nothing and exits non-zero. See
+  "idlefy-share" in `cinc/README.md`. The grant,
+  `/etc/sudoers.d/51-idlefy-share`, is written by `base::sudoers` only when
+  `base.share_helper.enabled` is true, and the attribute defaults to `false`.
+  Leave it off on any policy that runs `base::falco`: the grant without a
+  matching Falco exclusion pages on every legitimate share (the same coupling as
+  AGENTS.md trap 7).
+- `base::no_ssm_agent` removes the `amazon-ssm-agent` snap Canonical's AMIs
+  ship, after waiting (at most 600 s) for snapd to finish seeding. A failed
+  wait or a failed `snap list` fails the converge rather than skipping the
+  removal, and a snap still listed after the removal fails it too. `solo` only.
+- `base.firewall.public_web_ports` (default `[80, 443]`, what the fleet has
+  always opened) names the ports opened to the world beyond SSH.
+- **Fleet-visible:** `base::firewall` and `base::imds` now do on IPv6 what they
+  did on IPv4. A VM that converges this release gains an ip6tables INPUT `DROP`
+  policy with the same accepts as v4 (plus ICMPv6 and DHCPv6 replies), and
+  `fd00:ec2::254`, IMDS over IPv6, becomes reachable only by root and the
+  Instance Connect uid, as `169.254.169.254` already was. Rules are saved to
+  `/etc/iptables/rules.v6`. The v6 default policies are set after every v6
+  accept, so a converge that fails midway cannot leave v6 at `DROP` without
+  them. Every v6 accept is guarded by `ip6tables -C` with its own arguments,
+  and the v6 policy guards match the whole `-P` line.
+- **Fleet-visible:** the SSH and `public_web_ports` guards, v4 and v6, are
+  `-C INPUT -p tcp --dport N -j ACCEPT`: only that exact rule satisfies them.
+  The old `dport 22.*ACCEPT` was satisfied by a rule for 2222 (and 80 by
+  8080), and a substring match by a UDP or source-restricted rule for the same
+  port, each silently skipping the real one. Rules the old guards created are
+  that exact rule, so a converged VM adds nothing. Removing a port from
+  `public_web_ports` does not close it on a converged VM.
+- **Fleet-visible:** `base::imds` guards, v4 and v6, are `-C OUTPUT` checks of
+  their own rule, so the same text in another chain or table no longer skips
+  the OUTPUT rule. The DROP goes in right after the last owner-allow present:
+  `-I OUTPUT 3` on a normal host, as before; on a host without the Instance
+  Connect user, where a fixed 3 failed with "Index of insertion too big" and
+  aborted the converge before the DROP, it now lands after the root allow.
+- New gate: `make test-share-helper` (stubs `tailscale`; no tailnet needed),
+  part of the `base` stream.
+
 ## 2.1.0
 
 A fleet can boot from a prebuilt image: the first converge is done once, ahead
