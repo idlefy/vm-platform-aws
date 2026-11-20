@@ -326,7 +326,7 @@ check "the regions file holds 17 regions" "$([ "${#REGIONS[@]}" = 17 ]; echo $?)
 check "instance_type defaults to c7a.xlarge" "$(var instance_type=c7a.xlarge; echo $?)"
 check "the security group is passed" "$(var "security_group_id=$SG"; echo $?)"
 check "public defaults to true" "$(var public=true; echo $?)"
-check "volume is 20 GiB" "$(var volume_size_gb=20; echo $?)"
+check "volume is 9 GiB" "$(var volume_size_gb=9; echo $?)"
 check "provenance vars" "$(var platform_tag=v2.2.0 && var "platform_sha=$SHA" && var base_tag=base-2.1.0; echo $?)"
 STORED_SHA=$(sha_of "$T/state/solo-v2.2.0.tgz")
 check "archive_sha256 is the stored asset's" "$(var "archive_sha256=$STORED_SHA"; echo $?)"
@@ -366,7 +366,7 @@ assert raw.endswith("\n")
 assert d["format"] == 1 and d["image"] == "ubuntu-24.04-hardened"
 assert d["name"] == "idlefy-hardened-agent-ubuntu-24.04-amd64-%s-01" % date
 assert d["owner_id"] == "995603458290" and d["architecture"] == "x86_64"
-assert d["public"] is True and d["root_volume_gib"] == 20 and d["login_user"] == "ubuntu"
+assert d["public"] is True and d["root_volume_gib"] == 9 and d["login_user"] == "ubuntu"
 assert d["description"] == "Idlefy hardened image for AI agents; visibility=public", d["description"]
 assert d["platform_tag"] == "v2.2.0" and d["platform_sha"] == psha and d["base_tag"] == "base-2.1.0"
 assert d["archive_sha256"] == sha and d["archive_url"] == url

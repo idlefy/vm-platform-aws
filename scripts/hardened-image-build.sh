@@ -52,7 +52,14 @@ FILES="$ROOT/image/files"
 POLICYFILE="$ROOT/cinc/policyfiles/solo.rb"
 LOCKFILE="$ROOT/cinc/policyfiles/solo.lock.json"
 OWNER_ID=995603458290
-VOLUME_GIB=20
+# The root volume, in GiB: the build's and every copy's. A snapshot of the
+# zero-filled volume stores every block, so this is the stored size in each
+# region (owner decision 2026-11-20). 9, not 8: the publisher role's fence for
+# tagging copied snapshots uses ec2:VolumeSize as a discriminator, and 8 GiB
+# is the default root of stock Ubuntu images, so 8 would match ordinary
+# snapshots. Change hardened_volume_gib in idlefy/infra
+# terraform/aws/account/github_hardened_image.tf with it.
+VOLUME_GIB=9
 NAME_PREFIX=idlefy-hardened-agent-ubuntu-24.04-amd64
 
 die() { echo "✗ hardened-image-build: $*" >&2; exit 1; }
