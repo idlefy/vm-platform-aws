@@ -398,21 +398,38 @@ reaches it only through what the customer's own account does to the instance
     Deny on `CreateImage` when the request names an existing snapshot
     (`CreateImageOnlyNewSnapshots`). EC2 fills `ec2:SnapshotID` for the
     snapshot an ordinary CreateImage creates, so that Deny refused every
-    image; it was removed.
+    image; it was removed. **What this gives up:** a run that already
+    controls the publisher role could add any unencrypted snapshot it can
+    read in the build region — one the publisher account owns, or one
+    another account shared with it — to the build's image through an extra
+    block-device mapping, and publish it. G4 refuses to publish while the
+    account **owns** an unencrypted snapshot that is not a published one; it
+    does not see snapshots shared in, and a run that controls the role need
+    not pass the guard. Not yet tried: a Deny keyed on the new snapshot's
+    `ec2:VolumeSize`. It must be measured first: if EC2 does not present the
+    key, such a Deny would refuse every build, as the removed one did.
 
     **CopyImage — owner ruling 2026-11-20.** The role denied any request tag
     on a copy. With `CopyImageTags=true` EC2 presents the source image's
     tags as request tags (`aws:TagKeys` is set), so every copy was refused,
-    in all 16 regions (measured). The role now allows a copy only when its
-    tags are exactly `Name=idlefy-hardened-image-build`: Deny unless
-    `aws:RequestTag/Name` equals that value, and Deny any other tag key.
-    **What this gives up:** a run that already controls the role could copy
-    another unencrypted private image of the publisher account under the
-    build's name and publish it. The guard's G4 refuses to publish while
-    such an image exists (any self-owned image or snapshot that is
-    unencrypted and not fenced). A dedicated publishing account, holding
-    nothing but this image, was the alternative and was not chosen. Applied
-    in the role; **not yet proven by a real copy**.
+    in all 16 regions (measured). The role now requires the build's name on
+    the copy — Deny unless `aws:RequestTag/Name` equals
+    `idlefy-hardened-image-build` — **on the image resource only**, and
+    keeps the Deny on any other tag key on both the image and the snapshot:
+    `CopyImageTags` tags the AMI, and whether EC2 evaluates the copy's
+    snapshot with those tags is not measured. **What this gives up:** any
+    unencrypted image the account can launch — its own, in any region, or
+    one shared with it — could be copied under the build's name by a run
+    that already controls the role, and then published. G4 covers only
+    images the account owns, in the listed regions. A dedicated publishing
+    account, holding nothing but this image, was the alternative and was
+    not chosen. Applied in the role; **not yet proven by a real copy**.
+
+    **Both residuals above need a run that already controls the role**: a
+    `v*` tag, which only repository admins can create, plus the
+    `hardened-publish` environment approval. Such a run can already publish
+    arbitrary content through the build instance's user data; the residuals
+    add another way, not a new class of access.
 
 14. **How the release gets created.** `make release TAG=vX.Y.Z` cuts and the
     owner pushes only the git **tag**; nothing in this repository creates a
@@ -442,9 +459,12 @@ not the first, and a denied or unreadable read is a failure, never a pass.
 
 G4 exists because the publisher role can copy images inside the account, and
 an unencrypted private disk is the only thing a compromised run could make
-public. While none exists, nothing can leak. The CopyImage rule of decision
-13 (a copy's tags must be exactly the build's `Name`) leans on this: it does
-not stop a copy of another such image, G4 does.
+public. G4 sees only what the account **owns** in the listed regions: an
+unencrypted snapshot or image shared into the account, or one in a region
+not on the list, is not checked. The CreateImage and CopyImage residuals of
+decision 13 (an extra block-device mapping; a copy under the build's name)
+reach exactly those, and a run that controls the publisher role need not
+pass the guard at all; both are given up there, not covered here.
 
 G2's block-public-access check follows `HARDENED_PUBLIC` (the publish job
 passes the build's value; unset means `true`, anything but `true`/`false` is
@@ -701,6 +721,16 @@ trailing comment. No input or ref name is interpolated into a `run:` script.
 
 - **Law A1 and the build's lack of credentials** are decisions 3 and 12; the
   residuals below are what they leave.
+- **The publisher role's residuals** (decision 13), each needing a run that
+  already controls the role — a `v*` tag only repository admins can create,
+  plus the environment approval — which could already publish arbitrary
+  content through the build instance's user data:
+  - CreateImage: any unencrypted snapshot the role can read in the build
+    region, owned or shared in, added to the image through an extra
+    block-device mapping and published; G4 sees only owned snapshots;
+  - CopyImage: any unencrypted image the account can launch, owned in any
+    region or shared in, copied under the build's name and published; G4
+    sees only owned images in the listed regions.
 - **Freed blocks of a public snapshot are readable.** Anyone can copy a public
   snapshot and read every block, including blocks a deleted file used to
   occupy. **The first line of defence stays the law that nothing secret is
@@ -808,6 +838,16 @@ trailing comment. No input or ref name is interpolated into a `run:` script.
   pinned ids (decision 6) bound what such a run could do. Accepted, not
   defended: ci.yml installs the same way.
 
+## Candidates for later hardening
+
+Recorded, not planned; one line each.
+
+- G4 also checks images and snapshots shared into the account, and every
+  enabled region rather than only the listed ones.
+- The fence policy protects only resources that already carry
+  `IdlefyPublishedImage=true`; another principal could add that tag to a
+  private image.
+
 ## Testing
 
 - `test/test-hardened-template.sh` — `packer fmt`/`validate` with dummy
@@ -908,11 +948,17 @@ Still to verify on the next run, before any public build:
   without a doubt;
 - **StepCreateTags in every region**: Packer's last step tags the image and
   its snapshot in each of the 17 regions under the role;
+- **The exact `ec2:Describe*` list from CloudTrail**: which describe calls a
+  whole build makes under the role, to narrow `ec2:Describe*` (decision 13)
+  — pending, since no build has yet run to the end;
 - **The 9 GiB build under Packer**: the same as the 8 GiB hand test below,
   through the workflow, with the role's `ec2:VolumeSize` fence at 9.
 
 ## Measured
 
+- RunInstances under the publisher role passes with Packer's empty
+  instance-profile name: the role's `ec2:InstanceProfile` null condition
+  holds (run from `v2.2.1`, 2026-11-20).
 - Run from `v2.2.1` through the workflow (2026-11-20): the guard passes
   (every G1–G4 read under the role); bootstrap and scrub run under Packer,
   the console watcher stays silent, and the instance stops itself about 6
