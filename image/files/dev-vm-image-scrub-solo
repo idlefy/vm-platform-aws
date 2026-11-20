@@ -114,6 +114,23 @@ filter_has() {
     END         { exit !f }' "$R$1" 2>/dev/null
 }
 
+# meta_shadowed FILE ADDR: in a committed *filter table of FILE, an OUTPUT rule
+# before the metadata drop (`-A OUTPUT -d ADDR -j DROP`, wherever it sits)
+# accepts ADDR for every user — an unconditional `-A OUTPUT -j ACCEPT`, or one
+# naming `-d ADDR` with `-j ACCEPT` and no `-m owner --uid-owner`. Exact on
+# purpose: base::imds's owner-matched accepts (root, Instance Connect) pass.
+meta_shadowed() {
+  awk -v a="$2" '
+    /^\*/       { t = $0; s = 0; d = 0 }
+    t == "*filter" && $0 == "-A OUTPUT -d " a " -j DROP" { d = 1 }
+    t == "*filter" && !d && /^-A OUTPUT / {
+      if ($0 == "-A OUTPUT -j ACCEPT") s = 1
+      else if (index($0 " ", " -d " a " ") && $0 ~ / -j ACCEPT$/ && $0 !~ / -m owner .*--uid-owner /) s = 1
+    }
+    /^COMMIT$/  { if (t == "*filter" && s) f = 1; t = ""; s = 0; d = 0 }
+    END         { exit !f }' "$R$1" 2>/dev/null
+}
+
 # Hook 3, immediately before cloud-init clean, on the disk Packer is about to
 # snapshot. Paths under $R; the root-ownership check only on a real root,
 # since a test's fake root cannot be chowned.
@@ -162,6 +179,12 @@ solo_check() {
     || refuse "/etc/iptables/rules.v4 does not drop 169.254.169.254 (IMDS) in a committed *filter OUTPUT"
   filter_has /etc/iptables/rules.v6 '^-A OUTPUT -d fd00:ec2::254/128 -j DROP$' \
     || refuse "/etc/iptables/rules.v6 does not drop fd00:ec2::254 (IMDS v6) in *filter OUTPUT"
+  if meta_shadowed /etc/iptables/rules.v4 169.254.169.254/32; then
+    refuse "/etc/iptables/rules.v4 accepts 169.254.169.254 for every user before its IMDS drop"
+  fi
+  if meta_shadowed /etc/iptables/rules.v6 fd00:ec2::254/128; then
+    refuse "/etc/iptables/rules.v6 accepts fd00:ec2::254 for every user before its IMDS drop"
+  fi
   # 7. The SSM agent is an inbound instruction channel. `snap list` also fails
   #    when snapd is unreachable, so the disk is checked as well.
   if snap list amazon-ssm-agent >/dev/null 2>&1; then refuse "the amazon-ssm-agent snap is still installed"; fi

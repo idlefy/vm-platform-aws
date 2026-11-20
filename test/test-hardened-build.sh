@@ -37,7 +37,7 @@ check() { if [ "$2" = "0" ]; then PASS=$((PASS+1)); echo "  ok   $1"; else FAIL=
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 R="$T/r"
 mkdir -p "$T/bin" "$T/state" "$R/scripts" "$R/image" "$R/cinc/policyfiles" "$R/cinc/cookbooks/base"
-cp "$ROOT/scripts/hardened-image-build.sh" "$R/scripts/" 2>/dev/null
+cp "$ROOT/scripts/hardened-image-build.sh" "$ROOT/scripts/hardened-image-leftovers.sh" "$R/scripts/" 2>/dev/null
 cp -R "$ROOT/image/hardened" "$ROOT/image/files" "$R/image/"
 cp "$ROOT/cinc/policyfiles/solo.rb" "$R/cinc/policyfiles/solo.rb"
 printf "name 'base'\nversion '2.1.0'\n" > "$R/cinc/cookbooks/base/metadata.rb"
@@ -138,6 +138,8 @@ cat > "$T/bin/packer" <<'SH'
 echo "packer $1" >> "$ORDER_LOG"
 if [ "$1" = init ]; then echo "init $2" >> "$PACKER_LOG"; exit 0; fi
 printf '%s\n' "$@" >> "$PACKER_LOG"
+# A long build, to be signalled: says it started, then sleeps.
+if [ -n "${PACKER_SLEEP:-}" ]; then : > "$PACKER_STARTED"; sleep "$PACKER_SLEEP"; fi
 regions=""
 for a in "$@"; do
   case "$a" in
@@ -168,10 +170,24 @@ run_build() {
   [ -n "${NO_SG:-}" ] || e+=(HARDENED_SECURITY_GROUP_ID="$SG")
   [ -z "${PUBLIC:-}" ] || e+=(HARDENED_PUBLIC="$PUBLIC")
   [ -z "${ORG:-}" ] || e+=(HARDENED_ATTACHED_ORG_ID="$ORG")
-  ( cd "$T" && env -u HARDENED_SECURITY_GROUP_ID -u HARDENED_PUBLIC -u HARDENED_ATTACHED_ORG_ID \
-      -u HARDENED_SUBNET_ID -u HARDENED_INSTANCE_TYPE -u GH_REPO "${e[@]}" \
-      "$R/scripts/hardened-image-build.sh" > "$T/stdout" 2> "$T/stderr" )
-  local rc=$?
+  local rc
+  if [ -z "${TERM_MID_PACKER:-}" ]; then
+    ( cd "$T" && env -u HARDENED_SECURITY_GROUP_ID -u HARDENED_PUBLIC -u HARDENED_ATTACHED_ORG_ID \
+        -u HARDENED_SUBNET_ID -u HARDENED_INSTANCE_TYPE -u GH_REPO "${e[@]}" \
+        "$R/scripts/hardened-image-build.sh" > "$T/stdout" 2> "$T/stderr" )
+    rc=$?
+  else
+    # As a runner cancels: SIGTERM to the whole process group while packer runs.
+    rm -f "$T/packer.started"
+    ( cd "$T" && exec setsid env -u HARDENED_SECURITY_GROUP_ID -u HARDENED_PUBLIC -u HARDENED_ATTACHED_ORG_ID \
+        -u HARDENED_SUBNET_ID -u HARDENED_INSTANCE_TYPE -u GH_REPO "${e[@]}" \
+        PACKER_SLEEP=60 PACKER_STARTED="$T/packer.started" \
+        "$R/scripts/hardened-image-build.sh" > "$T/stdout" 2> "$T/stderr" ) &
+    local pid=$! n=0
+    while [ ! -e "$T/packer.started" ] && [ $n -lt 600 ]; do sleep 0.1; n=$((n+1)); done
+    kill -TERM -- "-$pid" 2>/dev/null
+    wait "$pid"; rc=$?
+  fi
   # Decompressed once: `zcat | grep -q` fails under pipefail when grep exits early.
   rm -f "$T/ud"; [ ! -f "$T/ud.gz" ] || zcat "$T/ud.gz" > "$T/ud"
   return "$rc"
@@ -350,7 +366,7 @@ check "exits non-zero, packer never runs" "$([ $? -ne 0 ] && grep -q 'solo-v2.2.
 echo "== a region missing from the artifact refuses =="
 ARTIFACT_REGIONS="us-east-1" run_build
 check "exits non-zero, names a missing region" "$([ $? -ne 0 ] && grep -q 'sa-east-1' "$T/stderr"; echo $?)"
-check "...no record file" "$([ ! -e "$T/out" ] || [ -z "$(ls -A "$T/out")" ]; echo $?)"
+check "...no record file" "$(! compgen -G "$T/out/*.json" >/dev/null; echo $?)"
 check "...no record upload, no notes edit" "$(! grep -q 'release upload .*\.json\|release edit' "$T/gh.log"; echo $?)"
 ARTIFACT_REGIONS="${REGIONS[*]} me-south-1" run_build
 check "a region the file does not list refuses too" "$([ $? -ne 0 ] && [ ! -e "$RECORD" ]; echo $?)"
@@ -371,6 +387,20 @@ check "...the leftover: region, id, state, public, fence tag" \
 check "...a region with none says none" "$(grep -qxF '   us-east-1: none' "$T/stderr"; echo $?)"
 check "...a failed describe is printed, not hidden" "$(grep -qF 'sa-east-1: could not list (check by hand): An error occurred (RequestLimitExceeded)' "$T/stderr"; echo $?)"
 check "...the old 'serial console holds the log' claim is gone" "$(! grep -qF "the instance's serial console holds the bootstrap log" "$T/stderr"; echo $?)"
+check "...the chosen name was written before packer ran" "$([ "$(cat "$T/out/hardened-ami-name")" = "$P-01" ]; echo $?)"
+LEFTOVER_us_east_2="$LEFT" TERM_MID_PACKER=1 run_build; rc=$?
+check "SIGTERM mid-packer (a cancel) → exit 143" "$([ $rc -eq 143 ]; echo $?)"
+check "...and the leftovers are still listed, with real rows" \
+  "$(grep -qF 'may be PUBLIC' "$T/stderr" && grep -qF 'us-east-2: ami-0aaa  state=available  public=true' "$T/stderr" \
+     && grep -qxF '   us-east-1: none' "$T/stderr" && ! grep -qF 'could not list' "$T/stderr"; echo $?)"
+echo "== scripts/hardened-image-leftovers.sh on its own (the workflow's step) =="
+lo() { env PATH="$T/bin:$PATH" AWS_LOG="$T/aws.log" ORDER_LOG="$T/order.log" "$R/scripts/hardened-image-leftovers.sh" "$@" > "$T/lo.out" 2> "$T/lo.err"; }
+LEFTOVER_us_east_2="$LEFT" lo "$P-01"
+check "every region read → exit 0, rows on stdout" "$([ $? -eq 0 ] && grep -qF 'us-east-2: ami-0aaa' "$T/lo.out"; echo $?)"
+LEFTOVER_FAIL=eu-west-1 lo "$P-01"
+check "a region it cannot read → exit 1, named" "$([ $? -eq 1 ] && grep -qF 'eu-west-1: could not list' "$T/lo.out"; echo $?)"
+: > "$T/aws.log"; lo "$P-01; rm -rf /"
+check "a name outside the pattern → exit 1, no AWS call" "$([ $? -eq 1 ] && [ ! -s "$T/aws.log" ]; echo $?)"
 LEFTOVER_us_east_1="$LEFT" ARTIFACT_REGIONS="us-east-1" run_build
 check "an artifact short of regions → the images are listed" \
   "$([ $? -ne 0 ] && grep -qF 'us-east-1: ami-0aaa' "$T/stderr"; echo $?)"

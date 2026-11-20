@@ -293,6 +293,34 @@ solo_refuses "rules.v4 INPUT policy ACCEPT" "rules.v4 has no INPUT DROP" "printf
 solo_refuses "rules.v4 without the IMDS drop" "rules.v4 does not drop 169.254.169.254" "printf '%s\n' '*filter' ':INPUT DROP [0:0]' '-A OUTPUT -d 169.254.169.254/32 -m owner --uid-owner 0 -j ACCEPT' 'COMMIT' > etc/iptables/rules.v4"
 solo_refuses "rules.v4 IMDS drop only in *mangle" "rules.v4 does not drop" "printf '%s\n' '*mangle' '-A OUTPUT -d 169.254.169.254/32 -j DROP' 'COMMIT' '*filter' ':INPUT DROP [0:0]' 'COMMIT' > etc/iptables/rules.v4"
 solo_refuses "rules.v4 truncated before COMMIT" "rules.v4" "printf '%s\n' '*filter' ':INPUT DROP [0:0]' '-A OUTPUT -d 169.254.169.254/32 -j DROP' > etc/iptables/rules.v4"
+
+# An accept for every user before the metadata drop defeats it, wherever the
+# drop sits; owner-matched accepts (base::imds: root, Instance Connect) do not,
+# and an accept after the drop never fires for that address.
+# solo_passes "LABEL" "MUTATION" — the scrub exits 0 and powers off.
+solo_passes() {
+  local label=$1 mutate=$2 got
+  build_root "$R" "2026-11-01T00:00:00Z ok $REV" "$LIST_SOLO"; seed_solo "$R"; : > "$T/log"
+  ( cd "$R" && eval "$mutate" )
+  ( export DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$FIRSTBOOT"; run_scrub "$R" solo ); got=$?
+  check "$label → exit 0, powers off" "$([ "$got" = 0 ] && tail -1 "$T/log" | grep -q '^poweroff'; echo $?)"
+}
+for fam in "4 169.254.169.254/32" "6 fd00:ec2::254/128"; do
+  set -- $fam; v=$1 a=$2; f="etc/iptables/rules.v$v"
+  solo_refuses "v$v: ACCEPT of the metadata address for all before the drop" "rules.v$v accepts" \
+    "printf '%s\n' '*filter' ':INPUT DROP [0:0]' '-A OUTPUT -d $a -j ACCEPT' '-A OUTPUT -d $a -j DROP' 'COMMIT' > $f"
+  solo_refuses "v$v: unconditional OUTPUT ACCEPT before the drop" "rules.v$v accepts" \
+    "printf '%s\n' '*filter' ':INPUT DROP [0:0]' '-A OUTPUT -j ACCEPT' '-A OUTPUT -d $a -j DROP' 'COMMIT' > $f"
+  solo_refuses "v$v: ACCEPT for all with an extra match, before the drop" "rules.v$v accepts" \
+    "printf '%s\n' '*filter' ':INPUT DROP [0:0]' '-A OUTPUT -d $a -p tcp -m tcp --dport 80 -j ACCEPT' '-A OUTPUT -d $a -j DROP' 'COMMIT' > $f"
+  solo_passes "v$v: owner-matched ACCEPTs (root, Instance Connect) before the drop" \
+    "printf '%s\n' '*filter' ':INPUT DROP [0:0]' ':FORWARD DROP [0:0]' ':OUTPUT ACCEPT [0:0]' '-A OUTPUT -d $a -m owner --uid-owner 0 -j ACCEPT' '-A OUTPUT -d $a -m owner --uid-owner 113 -j ACCEPT' '-A OUTPUT -d $a -j DROP' 'COMMIT' > $f"
+  solo_passes "v$v: the drop appended after the accepts, other OUTPUT rules first" \
+    "printf '%s\n' '*filter' ':INPUT DROP [0:0]' ':OUTPUT ACCEPT [0:0]' '-A OUTPUT -d 10.0.0.0/8 -j ACCEPT' '-A OUTPUT -d $a -m owner --uid-owner 0 -j ACCEPT' '-A OUTPUT -d $a -j DROP' 'COMMIT' > $f"
+  solo_passes "v$v: drop first, then an ACCEPT for all (the drop wins)" \
+    "printf '%s\n' '*filter' ':INPUT DROP [0:0]' '-A OUTPUT -d $a -j DROP' '-A OUTPUT -d $a -j ACCEPT' '-A OUTPUT -j ACCEPT' 'COMMIT' > $f"
+done
+set --
 solo_refuses "SSM snap still installed"     "amazon-ssm-agent"   ":" SHIM_SSM_SNAP_PRESENT=1
 # snap list fails when snapd is unreachable; the disk still tells.
 solo_refuses "SSM snap mounted though snap list fails" "amazon-ssm-agent" "mkdir -p snap/amazon-ssm-agent/current"

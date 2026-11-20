@@ -85,6 +85,12 @@ jobs:
     runs-on: ubuntu-latest
     environment: hardened-publish
     timeout-minutes: 240
+    env:
+      # One value for the guard and the build, so they cannot drift. Never
+      # `inputs.public || 'true'`: a boolean false would collapse to 'true'.
+      # A private build may keep image block public access on; the guard then
+      # does not ask for it off.
+      HARDENED_PUBLIC: ${{ github.event_name == 'schedule' && 'true' || inputs.public }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -113,9 +119,6 @@ jobs:
       - name: guard
         env:
           HARDENED_CI_ROLE_ARN: ${{ vars.HARDENED_PUBLISH_ROLE_ARN }}
-          # The same value as the build step's: a private build may keep image
-          # block public access on, and the guard then does not ask for it off.
-          HARDENED_PUBLIC: ${{ github.event_name == 'schedule' && 'true' || inputs.public }}
         run: scripts/hardened-guard-check.sh
 
       - name: build
@@ -123,11 +126,34 @@ jobs:
           PLATFORM_TAG: ${{ needs.resolve.outputs.tag }}
           PLATFORM_SHA: ${{ needs.resolve.outputs.sha }}
           HARDENED_SECURITY_GROUP_ID: ${{ vars.HARDENED_BUILD_SG_ID }}
-          # Never `inputs.public || 'true'`: a boolean false would collapse to 'true'.
-          HARDENED_PUBLIC: ${{ github.event_name == 'schedule' && 'true' || inputs.public }}
           HARDENED_ATTACHED_ORG_ID: ${{ vars.HARDENED_DEV_ORG_ID }}
           GH_TOKEN: ${{ github.token }}
         run: scripts/hardened-image-build.sh
+
+      # A failed build lists its leftovers itself, but a cancel or a timeout
+      # can kill the driver before it does. The driver writes the name it chose
+      # to dist/hardened-ami-name before `packer build`; this step lists every
+      # image of that name, read-only, into the job summary.
+      - name: leftovers
+        if: failure() || cancelled()
+        run: |
+          set +e -uo pipefail
+          if [ ! -s dist/hardened-ami-name ]; then
+            echo "The build never chose an image name; nothing to list." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          name=$(head -n 1 dist/hardened-ami-name)
+          scripts/hardened-image-leftovers.sh "$name" > leftovers.txt 2>&1
+          rc=$?
+          {
+            echo "### Images this run may have left behind"
+            echo
+            echo '```text'
+            cat leftovers.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat leftovers.txt
+          exit "$rc"
 
       # The record is also on the release; this copy survives a failed upload.
       - name: record

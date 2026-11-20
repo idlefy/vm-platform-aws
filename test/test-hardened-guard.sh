@@ -21,7 +21,15 @@
 #                                           implicitDeny for names in $LEAKY,
 #                                           allowed for names in $ALLOWED, and
 #                                           for names in $MFA_MASKED allowed
-#                                           only when MFA is simulated present
+#                                           only when MFA is simulated present;
+#                                           implicitDeny missing aws:SourceIp
+#                                           for $CONDITIONED, explicitDeny
+#                                           missing it for $EXPLICIT_MISSING;
+#                                           $REGION_ALLOWED=name:region allows
+#                                           only that region's ARNs (top level
+#                                           implicitDeny). One entry per
+#                                           resource in ResourceSpecificResults
+#                                           unless $NO_PER_RESOURCE.
 # Any call whose "service verb" is in $FAIL_CALL exits 254.
 
 # The checks read `[ … ]; echo $?` and `run_guard; check … "$?"` on purpose.
@@ -101,27 +109,59 @@ JSON
   "iam list-users")
     printf '{"Users": [{"Path": "/", "UserName": "aleksei", "Arn": "arn:aws:iam::995603458290:user/aleksei"}]}\n' ;;
   "iam simulate-principal-policy")
-    src=""; actions=(); mode=""
+    src=""; actions=(); resources=(); mode=""
     for x in "$@"; do
       case "$x" in
         --policy-source-arn) mode=src ;;
         --action-names) mode=act ;;
+        --resource-arns) mode=res ;;
         --*) mode="" ;;
-        *) case "$mode" in src) src=$x; mode="" ;; act) actions+=("$x") ;; esac ;;
+        *) case "$mode" in src) src=$x; mode="" ;; act) actions+=("$x") ;; res) resources+=("$x") ;; esac ;;
       esac
     done
-    d=explicitDeny
-    if in_list "${src##*/}" "${LEAKY:-}"; then d=implicitDeny; fi
-    if in_list "${src##*/}" "${ALLOWED:-}"; then d=allowed; fi
+    name=${src##*/}
+    d=explicitDeny missing=""
+    if in_list "$name" "${LEAKY:-}"; then d=implicitDeny; fi
+    if in_list "$name" "${ALLOWED:-}"; then d=allowed; fi
+    # An Allow under a condition on aws:SourceIp, which the guard cannot supply.
+    if in_list "$name" "${CONDITIONED:-}"; then d=implicitDeny missing=aws:SourceIp; fi
+    # An explicit deny that also reports a missing key: still a deny.
+    if in_list "$name" "${EXPLICIT_MISSING:-}"; then d=explicitDeny missing=aws:SourceIp; fi
     # A "require MFA" deny: explicitDeny unless the simulation says MFA is present.
-    if in_list "${src##*/}" "${MFA_MASKED:-}"; then
+    if in_list "$name" "${MFA_MASKED:-}"; then
       case " $* " in
         *" ContextKeyName=aws:MultiFactorAuthPresent,ContextKeyValues=true,ContextKeyType=boolean "*) d=allowed ;;
       esac
     fi
-    python3 -I -c 'import json, sys
-d = sys.argv[1]
-print(json.dumps({"EvaluationResults": [{"EvalActionName": a, "EvalDecision": d} for a in sys.argv[2:]]}))' "$d" "${actions[@]}" ;;
+    # REGION_ALLOWED=name:region — an Allow scoped to that region's ARNs only;
+    # the top-level decision still reads implicitDeny.
+    printf '%s\n' "${resources[@]}" > "$SIM_RES_LOG.last"
+    python3 -I - "$d" "$missing" "$name" "${REGION_ALLOWED:-}" "${NO_PER_RESOURCE:-}" "${actions[@]}" <<'PY'
+import json, os, sys
+d, missing, name, region_allowed, no_per = sys.argv[1:6]
+actions = sys.argv[6:]
+resources = open(os.environ["SIM_RES_LOG"] + ".last").read().split()
+ra_name, _, ra_region = region_allowed.partition(":")
+out = []
+for a in actions:
+    per = []
+    for r in resources:
+        rd = d
+        if ra_name == name and (":%s::" % ra_region) in r:
+            rd = "allowed"
+        per.append({"EvalResourceName": r, "EvalResourceDecision": rd,
+                    "MissingContextValues": [missing] if missing else []})
+    top = d
+    if ra_name == name and d == "explicitDeny":
+        top = "implicitDeny"
+    e = {"EvalActionName": a, "EvalResourceName": "*", "EvalDecision": top,
+         "MissingContextValues": [missing] if missing else []}
+    if not no_per:
+        e["ResourceSpecificResults"] = per
+    out.append(e)
+print(json.dumps({"EvaluationResults": out}))
+PY
+    ;;
   *) echo "shim: unexpected aws $*" >&2; exit 9 ;;
 esac
 SH
@@ -130,7 +170,7 @@ chmod +x "$T/bin/aws"
 # run_guard — runs the guard with the shim; returns its status.
 run_guard() {
   : > "$T/aws.log"
-  local e=(PATH="$T/bin:$PATH" AWS_LOG="$T/aws.log")
+  local e=(PATH="$T/bin:$PATH" AWS_LOG="$T/aws.log" SIM_RES_LOG="$T/simres")
   [ -n "${NO_CI_ROLE:-}" ] || e+=(HARDENED_CI_ROLE_ARN="${CI_ROLE_ARN:-$CI_ROLE}")
   ( cd "$T" && env -u HARDENED_CI_ROLE_ARN "${e[@]}" "$R/scripts/hardened-guard-check.sh" > "$T/stdout" 2> "$T/stderr" )
 }
@@ -183,6 +223,33 @@ check "read-only: every call is get/list/describe/simulate" \
 echo "== a principal that cannot act needs no explicit deny =="
 LEAKY=aleksei run_guard; check "implicitDeny passes → exit 0" "$?"
 check "…listed as implicitDeny" "$(grep -F "arn:aws:iam::$ACCT:user/aleksei" "$T/stdout" | grep -q 'implicitDeny'; echo $?)"
+
+echo "== G3 reads conditions and every region's resource =="
+CONDITIONED=aleksei run_guard
+check "an Allow conditioned on a key the simulation lacks → exit 1" "$([ $? -eq 1 ]; echo $?)"
+check "…names the principal, an action and the missing key, and says check by hand" \
+  "$(grep -F "arn:aws:iam::$ACCT:user/aleksei" "$T/stderr" | grep -F 'ec2:DeregisterImage' | grep -F 'aws:SourceIp' | grep -qF 'check by hand, then attach the deny'; echo $?)"
+check "…listed as conditional" "$(grep -F "arn:aws:iam::$ACCT:user/aleksei" "$T/stdout" | grep -q 'conditional'; echo $?)"
+EXPLICIT_MISSING=aleksei run_guard
+check "an explicit deny that also reports a missing key passes" "$?"
+REGION_ALLOWED=aleksei:eu-central-1 run_guard
+check "an Allow scoped to a non-build region's ARNs → exit 1, naming that ARN" \
+  "$([ $? -eq 1 ] && grep -F "arn:aws:iam::$ACCT:user/aleksei" "$T/stderr" | grep -qF 'allowed on arn:aws:ec2:eu-central-1::image/'; echo $?)"
+run_guard
+check "each simulation names one resource per region" \
+  "$(grep -F 'simulate-principal-policy' "$T/aws.log" | grep -F 'DeregisterImage' | grep -qF -- '--resource-arns arn:aws:ec2:us-east-1::image/ami-00000000000000000 arn:aws:ec2:eu-central-1::image/ami-00000000000000000 --context-entries'; echo $?)"
+NO_PER_RESOURCE=1 run_guard
+check "no per-resource results for several resources → unreadable, exit 1" \
+  "$([ $? -eq 1 ] && grep -qF 'no per-resource results' "$T/stderr"; echo $?)"
+cp "$R/image/hardened/regions" "$T/regions.two"
+printf '%s\n' us-east-1 us-east-2 us-west-1 us-west-2 ca-central-1 eu-central-1 eu-west-1 eu-west-2 eu-west-3 eu-north-1 ap-south-1 ap-northeast-1 \
+  > "$R/image/hardened/regions"
+run_guard
+check "12 regions → two batches per kind (10 + 2), every region covered, exit 0" \
+  "$([ $? -eq 0 ] && [ "$(calls 'iam simulate-principal-policy')" = 8 ] \
+     && grep -F 'simulate-principal-policy' "$T/aws.log" | grep -F 'DeregisterImage' | grep -qF -- 'eu-west-3::image/ami-00000000000000000 arn:aws:ec2:eu-north-1::image/ami-00000000000000000 --context' \
+     && grep -F 'simulate-principal-policy' "$T/aws.log" | grep -F 'DeregisterImage' | grep -qF -- '--resource-arns arn:aws:ec2:ap-south-1::image/ami-00000000000000000 arn:aws:ec2:ap-northeast-1::image/ami-00000000000000000 --context'; echo $?)"
+cp "$T/regions.two" "$R/image/hardened/regions"
 
 echo "== a principal that is allowed =="
 ALLOWED=aleksei run_guard; check "exit 1" "$([ $? -eq 1 ]; echo $?)"

@@ -27,6 +27,9 @@
 #   7. Packer builds and copies the AMI to every region;
 #   8. the release record hardened-ami-YYYYMMDD-NN.json, naming every region,
 #      is uploaded to the release and its table appended to the release notes.
+# Before step 7 the chosen name is written to $HARDENED_OUT/hardened-ami-name;
+# a failure, INT or TERM from step 7 until the record is uploaded lists the
+# images of that name in every region (scripts/hardened-image-leftovers.sh).
 #
 # Talks to GitHub (gh) and AWS (EC2 through Packer, plus one DescribeImages).
 # Credentials come from the environment; nothing here prints one.
@@ -89,9 +92,11 @@ fi
 TMPS=()
 # shellcheck disable=SC2317  # reached only through the traps below
 cleanup() { [ ${#TMPS[@]} -eq 0 ] || rm -rf "${TMPS[@]}"; }
+# INT and TERM only exit: the EXIT trap cleans up, and after `packer build`
+# starts it first lists what the build may have left behind.
 trap cleanup EXIT
-trap 'cleanup; exit 130' INT
-trap 'cleanup; exit 143' TERM
+trap 'exit 130' INT
+trap 'exit 143' TERM
 # tmp VAR — a fresh 0600 file in VAR, removed on exit. Not $(…): a subshell
 # would lose the registration.
 tmp() { local f; f="$(mktemp)"; TMPS+=("$f"); printf -v "$1" '%s' "$f"; }
@@ -289,45 +294,25 @@ tmp PKLOG
 
 # From here until the record is on the release, a failure can leave images
 # named $AMI_NAME in some regions — possibly public — that no record names.
-# leftovers lists them (read-only) on stderr; the exit status stays the
-# failure's own.
-leftovers() {
-  local r out
-  echo >&2
-  echo "!! Images named $AMI_NAME may exist, and may be PUBLIC; no release record names them." >&2
-  echo "!! Deregister them and delete their snapshots by hand before any retention run or new" >&2
-  echo "!! build — docs/runbook.md, \"A hardened build that failed after its images\"." >&2
-  for r in $REGIONS; do
-    if ! out="$(aws ec2 describe-images --region "$r" --owners self --include-deprecated --include-disabled \
-                  --filters "Name=name,Values=$AMI_NAME" --output json 2>"$W/leftovers.err")"; then
-      echo "   $r: could not list (check by hand): $(tr '\n' ' ' < "$W/leftovers.err")" >&2
-      continue
-    fi
-    python3 -I - "$r" "$out" "$AMI_NAME" >&2 <<'PY' || echo "   $r: unreadable answer (check by hand)" >&2
-import json, sys
-region, answer, name = sys.argv[1], sys.argv[2], sys.argv[3]
-try:
-    images = [i for i in json.loads(answer)["Images"] if i.get("Name") == name]
-    rows = []
-    for i in images:
-        fenced = any(t.get("Key") == "IdlefyPublishedImage" and t.get("Value") == "true" for t in i.get("Tags") or [])
-        rows.append("   %s: %s  state=%s  public=%s  IdlefyPublishedImage=true: %s"
-                    % (region, i["ImageId"], i.get("State", "?"), str(i.get("Public")).lower(), "yes" if fenced else "no"))
-except (ValueError, KeyError, TypeError, AttributeError):
-    sys.exit(1)
-print("\n".join(rows) if rows else "   %s: none" % region)
-PY
-  done
-}
+# scripts/hardened-image-leftovers.sh lists them (read-only) on stderr; the
+# exit status stays the failure's own. INT and TERM only exit (see the traps
+# above), so the listing runs here, before cleanup. The name is also written
+# to $HARDENED_OUT/hardened-ami-name first: a runner that kills this script
+# outright (an Actions cancel or timeout) leaves the listing to the workflow.
 IMAGES_MAY_EXIST=1
 # shellcheck disable=SC2317  # reached only through the trap
 on_exit() {
   local rc=$?
-  if [ "$rc" -ne 0 ] && [ "$IMAGES_MAY_EXIST" = 1 ]; then leftovers || true; fi
+  if [ "$rc" -ne 0 ] && [ "$IMAGES_MAY_EXIST" = 1 ]; then
+    echo >&2
+    "$ROOT/scripts/hardened-image-leftovers.sh" "$AMI_NAME" >&2 || true
+  fi
   cleanup
   exit "$rc"
 }
 trap on_exit EXIT
+mkdir -p "$HARDENED_OUT"
+printf '%s\n' "$AMI_NAME" > "$HARDENED_OUT/hardened-ami-name"
 
 # -machine-readable: the artifact line is the only reliable source of the AMI
 # ids. The ui lines are echoed as they come, so the operator sees progress.
