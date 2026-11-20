@@ -184,6 +184,7 @@ check "ran the skeleton-sync guard" "$(echo "$OUT" | grep -q 'skeleton-sync stub
 check "ran the image-template gate" "$(echo "$OUT" | grep -q 'image-template stub' && echo 0 || echo 1)"
 check "ran the image-scrub gate" "$(echo "$OUT" | grep -q 'image-scrub stub' && echo 0 || echo 1)"
 check "ran the hardened-template gate" "$(echo "$OUT" | grep -q 'hardened-template stub' && echo 0 || echo 1)"
+check "ran the hardened-build gate" "$(echo "$OUT" | grep -q 'hardened-build stub' && echo 0 || echo 1)"
 check "ran the ami-build gate" "$(echo "$OUT" | grep -q 'ami-build stub' && echo 0 || echo 1)"
 check "ran the fetch-sync guard" "$(echo "$OUT" | grep -q 'fetch-sync stub' && echo 0 || echo 1)"
 check "no chefspec on the v path" "$(echo "$OUT" | grep -q 'chefspec stub' && echo 1 || echo 0)"

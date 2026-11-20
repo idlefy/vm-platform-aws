@@ -92,7 +92,7 @@ for t in test/test-release-gate.sh test/test-resolve-pin.sh test/test-boundary-c
          test/test-preflight.sh test/test-skeleton-sync.sh test/test-fetch-sync.sh \
          test/test-policy-publish.sh test/test-get-started.sh \
          test/test-image-template.sh test/test-image-scrub.sh test/test-ami-build.sh \
-         test/test-hardened-template.sh; do "$t"; done
+         test/test-hardened-template.sh test/test-hardened-build.sh; do "$t"; done
 ( cd cinc && make lint && make test && make test-broker && make test-loki-token && make test-share-helper && make test-policy-fetch )
 make test-pin-check                                    # root target; needs chef
 mkdocs build --strict
