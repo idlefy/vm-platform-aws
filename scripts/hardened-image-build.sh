@@ -393,8 +393,10 @@ chmod 0644 "$RECORD_TMP"
 mv "$RECORD_TMP" "$RECORD"
 gh release upload -R "$GH_REPO" "$PLATFORM_TAG" "$RECORD" >/dev/null \
   || die "the AMIs exist but the record $RECORD was not uploaded — upload it to $PLATFORM_TAG by hand (gh release upload), or treat the images below as leftovers"
-# The record names the images now: a later failure leaves nothing unnamed.
+# The record names the images now: a later failure leaves nothing unnamed,
+# and the workflow's leftovers step must not list recorded images either.
 IMAGES_MAY_EXIST=0
+rm -f "$HARDENED_OUT/hardened-ami-name"
 tmp NOTES
 gh release view -R "$GH_REPO" "$PLATFORM_TAG" --json body -q .body > "$NOTES" \
   && cat "$NOTES_ADD" >> "$NOTES" \

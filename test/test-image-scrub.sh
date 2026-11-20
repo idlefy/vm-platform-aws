@@ -196,6 +196,8 @@ seed_solo() {  # seed_solo DIR
   # can follow it inside the fake root).
   ln -sfn ../idlefy-hardened-firstboot.service \
     "$1/etc/systemd/system/multi-user.target.wants/idlefy-hardened-firstboot.service"
+  printf '%s\n' 'root:x:0:0:root:/root:/bin/bash' 'ec2-instance-connect:x:113:65534::/nonexistent:/usr/sbin/nologin' \
+    'ubuntu:x:1000:1000::/home/ubuntu:/bin/bash' > "$1/etc/passwd"
   cat > "$1/etc/iptables/rules.v6" <<'V6'
 *filter
 :INPUT DROP [0:0]
@@ -305,20 +307,44 @@ solo_passes() {
   ( export DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$FIRSTBOOT"; run_scrub "$R" solo ); got=$?
   check "$label → exit 0, powers off" "$([ "$got" = 0 ] && tail -1 "$T/log" | grep -q '^poweroff'; echo $?)"
 }
-for fam in "4 169.254.169.254/32" "6 fd00:ec2::254/128"; do
-  set -- $fam; v=$1 a=$2; f="etc/iptables/rules.v$v"
-  solo_refuses "v$v: ACCEPT of the metadata address for all before the drop" "rules.v$v accepts" \
-    "printf '%s\n' '*filter' ':INPUT DROP [0:0]' '-A OUTPUT -d $a -j ACCEPT' '-A OUTPUT -d $a -j DROP' 'COMMIT' > $f"
-  solo_refuses "v$v: unconditional OUTPUT ACCEPT before the drop" "rules.v$v accepts" \
-    "printf '%s\n' '*filter' ':INPUT DROP [0:0]' '-A OUTPUT -j ACCEPT' '-A OUTPUT -d $a -j DROP' 'COMMIT' > $f"
-  solo_refuses "v$v: ACCEPT for all with an extra match, before the drop" "rules.v$v accepts" \
-    "printf '%s\n' '*filter' ':INPUT DROP [0:0]' '-A OUTPUT -d $a -p tcp -m tcp --dport 80 -j ACCEPT' '-A OUTPUT -d $a -j DROP' 'COMMIT' > $f"
-  solo_passes "v$v: owner-matched ACCEPTs (root, Instance Connect) before the drop" \
-    "printf '%s\n' '*filter' ':INPUT DROP [0:0]' ':FORWARD DROP [0:0]' ':OUTPUT ACCEPT [0:0]' '-A OUTPUT -d $a -m owner --uid-owner 0 -j ACCEPT' '-A OUTPUT -d $a -m owner --uid-owner 113 -j ACCEPT' '-A OUTPUT -d $a -j DROP' 'COMMIT' > $f"
-  solo_passes "v$v: the drop appended after the accepts, other OUTPUT rules first" \
-    "printf '%s\n' '*filter' ':INPUT DROP [0:0]' ':OUTPUT ACCEPT [0:0]' '-A OUTPUT -d 10.0.0.0/8 -j ACCEPT' '-A OUTPUT -d $a -m owner --uid-owner 0 -j ACCEPT' '-A OUTPUT -d $a -j DROP' 'COMMIT' > $f"
-  solo_passes "v$v: drop first, then an ACCEPT for all (the drop wins)" \
-    "printf '%s\n' '*filter' ':INPUT DROP [0:0]' '-A OUTPUT -d $a -j DROP' '-A OUTPUT -d $a -j ACCEPT' '-A OUTPUT -j ACCEPT' 'COMMIT' > $f"
+# Before the drop only an allowlist may stand: root's and Instance Connect's
+# owner allows (the uid read from the image's /etc/passwd; seed_solo gives
+# ec2-instance-connect uid 113). Anything else there refuses; nothing after
+# the drop is restricted.
+NO_EIC="printf '%s\n' 'root:x:0:0:root:/root:/bin/bash' 'ubuntu:x:1000:1000::/home/ubuntu:/bin/bash' > etc/passwd"
+for fam in "4 169.254.169.254/32 169.254.0.0/16" "6 fd00:ec2::254/128 fd00:ec2::/64"; do
+  set -- $fam; v=$1 a=$2 wide=$3; f="etc/iptables/rules.v$v"
+  root="-A OUTPUT -d $a -m owner --uid-owner 0 -j ACCEPT"
+  # pre LINE — rules.v$v with root's allow, then LINE, then the drop.
+  pre() { printf "printf '%%s\\\\n' '*filter' ':INPUT DROP [0:0]' ':OUTPUT ACCEPT [0:0]' '%s' '%s' '-A OUTPUT -d %s -j DROP' 'COMMIT' > %s" "$root" "$1" "$a" "$f"; }
+  for bad in "-A OUTPUT -d $a -j ACCEPT" \
+             "-A OUTPUT -j ACCEPT" \
+             "-A OUTPUT -d $a -p tcp -m tcp --dport 80 -j ACCEPT" \
+             "-A OUTPUT -d $a -m owner --uid-owner 1000 -j ACCEPT" \
+             "-A OUTPUT -d $a -m owner --uid-owner 0-1000 -j ACCEPT" \
+             "-A OUTPUT -d $a -m owner ! --uid-owner 1000 -j ACCEPT" \
+             "-A OUTPUT -d $a -m owner --gid-owner 0 -j ACCEPT" \
+             "-A OUTPUT -d $wide -m owner --uid-owner 0 -j ACCEPT" \
+             "-A OUTPUT -p tcp -j ACCEPT" \
+             "-A OUTPUT -j RETURN" \
+             "-A OUTPUT -j ts-output" \
+             "-A OUTPUT -d 10.0.0.0/8 -j ACCEPT" \
+             "[0:0] -A OUTPUT -d $a -m owner --uid-owner 0 -j ACCEPT"; do
+    solo_refuses "v$v before the drop: $bad" "rules.v$v has an OUTPUT rule before its IMDS drop" "$(pre "$bad")"
+  done
+  solo_refuses "v$v: Instance Connect's allow when this image has no such user" \
+    "rules.v$v has an OUTPUT rule before its IMDS drop" "$NO_EIC; $(pre "-A OUTPUT -d $a -m owner --uid-owner 113 -j ACCEPT")"
+  solo_refuses "v$v: an unreadable rules file" "rules.v$v" "chmod 000 $f; mv $f $f.x; mkdir $f"
+  solo_passes "v$v: root's and Instance Connect's allows, then the drop" \
+    "$(pre "-A OUTPUT -d $a -m owner --uid-owner 113 -j ACCEPT")"
+  solo_passes "v$v: no Instance Connect user, root's allow only" \
+    "$NO_EIC; printf '%s\n' '*filter' ':INPUT DROP [0:0]' '$root' '-A OUTPUT -d $a -j DROP' 'COMMIT' > $f"
+  solo_passes "v$v: no allow at all, the drop first (fail closed)" \
+    "printf '%s\n' '*filter' ':INPUT DROP [0:0]' '-A OUTPUT -d $a -j DROP' 'COMMIT' > $f"
+  solo_passes "v$v: anything after the drop (the drop wins)" \
+    "printf '%s\n' '*filter' ':INPUT DROP [0:0]' '$root' '-A OUTPUT -d $a -j DROP' '-A OUTPUT -d $a -j ACCEPT' '-A OUTPUT -j ACCEPT' '-A OUTPUT -j ts-output' 'COMMIT' > $f"
+  solo_passes "v$v: Docker and Tailscale chains elsewhere, a nat OUTPUT jump" \
+    "printf '%s\n' '*nat' ':OUTPUT ACCEPT [0:0]' '-A OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER' 'COMMIT' '*filter' ':INPUT DROP [0:0]' ':FORWARD DROP [0:0]' ':OUTPUT ACCEPT [0:0]' ':DOCKER-USER - [0:0]' ':ts-input - [0:0]' '-A INPUT -j ts-input' '-A FORWARD -j DOCKER-USER' '$root' '-A OUTPUT -d $a -m owner --uid-owner 113 -j ACCEPT' '-A OUTPUT -d $a -j DROP' 'COMMIT' > $f"
 done
 set --
 solo_refuses "SSM snap still installed"     "amazon-ssm-agent"   ":" SHIM_SSM_SNAP_PRESENT=1

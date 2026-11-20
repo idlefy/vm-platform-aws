@@ -407,9 +407,13 @@ check "an artifact short of regions → the images are listed" \
 LEFTOVER_us_east_1="$LEFT" GH_RECORD_UPLOAD_FAIL=1 run_build
 check "the record upload fails → the images are listed" \
   "$([ $? -ne 0 ] && grep -qF 'may be PUBLIC' "$T/stderr" && grep -qF 'us-east-1: ami-0aaa' "$T/stderr"; echo $?)"
-LEFTOVER_us_east_1="$LEFT" GH_NOTES_FAIL=1 run_build
-check "the notes edit fails after the record is up → no leftover list" \
-  "$([ $? -ne 0 ] && grep -qF 'release notes were not updated' "$T/stderr" && ! grep -qF 'may be PUBLIC' "$T/stderr"; echo $?)"
+LEFTOVER_us_east_1="$LEFT" GH_NOTES_FAIL=1 run_build; rc=$?
+check "the notes edit fails after the record is up → exit 1, no leftover list" \
+  "$([ $rc -eq 1 ] && grep -qF 'release notes were not updated' "$T/stderr" && ! grep -qF 'may be PUBLIC' "$T/stderr"; echo $?)"
+check "...and no name file for the workflow's leftovers step to list recorded images by" \
+  "$([ ! -e "$T/out/hardened-ami-name" ] && compgen -G "$T/out/hardened-ami-*.json" >/dev/null; echo $?)"
+LEFTOVER_us_east_1="$LEFT" GH_RECORD_UPLOAD_FAIL=1 run_build
+check "a failed record upload keeps the name file (its images are unrecorded)" "$([ -s "$T/out/hardened-ami-name" ]; echo $?)"
 LEFTOVER_us_east_1="$LEFT" run_build
 check "a green build lists nothing" "$([ $? -eq 0 ] && ! grep -qF 'may be PUBLIC' "$T/stderr"; echo $?)"
 

@@ -114,28 +114,31 @@ filter_has() {
     END         { exit !f }' "$R$1" 2>/dev/null
 }
 
-# meta_shadowed FILE ADDR: in a committed *filter table of FILE, an OUTPUT rule
-# before the metadata drop (`-A OUTPUT -d ADDR -j DROP`, wherever it sits)
-# accepts ADDR for every user — an unconditional `-A OUTPUT -j ACCEPT`, or one
-# naming `-d ADDR` with `-j ACCEPT` and no `-m owner --uid-owner`. Exact on
-# purpose: base::imds's owner-matched accepts (root, Instance Connect) pass.
-meta_shadowed() {
-  awk -v a="$2" '
+# meta_preamble_ok FILE ADDR EIC_UID: in every committed *filter table of FILE,
+# each OUTPUT rule before the metadata drop (`-A OUTPUT -d ADDR -j DROP`,
+# wherever it sits) is exactly one of base::imds's owner allows:
+#   -A OUTPUT -d ADDR -m owner --uid-owner 0 -j ACCEPT
+#   -A OUTPUT -d ADDR -m owner --uid-owner EIC_UID -j ACCEPT  (EIC_UID non-empty)
+# An allowlist: anything else there — another uid, a negation, a gid match, a
+# wider destination, a protocol accept, RETURN, a jump, a counter-prefixed
+# line — fails, and so does an unreadable file. Rules after the drop are not
+# restricted: the drop has already decided the metadata address.
+meta_preamble_ok() {
+  awk -v a="$2" -v eic="$3" '
+    BEGIN       { root = "-A OUTPUT -d " a " -m owner --uid-owner 0 -j ACCEPT"
+                  e = (eic ~ /^[0-9]+$/) ? "-A OUTPUT -d " a " -m owner --uid-owner " eic " -j ACCEPT" : "" }
     /^\*/       { t = $0; s = 0; d = 0 }
     t == "*filter" && $0 == "-A OUTPUT -d " a " -j DROP" { d = 1 }
-    t == "*filter" && !d && /^-A OUTPUT / {
-      if ($0 == "-A OUTPUT -j ACCEPT") s = 1
-      else if (index($0 " ", " -d " a " ") && $0 ~ / -j ACCEPT$/ && $0 !~ / -m owner .*--uid-owner /) s = 1
-    }
-    /^COMMIT$/  { if (t == "*filter" && s) f = 1; t = ""; s = 0; d = 0 }
-    END         { exit !f }' "$R$1" 2>/dev/null
+    t == "*filter" && !d && index($0, "-A OUTPUT") && $0 != root && (e == "" || $0 != e) { s = 1 }
+    /^COMMIT$/  { if (t == "*filter" && s) bad = 1; t = ""; s = 0; d = 0 }
+    END         { exit bad }' "$R$1" 2>/dev/null
 }
 
 # Hook 3, immediately before cloud-init clean, on the disk Packer is about to
 # snapshot. Paths under $R; the root-ownership check only on a real root,
 # since a test's fake root cannot be chowned.
 solo_check() {
-  local f g grp st mode own
+  local f g grp st mode own eic
   local h=/usr/local/sbin/idlefy-share
   # 1. The oneshot that strips cloud-init's re-grants to ubuntu on first boot.
   #    Enabled on the disk: `enabled-runtime` lives in /run, not in the image.
@@ -168,9 +171,9 @@ solo_check() {
   done
   # 6. The persisted rules as iptables-save / ip6tables-save write them, in the
   #    filter table only (*filter … COMMIT): the INPUT policy is a chain header
-  #    (never a -P line), and base::imds's IMDS drops (`iptables -I OUTPUT 3 -d
-  #    169.254.169.254 -j DROP`, `ip6tables -I OUTPUT 3 -d fd00:ec2::254 -j
-  #    DROP`) are saved as OUTPUT rules with their /32 and /128.
+  #    (never a -P line), and base::imds's IMDS drops (`iptables -I OUTPUT <n>
+  #    -d 169.254.169.254 -j DROP`, the same for fd00:ec2::254, inserted right
+  #    after the owner allows) are saved as OUTPUT rules with /32 and /128.
   for f in /etc/iptables/rules.v4 /etc/iptables/rules.v6; do
     [ -f "$R$f" ] || refuse "$f is missing"
     filter_has "$f" '^:INPUT DROP( |$)' || refuse "$f has no INPUT DROP policy in a committed *filter"
@@ -179,12 +182,14 @@ solo_check() {
     || refuse "/etc/iptables/rules.v4 does not drop 169.254.169.254 (IMDS) in a committed *filter OUTPUT"
   filter_has /etc/iptables/rules.v6 '^-A OUTPUT -d fd00:ec2::254/128 -j DROP$' \
     || refuse "/etc/iptables/rules.v6 does not drop fd00:ec2::254 (IMDS v6) in *filter OUTPUT"
-  if meta_shadowed /etc/iptables/rules.v4 169.254.169.254/32; then
-    refuse "/etc/iptables/rules.v4 accepts 169.254.169.254 for every user before its IMDS drop"
-  fi
-  if meta_shadowed /etc/iptables/rules.v6 fd00:ec2::254/128; then
-    refuse "/etc/iptables/rules.v6 accepts fd00:ec2::254 for every user before its IMDS drop"
-  fi
+  #    Before each drop only root's and Instance Connect's owner allows may
+  #    stand; the Instance Connect uid comes from this disk's /etc/passwd
+  #    (no such user → root's allow only).
+  eic=$(awk -F: '$1 == "ec2-instance-connect" { print $3; exit }' "$R/etc/passwd" 2>/dev/null) || eic=""
+  meta_preamble_ok /etc/iptables/rules.v4 169.254.169.254/32 "$eic" \
+    || refuse "/etc/iptables/rules.v4 has an OUTPUT rule before its IMDS drop other than root's or Instance Connect's owner allow"
+  meta_preamble_ok /etc/iptables/rules.v6 fd00:ec2::254/128 "$eic" \
+    || refuse "/etc/iptables/rules.v6 has an OUTPUT rule before its IMDS drop other than root's or Instance Connect's owner allow"
   # 7. The SSM agent is an inbound instruction channel. `snap list` also fails
   #    when snapd is unreachable, so the disk is checked as well.
   if snap list amazon-ssm-agent >/dev/null 2>&1; then refuse "the amazon-ssm-agent snap is still installed"; fi

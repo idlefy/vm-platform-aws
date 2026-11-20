@@ -139,7 +139,7 @@ jobs:
         run: |
           set +e -uo pipefail
           if [ ! -s dist/hardened-ami-name ]; then
-            echo "The build never chose an image name; nothing to list." >> "$GITHUB_STEP_SUMMARY"
+            echo "The build chose no image name, or its record was uploaded: nothing to list." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           name=$(head -n 1 dist/hardened-ami-name)

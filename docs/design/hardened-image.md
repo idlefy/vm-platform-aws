@@ -221,15 +221,22 @@ reaches it only through what the customer's own account does to the instance
          `:INPUT DROP` policy (`base::firewall`'s `iptables -P INPUT DROP` /
          `ip6tables -P INPUT DROP`) and `base::imds`'s metadata drop exactly as
          `iptables-save` writes it: `-A OUTPUT -d 169.254.169.254/32 -j DROP`
-         in rules.v4 (from `iptables -I OUTPUT 3 -d 169.254.169.254 -j DROP`)
+         in rules.v4 (from `iptables -I OUTPUT <n> -d 169.254.169.254 -j DROP`,
+         `<n>` right after the last owner allow — `libraries/imds_firewall.rb`)
          and `-A OUTPUT -d fd00:ec2::254/128 -j DROP` in rules.v6. A truncated
          file, a missing one, or the rule in another table or chain refuses.
-         So does an OUTPUT rule **before** that drop that accepts the
-         metadata address for every user — `-A OUTPUT -j ACCEPT`, or one
-         naming the address with `-j ACCEPT` and no `-m owner --uid-owner`.
-         The check reads only what precedes the drop, never its index, so
-         base::imds's owner-matched accepts (root, Instance Connect) pass
-         whether the drop is inserted at position 3 or appended;
+         Before that drop an **allowlist** holds: every OUTPUT line there must
+         be exactly `-A OUTPUT -d <addr>/<prefix> -m owner --uid-owner 0 -j ACCEPT`
+         or the same with the uid of `ec2-instance-connect` read from the
+         image's own `/etc/passwd` (no such user → root's line only). Anything
+         else refuses — another uid, a uid range, `!`, `--gid-owner`, a wider
+         destination, a protocol accept, `RETURN`, a jump to another chain, a
+         counter-prefixed `[n:m] -A …` line — and so does an unreadable file.
+         The check reads only what precedes the drop, never its index; lines
+         after it are not restricted. No other recipe of the solo run list
+         puts a filter `OUTPUT` line ahead of the drop: Docker is rootless
+         (the system daemon is stopped, and dockerd's own OUTPUT jump is in
+         `*nat`), and Tailscale's chains hang off `INPUT` and `FORWARD`;
       7. the `amazon-ssm-agent` snap is neither listed by `snap` nor on disk
          (`/snap/amazon-ssm-agent`, `/var/lib/snapd/snaps/amazon-ssm-agent_*.snap`);
       8. dpkg reports `cinc` as not installed;
@@ -309,8 +316,10 @@ public until removed, and
 the next build's NN skips their number (NN is one past the highest same-day
 number in **any** listed region). Clean-up is manual and comes before any
 retention run or new build — `docs/runbook.md`, "A hardened build that failed
-after its images". Once the record is uploaded, a later failure (the notes
-edit) lists nothing: the record names the images.
+after its images". Once the record is uploaded, the driver removes
+`dist/hardened-ami-name`, so a later failure (the notes edit) lists nothing,
+neither in the driver nor in the workflow's step: the record names the
+images.
 
 ### Workflows
 
@@ -326,8 +335,9 @@ UTC):
   then the build. One approval covers both. `HARDENED_PUBLIC` is set once,
   in the job's `env:`, so the guard and the build cannot drift. After a
   failed, cancelled or timed-out build the `leftovers` step lists any image
-  of the chosen name into the job summary (it says so when the build never
-  chose a name), and the `record` step prints any record written.
+  of the chosen name into the job summary (without a name file it says the
+  build chose no name, or its record was uploaded), and the `record` step
+  prints any record written.
 - `permissions: contents: write, id-token: write`, nothing broader;
   `concurrency: hardened-publish` without cancel. A third queued run replaces
   a pending one, as GitHub concurrency does. The retire workflow has its own

@@ -97,8 +97,8 @@ publishes it from Idlefy's account; design record:
   or is signalled after `packer build` started, and the publish workflow runs
   it after a failed, cancelled or timed-out build. The driver takes NN from
   every listed region. The solo scrub checks `rules.v4` as it checks
-  `rules.v6`, and refuses an OUTPUT accept for every user ahead of either
-  metadata drop.
+  `rules.v6`, and allows ahead of either metadata drop only root's and
+  Instance Connect's owner allows (an allowlist).
 - `scripts/hardened-image-retire.sh`: keeps the newest two public builds,
   deprecates and deregisters older ones on a 7-day cadence, never
   deregisters one of the two newest, yanks one build with `--disable`, and
