@@ -89,9 +89,13 @@ publishes it from Idlefy's account; design record:
   its sha256 in the user data, builds, and writes the release record.
 - `scripts/hardened-guard-check.sh`: refuses to publish unless the account is
   still safe to publish from (encryption by default off, public sharing
-  unblocked, SSM Default Host Management unset, quota room, the deny on
-  published images intact for every principal, and no unencrypted snapshot
-  or image outside the published ones).
+  unblocked for a public build, SSM Default Host Management unset, quota
+  room, no principal but the publisher allowed to change a published image,
+  and no unencrypted snapshot or image outside the published ones).
+- The driver also lists, read-only, any image of the build's name left in a
+  region when a build fails after `packer build` started, and takes NN from
+  every listed region. The solo scrub checks `rules.v4` as it checks
+  `rules.v6`.
 - `scripts/hardened-image-retire.sh`: keeps the newest two public builds,
   deprecates and deregisters older ones on a 7-day cadence, never
   deregisters one of the two newest, yanks one build with `--disable`, and

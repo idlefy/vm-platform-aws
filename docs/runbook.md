@@ -631,6 +631,36 @@ Dev Boxes: `idlefy-hardened-agent-ubuntu-24.04-amd64-YYYYMMDD-NN`, owner
 tenant. How it is built, published and retired is in
 [Hardened image for AI agents](design/hardened-image.md).
 
+#### A hardened build that failed after its images
+
+When `publish-hardened-image` fails after `packer build` started and before
+the record reached the release, the build log ends with a list headed
+"Images named … may exist, and may be PUBLIC; no release record names them":
+one line per region with the image id, its state, `public=` and whether
+`IdlefyPublishedImage=true` is set, or "could not list" for a region to check
+by hand. No consumer pins these images, but a public one is launchable by
+anyone until it is removed, and retention would count it as a real build. So
+clean up **before any retention run or new build**:
+
+1. For every "could not list" region, read it yourself (owner credentials,
+   read-only):
+   `aws ec2 describe-images --region <r> --owners self --include-deprecated --include-disabled --filters Name=name,Values=<name> --query 'Images[].[ImageId,State,Public,BlockDeviceMappings[].Ebs.SnapshotId]'`.
+2. **Tagged leftovers** (`IdlefyPublishedImage=true: yes`). Once tagged, no
+   principal but the publisher role may change them — not the owner either.
+   Run *retire-hardened-image* with `disable_name=<name>` and `apply=true`:
+   it disables the name in every region and runs no retention, and a disabled
+   image is private and cannot be launched. A later retention run deregisters
+   it and deletes its snapshots once it is 7 days old and two newer builds
+   exist. To remove it sooner, the only other way is to use the publisher role
+   temporarily for `aws ec2 deregister-image` and then
+   `aws ec2 delete-snapshot` on each of its snapshots, region by region.
+3. **Untagged leftovers** (`IdlefyPublishedImage=true: no` — tagging failed).
+   The owner removes them with the owner's credentials: note the snapshot ids
+   (step 1), `aws ec2 deregister-image --region <r> --image-id <ami>`, then
+   `aws ec2 delete-snapshot --region <r> --snapshot-id <snap>` for each.
+4. Run `scripts/hardened-guard-check.sh` (G4 names any unencrypted, untagged
+   snapshot still left), then retry the build. It takes the next NN.
+
 ## Defaults you may want to change
 
 These are the template's starting values, not leftovers. Each is a deliberate

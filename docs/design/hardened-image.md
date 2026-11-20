@@ -85,11 +85,19 @@ reaches it only through what the customer's own account does to the instance
 
 6. **The trust anchor is the consumer's pinned AMI id list.** Idlefy's
    costpilot side launches only ids it has pinned from a release record; a
-   name pattern or an owner id alone is never enough. The account-side deny
-   (every principal other than the publisher role and AWS service-linked
-   roles is explicitly denied every mutation of an image or snapshot tagged
-   `IdlefyPublishedImage=true`) is hygiene. The guard simulates it for every
-   IAM user and role (G3) and refuses to publish when it has regressed. The
+   name pattern or an owner id alone is never enough. The account-side fence
+   (no principal other than the publisher role and AWS service-linked roles
+   may mutate an image or snapshot tagged `IdlefyPublishedImage=true`) is
+   hygiene. The guard simulates it for every IAM user and role (G3) and
+   refuses to publish when any principal is **allowed** such a mutation. An
+   implicit deny passes like an explicit one: a principal that cannot act
+   needs no explicit deny, and attaching the deny to CloudFormation-created
+   roles makes their stacks undeletable; the guard re-checks on every
+   publish. The simulation says MFA is present
+   (`aws:MultiFactorAuthPresent=true`), so an account's "require MFA" deny
+   cannot mask a principal that is otherwise allowed — measured on the
+   account: the owner's user simulated `explicitDeny` only because of such a
+   policy. The
    guard is read-only and reports every failure, not the first; roles under
    `/aws-reserved/` (Identity Center) cannot be simulated usefully, so they
    are skipped and listed for a manual check. For the public-AMI quota (G2c)
@@ -202,8 +210,14 @@ reaches it only through what the customer's own account does to the instance
       3. `visudo -c` accepts the sudoers files;
       4. `/etc/sudoers.d/90-cloud-init-users` is absent;
       5. `ubuntu` is in none of `sudo`, `admin`, `adm`, `lxd` (whole words);
-      6. `/etc/iptables/rules.v6`'s `*filter` table has an `INPUT DROP`
-         policy and the `OUTPUT` drop of `fd00:ec2::254/128` (IMDS over v6);
+      6. `/etc/iptables/rules.v4` and `/etc/iptables/rules.v6` exist, and in
+         each a `*filter` table **closed by its `COMMIT`** holds the
+         `:INPUT DROP` policy (`base::firewall`'s `iptables -P INPUT DROP` /
+         `ip6tables -P INPUT DROP`) and `base::imds`'s metadata drop exactly as
+         `iptables-save` writes it: `-A OUTPUT -d 169.254.169.254/32 -j DROP`
+         in rules.v4 (from `iptables -I OUTPUT 3 -d 169.254.169.254 -j DROP`)
+         and `-A OUTPUT -d fd00:ec2::254/128 -j DROP` in rules.v6. A truncated
+         file, a missing one, or the rule in another table or chain refuses;
       7. the `amazon-ssm-agent` snap is neither listed by `snap` nor on disk
          (`/snap/amazon-ssm-agent`, `/var/lib/snapd/snaps/amazon-ssm-agent_*.snap`);
       8. dpkg reports `cinc` as not installed;
@@ -236,15 +250,49 @@ not the first, and a denied or unreadable read is a failure, never a pass.
 | Check | Refuses when |
 |---|---|
 | G1 | the caller is not in account `995603458290` (nothing else is called) |
-| G2 | in a region of `image/hardened/regions`: EBS encryption by default is on (the copy would be encrypted and could not be public); image block public access is not `unblocked`; the region is not enabled |
+| G2 | in a region of `image/hardened/regions`: EBS encryption by default is on (the copy would be encrypted and could not be public); the region is not enabled; for a **public** build only, image block public access is not `unblocked` |
 | G2b | SSM Default Host Management Configuration is set in a region (it would hand the build instance a role) |
 | G2c | a region has no room under the public-AMI quota `L-0E3CBAB9` for one more public image (deprecated public images count; the AWS default applies when no value was applied) |
-| G3 | an IAM user or role other than the publish role and service-linked roles is not explicitly denied every mutation of an image or snapshot tagged `IdlefyPublishedImage=true` (policy simulation); `/aws-reserved/` roles are skipped and listed for a manual check |
+| G3 | an IAM user or role other than the publish role and service-linked roles is **allowed** any fenced action on an image or snapshot tagged `IdlefyPublishedImage=true`, or its simulation fails (policy simulation with the fence tag and `aws:MultiFactorAuthPresent=true`; `implicitDeny` passes like `explicitDeny`); `/aws-reserved/` roles are skipped and listed for a manual check |
 | G4 | a region holds a self-owned unencrypted snapshot, or a self-owned image with an unencrypted snapshot, not tagged `IdlefyPublishedImage=true` — each named with its region |
 
 G4 exists because the publisher role can copy images inside the account, and
 an unencrypted private disk is the only thing a compromised run could make
 public. While none exists, nothing can leak.
+
+G2's block-public-access check follows `HARDENED_PUBLIC` (the publish job
+passes the build's value; unset means `true`, anything but `true`/`false` is
+refused). A private build does not need it lifted, and with it on nothing can
+become public even through a bug — so it stays on until the first public
+build, and the guard says so instead of failing.
+
+G3's fenced actions — image: `DeregisterImage`, `ModifyImageAttribute`,
+`ResetImageAttribute`, `EnableImageDeprecation`, `DisableImageDeprecation`,
+`DisableImage`, `EnableImage`, `CreateTags`, `DeleteTags`,
+`EnableImageDeregistrationProtection`, `DisableImageDeregistrationProtection`,
+`AttachImageWatermark`, `DetachImageWatermark`,
+`ReplaceImageInstanceTypeSpecification`; snapshot: `DeleteSnapshot`,
+`ModifySnapshotAttribute`, `ResetSnapshotAttribute`, `CreateTags`,
+`DeleteTags`, `LockSnapshot`, `UnlockSnapshot`, `ModifySnapshotTier` (all
+`ec2:`). The account's deny policy covers the same list.
+
+### A build that failed after its images
+
+Packer registers the image in the build region, then copies it to every other
+region; the record is written only after all of that. A failure anywhere from
+`packer build` until the record is on the release — a failed copy, an
+artifact that does not name exactly the listed regions, a failed record
+upload, an interrupted run — can leave images named `$AMI_NAME` in some
+regions, **public if the build was**, that no release record names. The
+driver then lists them on stderr (read-only `describe-images` by exact name,
+in every listed region: id, state, `Public`, and whether the fence tag is
+set; a failed describe is printed, never hidden) and keeps the failure's exit
+status. The consumer never pins them, but they are public until removed, and
+the next build's NN skips their number (NN is one past the highest same-day
+number in **any** listed region). Clean-up is manual and comes before any
+retention run or new build — `docs/runbook.md`, "A hardened build that failed
+after its images". Once the record is uploaded, a later failure (the notes
+edit) lists nothing: the record names the images.
 
 ### Workflows
 
@@ -256,8 +304,9 @@ UTC):
   schedule takes the newest `vX.Y.Z` tag on origin, peeled to its commit.
 - `publish` (`environment: hardened-publish`, 240 minutes): checkout of the
   tag with `persist-credentials: false`, Packer 1.11.2, Cinc Workstation,
-  OIDC credentials for `HARDENED_PUBLISH_ROLE_ARN` (4 hours), then the guard,
-  then the build. One approval covers both.
+  OIDC credentials for `HARDENED_PUBLISH_ROLE_ARN` (4 hours), then the guard
+  (given the same `HARDENED_PUBLIC` as the build), then the build. One
+  approval covers both.
 - `permissions: contents: write, id-token: write`, nothing broader;
   `concurrency: hardened-publish` without cancel. A third queued run replaces
   a pending one, as GitHub concurrency does. The retire workflow has its own
@@ -348,11 +397,14 @@ trailing comment. No input or ref name is interpolated into a `run:` script.
   IMDSv2 without tag reading, the fence tag, one template per directory.
 - `test/test-hardened-build.sh` — the driver against shimmed `chef`, `gh`,
   `aws` and `packer`: the account check, the stored-asset comparison, the
-  release created when missing, the record, and the real solo user data
-  measured against EC2's 16 KB.
+  release created when missing, the record, NN across every region, the
+  leftover listing after a failure past `packer build`, and the real solo
+  user data measured against EC2's 16 KB.
 - `test/test-hardened-guard.sh` — G1–G4 against a shimmed `aws`, including
-  the default-quota fallback, the listed `/aws-reserved/` roles, and stray
-  unencrypted snapshots and images, fenced or not.
+  the default-quota fallback, the listed `/aws-reserved/` roles, implicit
+  denies passing and allows failing, a "require MFA" deny that must not mask
+  an allow, block public access by `HARDENED_PUBLIC`, and stray unencrypted
+  snapshots and images, fenced or not.
 - `test/test-hardened-retire.sh` — retention, the safety net, doubts and
   `--disable` against a shimmed `aws` and a fixed clock.
 - The solo section of `test/test-image-scrub.sh` — the solo lists against
@@ -360,6 +412,29 @@ trailing comment. No input or ref name is interpolated into a `run:` script.
   a fake root.
 - The workflows have no local test; `actionlint` (run by CodeRabbit) checks
   them, and the first private build is their test.
+
+## To verify on the first private build
+
+Each item is checked on the restored snapshot of the first `public=false`
+build (or on two instances launched from it) before any public build; a
+finding becomes a scrub or guard change and a new `v` release first.
+
+- **snapd's device identity.** `/var/lib/snapd/device/private-keys-v1/*` and
+  the serial and session macaroon in `/var/lib/snapd/state.json`; run
+  `snap model --serial` on two instances from the image. If the build's
+  identity is in the snapshot (the same serial on both, or a key on disk),
+  the scrub must remove it before any public build.
+- **Per-user state of the agent CLIs**: `/home/ubuntu/.codex`,
+  `/home/ubuntu/.claude` (any id, session, history or auth file), and
+  `/var/log/audit`.
+- **The saved firewall rules**: the exact `rules.v4` and `rules.v6` lines,
+  against the forms decision 12 checks.
+- **Tags on copied snapshots**: the snapshot of the copy in a region other
+  than the build region carries `IdlefyPublishedImage=true` (the fence and G4
+  depend on it).
+- **The publisher role can make every guard read** (G1–G4): a guard run
+  under the role itself, not the owner's credentials, ends with no "the call
+  failed" line.
 
 ## Measured
 
