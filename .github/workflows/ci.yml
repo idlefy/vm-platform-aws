@@ -75,6 +75,10 @@ jobs:
                    test/test-preflight.sh \
                    test/test-get-started.sh \
                    test/test-image-template.sh \
+                   test/test-hardened-template.sh \
+                   test/test-hardened-build.sh \
+                   test/test-hardened-guard.sh \
+                   test/test-hardened-retire.sh \
                    test/test-image-scrub.sh \
                    test/test-ami-build.sh; do
             echo "=== $t"

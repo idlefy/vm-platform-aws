@@ -91,13 +91,15 @@ for t in test/test-release-gate.sh test/test-resolve-pin.sh test/test-boundary-c
          test/test-placeholder-check.sh test/test-prepare.sh test/test-pin-to-worktree.sh \
          test/test-preflight.sh test/test-skeleton-sync.sh test/test-fetch-sync.sh \
          test/test-policy-publish.sh test/test-get-started.sh \
-         test/test-image-template.sh test/test-image-scrub.sh test/test-ami-build.sh; do "$t"; done
+         test/test-image-template.sh test/test-image-scrub.sh test/test-ami-build.sh \
+         test/test-hardened-template.sh test/test-hardened-build.sh \
+         test/test-hardened-guard.sh test/test-hardened-retire.sh; do "$t"; done
 ( cd cinc && make lint && make test && make test-broker && make test-loki-token && make test-share-helper && make test-policy-fetch )
 make test-pin-check                                    # root target; needs chef
 mkdocs build --strict
 ```
 
-`terraform test` needs Terraform ≥1.7 for `mock_provider` (everything else works on the declared `>= 1.5.0` floor), `test/test-image-template.sh` needs Packer (1.11.2 in CI) and network access for `packer init`, and `mkdocs build --strict` needs `mkdocs-material`. CI runs the same list on every pull request and on every push to `main` — the docs build in its own workflow.
+`terraform test` needs Terraform ≥1.7 for `mock_provider` (everything else works on the declared `>= 1.5.0` floor), `test/test-image-template.sh` and `test/test-hardened-template.sh` need Packer (1.11.2 in CI) and network access for `packer init`, and `mkdocs build --strict` needs `mkdocs-material`. CI runs the same list on every pull request and on every push to `main` — the docs build in its own workflow.
 
 Working in this repository with an agent? Read [`AGENTS.md`](AGENTS.md) — it carries the traps, each of which has actually happened. How to open a pull request is in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 

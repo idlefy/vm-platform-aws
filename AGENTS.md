@@ -17,7 +17,9 @@ tenant. This file carries the mechanisms and the evidence behind them, which is
 what a change to the platform needs.
 
 **Agent guides.** Someone who has just cloned this repository and wants to
-start → follow [`GET-STARTED.md`](GET-STARTED.md).
+start → follow [`GET-STARTED.md`](GET-STARTED.md). An Idlefy-published image
+(the public hardened AMI, its workflows and retention) →
+[`docs/design/hardened-image.md`](docs/design/hardened-image.md).
 
 There is no deployable `vms/` root here on purpose: two copies of it would drift
 and nothing would catch it. `vms/` holds `modules/` and `README.md`.
@@ -39,7 +41,9 @@ for t in test/test-release-gate.sh test/test-resolve-pin.sh test/test-boundary-c
          test/test-placeholder-check.sh test/test-prepare.sh test/test-pin-to-worktree.sh \
          test/test-preflight.sh test/test-skeleton-sync.sh test/test-fetch-sync.sh \
          test/test-policy-publish.sh test/test-get-started.sh \
-         test/test-image-template.sh test/test-image-scrub.sh test/test-ami-build.sh; do "$t"; done
+         test/test-image-template.sh test/test-image-scrub.sh test/test-ami-build.sh \
+         test/test-hardened-template.sh test/test-hardened-build.sh \
+         test/test-hardened-guard.sh test/test-hardened-retire.sh; do "$t"; done
 ( cd cinc && make lint && make test && make test-broker && make test-loki-token && make test-share-helper && make test-policy-fetch )
 make test-pin-check                                    # root target; needs chef
 mkdocs build --strict
@@ -70,6 +74,7 @@ challenge one is to reproduce it.
 7. The Falco sudo exclusion and the Tailscale sudoers grant are one change.
 8. Root never writes under `/home/ubuntu` — stage under `/usr/share/dev-vm/home`, copy as `ubuntu`.
 9. A signature commits to bytes; compare an archive's contents before signing its hash.
+10. Packer loads a whole directory — a second template lives in its own.
 
 **A deny entry in the permissions boundary must cover every route to the asset,
 not the API that happens to name it.** The list blocks the snapshot path to a VM's
@@ -251,6 +256,13 @@ vary), so the hash alone can never be the check. If you touch the publisher,
 `plant_archive` in `test/test-policy-publish.sh` is the case that must keep
 failing.
 
+**Packer loads every `*.pkr.hcl` in a directory as one build.** A second
+template next to `image/dev-vm.pkr.hcl` redeclares its variables and
+`packer validate .` fails with "Duplicate variable" (reproduced 2026-11-20 by
+copying both templates into one directory). The Idlefy template lives in
+`image/hardened/`, and `test/test-hardened-template.sh` fails if a second
+`*.pkr.hcl` appears in either directory.
+
 ## Release
 
 Two tag streams, cut by `make release`, which refuses a dirty tree and a HEAD
@@ -259,7 +271,7 @@ that consumers cannot reach:
 | Stream | Publishes | Gates | Lockstep |
 |---|---|---|---|
 | `base-X.Y.Z` | `cinc/cookbooks/base/**` | `cookstyle`, `chefspec`, `test-broker`, `test-loki-token`, `test-share-helper`, `test-policy-fetch`, `test-fetch-sync` | `metadata.rb` must say `X.Y.Z`, byte for byte |
-| `vX.Y.Z` | `vms/modules/**` + `tenant-skeleton/**` + `image/**` | `boundary-check`, `test-skeleton-sync`, `test-fetch-sync`, `test-policy-publish`, `test-image-template`, `test-image-scrub`, `test-ami-build`, `smoke` | none — the module carries no version string |
+| `vX.Y.Z` | `vms/modules/**` + `tenant-skeleton/**` + `image/**` | `boundary-check`, `test-skeleton-sync`, `test-fetch-sync`, `test-policy-publish`, `test-image-template`, `test-hardened-template`, `test-hardened-build`, `test-hardened-guard`, `test-hardened-retire`, `test-image-scrub`, `test-ami-build`, `smoke` | none — the module carries no version string |
 
 ```bash
 make release TAG=base-1.0.0

@@ -1,0 +1,22 @@
+# Regions the Idlefy hardened image is published to, one per line. The first
+# line is the build region: the image is built there and copied to the rest.
+# These are the 17 commercial regions enabled by default. Adding an opt-in
+# region takes three steps: the owner enables it on the publishing account, a
+# line here, and the same line in the consumer's copy of this list.
+us-east-1
+us-east-2
+us-west-1
+us-west-2
+ca-central-1
+eu-central-1
+eu-west-1
+eu-west-2
+eu-west-3
+eu-north-1
+ap-south-1
+ap-northeast-1
+ap-northeast-2
+ap-northeast-3
+ap-southeast-1
+ap-southeast-2
+sa-east-1

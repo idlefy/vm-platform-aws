@@ -6,7 +6,9 @@ A second published policy, `solo`: one developer's box with an AI agent
 working as `ubuntu`, no fleet behind it — the run list for Idlefy's public
 image. Its inclusion rule is that nothing on the box takes instructions from
 Idlefy after launch, so it has no policy fetch, no credential broker, no
-Traefik, no Falco, no Alloy and no SSM agent. No `v` release.
+Traefik, no Falco, no Alloy and no SSM agent. `v2.2.0` builds that image and
+publishes it from Idlefy's account; design record:
+[Hardened image for AI agents](design/hardened-image.md).
 
 **`base-2.2.0`**
 
@@ -68,6 +70,56 @@ Traefik, no Falco, no Alloy and no SSM agent. No `v` release.
   aborted the converge before the DROP, it now lands after the root allow.
 - New gate: `make test-share-helper` (stubs `tailscale`; no tailnet needed),
   part of the `base` stream.
+
+**`v2.2.0`**
+
+- The solo bootstrap and scrub profile: `image/files/bootstrap-solo`
+  converges `base::solo` once in local mode, with its state on tmpfs, and
+  `dev-vm-image-scrub --profile solo` sources the new
+  `image/files/dev-vm-image-scrub-solo`, which purges CINC, swaps in the solo
+  lists (`test/fixtures/image-scrub-paths-solo`) and refuses the image — exit
+  70, no power-off — unless every baked invariant holds on disk. The fleet
+  profile is unchanged.
+- `image/hardened/`: the Packer template of Idlefy's public image
+  `idlefy-hardened-agent-ubuntu-24.04-amd64-YYYYMMDD-NN` — unencrypted, no
+  instance profile, a fixed security group, never connecting — and
+  `regions`, the 17 default-enabled regions it is copied to.
+- `scripts/hardened-image-build.sh`, the build driver: checks the account and
+  the tag — and that the checkout is exactly the tag, with no modified,
+  staged or untracked build input — stores the solo policy archive once as a
+  release asset and pins its sha256 in the user data, builds, and writes the
+  release record. The image's `Description` and the record say
+  `visibility=public` or `visibility=private`.
+- `scripts/hardened-guard-check.sh`: refuses to publish unless the account is
+  still safe to publish from (encryption by default off, public sharing
+  unblocked for a public build, SSM Default Host Management unset, quota
+  room, every principal but the publisher and service-linked roles
+  explicitly denied any change to a published image by the fence policy
+  itself, in every region, and no unencrypted snapshot or image outside the
+  published ones). A failing principal is reported in one line, with a hint
+  to apply the account's Terraform. A quota read that fails for any reason
+  but "no applied value" fails the guard.
+- `scripts/hardened-image-leftovers.sh` lists, read-only, any image of a
+  build's name in every listed region. The driver runs it when a build fails
+  or is signalled after `packer build` started, and the publish workflow runs
+  it after a failed, cancelled or timed-out build. The driver takes NN from
+  every listed region. The solo scrub checks `rules.v4` as it checks
+  `rules.v6`, and allows ahead of either metadata drop only root's and
+  Instance Connect's owner allows (an allowlist).
+- `scripts/hardened-image-retire.sh`: keeps the newest two public builds,
+  deprecates and deregisters older ones on a 7-day cadence, never
+  deregisters one of the two newest ever published (read from the image's
+  `Description`; a private build is retired by its own age), yanks one build
+  with `--disable`, and is a dry run unless `--apply`. It leaves a region
+  alone on anything it cannot read, and retries a snapshot still in use.
+- Two workflows: `publish-hardened-image` (dispatched on a `vX.Y.Z` tag, or
+  monthly on the newest one) and `retire-hardened-image` (dispatch only),
+  both behind the protected environment `hardened-publish`, with no token
+  permission at workflow level and only what each job needs.
+- Hardened image builds are recorded on each GitHub release as
+  `hardened-ami-<date>-<nn>.json` and in the release notes.
+- New gates in the `v` stream: `test-hardened-template`,
+  `test-hardened-build`, `test-hardened-guard`, `test-hardened-retire`.
 
 ## 2.1.0
 

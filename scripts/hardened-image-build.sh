@@ -1,0 +1,427 @@
+#!/usr/bin/env bash
+# hardened-image-build.sh — build and publish Idlefy's hardened image for AI
+# agents, idlefy-hardened-agent-ubuntu-24.04-amd64-YYYYMMDD-NN, from a platform
+# tag. Run by the release workflow; not a tenant tool. Design:
+# docs/design/hardened-image.md.
+#
+#   PLATFORM_TAG=vX.Y.Z PLATFORM_SHA=<40 hex> HARDENED_SECURITY_GROUP_ID=sg-… \
+#     scripts/hardened-image-build.sh
+#
+# Optional: HARDENED_PUBLIC (true|false, default true), HARDENED_ATTACHED_ORG_ID
+# (a UUID), HARDENED_INSTANCE_TYPE (default c7a.xlarge), HARDENED_SUBNET_ID,
+# HARDENED_OUT (default dist), GH_REPO (default idlefy/vm-platform-aws).
+# Test hooks, never set in a real build: HARDENED_SKIP_TAG_CHECK=1 (exactly 1)
+# skips the tag check and the clean-tree check with it; HARDENED_TODAY=YYYYMMDD replaces today's UTC date, and
+# is refused unless HARDENED_SKIP_TAG_CHECK=1 is set too — a forward-dated
+# name would stay the "newest" build for retention forever.
+#
+# What it does, refusing at the first thing that is not so:
+#   1. the tag names PLATFORM_SHA and the tree is that commit: HEAD, no
+#      modified or staged tracked file, no untracked file under image/,
+#      scripts/ or cinc/;
+#   2. image/hardened/regions parses (the first region is the build region);
+#   3. the committed solo lock is what solo.rb resolves to today;
+#   4. the lock's base-X.Y.Z tag exists on GitHub;
+#   5. the lock is exported as solo-<tag>.tgz and stored once as an asset of the
+#      tag's release — a stored asset whose contents differ is never used;
+#   6. the user data pins that asset's sha256 (law A1: the build instance has no
+#      instance profile and fetches nothing else of Idlefy's);
+#   7. Packer builds and copies the AMI to every region;
+#   8. the release record hardened-ami-YYYYMMDD-NN.json, naming every region,
+#      is uploaded to the release and its table appended to the release notes.
+# Before step 7 the chosen name is written to $HARDENED_OUT/hardened-ami-name;
+# a failure, INT or TERM from step 7 until the record is uploaded lists the
+# images of that name in every region (scripts/hardened-image-leftovers.sh).
+#
+# Talks to GitHub (gh) and AWS (EC2 through Packer, plus one DescribeImages).
+# Credentials come from the environment; nothing here prints one.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+IMG="$ROOT/image/hardened"
+FILES="$ROOT/image/files"
+POLICYFILE="$ROOT/cinc/policyfiles/solo.rb"
+LOCKFILE="$ROOT/cinc/policyfiles/solo.lock.json"
+OWNER_ID=995603458290
+VOLUME_GIB=20
+NAME_PREFIX=idlefy-hardened-agent-ubuntu-24.04-amd64
+
+die() { echo "✗ hardened-image-build: $*" >&2; exit 1; }
+
+# ---- 1. inputs -----------------------------------------------------------------
+for c in chef packer aws gh python3 gzip sha256sum git; do
+  command -v "$c" >/dev/null || die "$c is not on PATH"
+done
+PLATFORM_TAG="${PLATFORM_TAG:-}"
+PLATFORM_SHA="${PLATFORM_SHA:-}"
+HARDENED_SECURITY_GROUP_ID="${HARDENED_SECURITY_GROUP_ID:-}"
+HARDENED_PUBLIC="${HARDENED_PUBLIC:-true}"
+HARDENED_ATTACHED_ORG_ID="${HARDENED_ATTACHED_ORG_ID:-}"
+HARDENED_INSTANCE_TYPE="${HARDENED_INSTANCE_TYPE:-c7a.xlarge}"
+HARDENED_SUBNET_ID="${HARDENED_SUBNET_ID:-}"
+HARDENED_OUT="${HARDENED_OUT:-dist}"
+GH_REPO="${GH_REPO:-idlefy/vm-platform-aws}"
+
+[[ $PLATFORM_TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "PLATFORM_TAG='$PLATFORM_TAG' is not a vX.Y.Z tag"
+[[ $PLATFORM_SHA =~ ^[0-9a-f]{40}$ ]] || die "PLATFORM_SHA='$PLATFORM_SHA' is not a full commit SHA"
+[[ $HARDENED_SECURITY_GROUP_ID =~ ^sg-[0-9a-f]+$ ]] \
+  || die "HARDENED_SECURITY_GROUP_ID='$HARDENED_SECURITY_GROUP_ID' is not a security group id — set it to the build's fixed group"
+[[ $HARDENED_PUBLIC =~ ^(true|false)$ ]] || die "HARDENED_PUBLIC='$HARDENED_PUBLIC' must be true or false"
+[ -z "$HARDENED_ATTACHED_ORG_ID" ] \
+  || [[ $HARDENED_ATTACHED_ORG_ID =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
+  || die "HARDENED_ATTACHED_ORG_ID='$HARDENED_ATTACHED_ORG_ID' is not a lowercase UUID"
+[[ $HARDENED_INSTANCE_TYPE =~ ^[a-z0-9-]+\.[a-z0-9]+$ ]] || die "HARDENED_INSTANCE_TYPE='$HARDENED_INSTANCE_TYPE' is not an instance type"
+[ -z "$HARDENED_SUBNET_ID" ] || [[ $HARDENED_SUBNET_ID =~ ^subnet-[0-9a-f]+$ ]] \
+  || die "HARDENED_SUBNET_ID='$HARDENED_SUBNET_ID' is not a subnet id"
+[[ $GH_REPO =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "GH_REPO='$GH_REPO' is not owner/name"
+# Taken once: a build that crosses UTC midnight keeps the date it started on.
+if [ -n "${HARDENED_TODAY:-}" ] && [ "${HARDENED_SKIP_TAG_CHECK:-}" != 1 ]; then
+  die "HARDENED_TODAY is set without HARDENED_SKIP_TAG_CHECK=1 — both are test hooks, never set in a real build; unset HARDENED_TODAY"
+fi
+DATE="${HARDENED_TODAY:-$(date -u +%Y%m%d)}"
+[[ $DATE =~ ^[0-9]{8}$ ]] || die "HARDENED_TODAY='$DATE' is not YYYYMMDD (it is a test hook; unset it)"
+
+# The record says which commit built the image; it must be the one checked out.
+if [ "${HARDENED_SKIP_TAG_CHECK:-}" != 1 ]; then
+  tagged="$(git -C "$ROOT" rev-parse -q --verify "refs/tags/$PLATFORM_TAG^{commit}" 2>/dev/null)" \
+    || die "no tag $PLATFORM_TAG in this checkout — fetch tags, or check PLATFORM_TAG"
+  [ "$tagged" = "$PLATFORM_SHA" ] || die "$PLATFORM_TAG names ${tagged:0:12}, PLATFORM_SHA is ${PLATFORM_SHA:0:12} — pass the tag's commit"
+  [ "$(git -C "$ROOT" rev-parse HEAD)" = "$PLATFORM_SHA" ] \
+    || die "the checkout is not PLATFORM_SHA ${PLATFORM_SHA:0:12} — check out $PLATFORM_TAG and retry"
+  # HEAD alone is not the tree: a modified tracked file, a staged change or an
+  # untracked file the build reads (image/, scripts/, cinc/ — ignored ones
+  # included: an export packs them too) would go into the image while the
+  # record names the clean commit. dist/ is the build's output.
+  dirty="$(git -C "$ROOT" status --porcelain --untracked-files=no)" \
+    || die "git status failed in $ROOT"
+  [ -z "$dirty" ] || die "the working tree or index differs from $PLATFORM_TAG — commit or discard: $(printf '%s' "$dirty" | tr '\n' ' ')"
+  untracked="$(git -C "$ROOT" ls-files --others -- image scripts cinc)" \
+    || die "git ls-files failed in $ROOT"
+  [ -z "$untracked" ] || die "untracked files under image/, scripts/ or cinc/ would enter the build — remove them: $(printf '%s' "$untracked" | tr '\n' ' ')"
+fi
+
+TMPS=()
+# shellcheck disable=SC2317  # reached only through the traps below
+cleanup() { [ ${#TMPS[@]} -eq 0 ] || rm -rf "${TMPS[@]}"; }
+# INT and TERM only exit: the EXIT trap cleans up, and after `packer build`
+# starts it first lists what the build may have left behind.
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+# tmp VAR — a fresh 0600 file in VAR, removed on exit. Not $(…): a subshell
+# would lose the registration.
+tmp() { local f; f="$(mktemp)"; TMPS+=("$f"); printf -v "$1" '%s' "$f"; }
+W="$(mktemp -d)"; TMPS+=("$W")
+
+# ---- 2. regions ----------------------------------------------------------------
+# '#' lines and blank lines are comments; every other line is exactly a region.
+REGIONS_VARS="$(python3 -I - "$IMG/regions" <<'PY'
+import json, re, shlex, sys
+try:
+    lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+except OSError as e:
+    sys.exit("cannot read %s: %s" % (sys.argv[1], e.strerror))
+regions = []
+for n, line in enumerate(lines, 1):
+    if line.strip() == "" or line.lstrip().startswith("#"):
+        continue
+    if not re.fullmatch(r"[a-z]{2}-[a-z]+-[0-9]", line):
+        sys.exit("line %d is not a region: %r" % (n, line))
+    if line in regions:
+        sys.exit("line %d repeats %s" % (n, line))
+    regions.append(line)
+if not regions:
+    sys.exit("it lists no region")
+print("BUILD_REGION=%s" % shlex.quote(regions[0]))
+print("REGIONS=%s" % shlex.quote(" ".join(regions)))
+print("AMI_REGIONS=%s" % shlex.quote(json.dumps(regions, separators=(",", ":"))))
+PY
+)" || die "image/hardened/regions: see above — fix the file"
+eval "$REGIONS_VARS"
+
+# The image is published as Idlefy's: refuse any other account before anything
+# is created, here or on GitHub.
+ACCOUNT="$(aws sts get-caller-identity --region "$BUILD_REGION" --query Account --output text 2>"$W/sts.err")" \
+  || die "could not read the AWS account (aws sts get-caller-identity): $(tr '\n' ' ' < "$W/sts.err")— check the credentials in the environment"
+[ "$ACCOUNT" = "$OWNER_ID" ] \
+  || die "the AWS credentials are for account '$ACCOUNT', the image is published by $OWNER_ID — use the publishing account's credentials"
+
+# ---- 3. the lock is fresh --------------------------------------------------------
+# `chef install` honours an existing lock, so resolve a copy that has none.
+[ -f "$POLICYFILE" ] && [ -f "$LOCKFILE" ] || die "no cinc/policyfiles/solo.rb with its lock"
+read -r LOCK_REV COOKBOOK_VERSION < <(python3 -I -c '
+import json, re, sys
+d = json.load(open(sys.argv[1]))
+r, v = d["revision_id"], d["cookbook_locks"]["base"]["version"]
+assert d["name"] == "solo" and re.fullmatch(r"[0-9a-f]{64}", r) and re.fullmatch(r"\d+\.\d+\.\d+", v)
+print(r, v)' "$LOCKFILE" 2>/dev/null) \
+  || die "cannot read name, revision_id and cookbook_locks.base.version from cinc/policyfiles/solo.lock.json"
+mkdir -p "$W/cinc/cookbooks" "$W/cinc/policyfiles"
+cp -R "$ROOT/cinc/cookbooks/base" "$W/cinc/cookbooks/base"
+cp "$POLICYFILE" "$W/cinc/policyfiles/solo.rb"
+chef install "$W/cinc/policyfiles/solo.rb" > "$W/install.log" 2>&1 \
+  || { tail -20 "$W/install.log" >&2; die "chef install of a copy of solo.rb failed"; }
+FRESH_REV="$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["revision_id"])' \
+  "$W/cinc/policyfiles/solo.lock.json" 2>/dev/null)" || die "chef install wrote no readable lock"
+[ "$FRESH_REV" = "$LOCK_REV" ] \
+  || die "cinc/policyfiles/solo.lock.json is stale (${LOCK_REV:0:12}; solo.rb resolves to ${FRESH_REV:0:12}) — run 'cd cinc && make install', commit the lock, tag again"
+
+# ---- 4. the cookbook tag ---------------------------------------------------------
+BASE_TAG="base-$COOKBOOK_VERSION"
+gh api "repos/$GH_REPO/git/ref/tags/$BASE_TAG" >/dev/null 2>&1 \
+  || die "the lock says base $COOKBOOK_VERSION, but $GH_REPO has no tag $BASE_TAG — release it first (make release TAG=$BASE_TAG)"
+
+# ---- 5. the archive --------------------------------------------------------------
+ASSET="solo-$PLATFORM_TAG.tgz"
+chef export "$POLICYFILE" "$W/export" --archive > "$W/export.log" 2>&1 \
+  || { tail -20 "$W/export.log" >&2; die "chef export of cinc/policyfiles/solo.rb failed"; }
+[ -f "$W/export/solo-$LOCK_REV.tgz" ] || die "chef export wrote no solo-$LOCK_REV.tgz"
+cp "$W/export/solo-$LOCK_REV.tgz" "$W/$ASSET"
+
+gh release view -R "$GH_REPO" "$PLATFORM_TAG" >/dev/null 2>&1 \
+  || gh release create -R "$GH_REPO" "$PLATFORM_TAG" --verify-tag --title "$PLATFORM_TAG" --notes "" >/dev/null \
+  || die "could not create the release $PLATFORM_TAG — is the tag pushed?"
+
+# The same comparison as tree() in scripts/policy-publish.sh, duplicated: that
+# script ships byte-identical to tenants and cannot grow a mode for this one.
+# An export is not byte-reproducible (mtimes), so contents are compared — paths,
+# types, file hashes and link targets — read with tarfile, never extracted.
+same_tree() {
+  python3 -I - "$1" "$2" <<'PY'
+import hashlib, sys, tarfile
+def tree(path):
+    out = {}
+    with tarfile.open(path, "r:gz") as t:
+        for m in t:
+            name = m.name.removeprefix("./").rstrip("/")
+            if name in ("", "."):
+                continue
+            if name in out:
+                sys.exit(f"duplicate member {name}")
+            if m.isfile():
+                out[name] = "f" + hashlib.sha256(t.extractfile(m).read()).hexdigest()
+            elif m.isdir():
+                out[name] = "d"
+            elif m.issym():
+                out[name] = "l" + m.linkname
+            else:
+                sys.exit(f"unexpected member type: {name}")
+    return out
+sys.exit(0 if tree(sys.argv[1]) == tree(sys.argv[2]) else 1)
+PY
+}
+download() { gh release download -R "$GH_REPO" "$PLATFORM_TAG" --pattern "$ASSET" -O "$W/stored.tgz" >/dev/null 2>&1; }
+if download; then
+  same_tree "$W/stored.tgz" "$W/$ASSET" \
+    || die "the release asset $ASSET of $PLATFORM_TAG does not match what cinc/policyfiles/solo.lock.json exports; someone other than this script wrote it — investigate, delete it, and rerun"
+else
+  rm -f "$W/stored.tgz"
+  # No --clobber: if the asset exists after all, the upload fails, and nothing
+  # here ever replaces a stored asset.
+  gh release upload -R "$GH_REPO" "$PLATFORM_TAG" "$W/$ASSET" >/dev/null \
+    || die "could not upload $ASSET to the release $PLATFORM_TAG"
+  download || die "uploaded $ASSET but could not download it back"
+  cmp -s "$W/stored.tgz" "$W/$ASSET" || die "the $ASSET downloaded back is not the one uploaded"
+fi
+ARCHIVE_SHA256="$(sha256sum "$W/stored.tgz" | cut -d' ' -f1)"
+ARCHIVE_URL="https://github.com/$GH_REPO/releases/download/$PLATFORM_TAG/$ASSET"
+
+# ---- 6. the name -----------------------------------------------------------------
+# One past the highest NN in use today, not the count: a deregistered -01
+# next to a live -02 must not yield -02 again. Deprecated and disabled images
+# keep their names, so they are read too — in every region, since a copy left
+# behind by a failed build can hold a name the build region no longer has.
+NAMES=""
+for r in $REGIONS; do
+  n="$(aws ec2 describe-images --region "$r" --owners self --include-deprecated --include-disabled \
+        --filters "Name=name,Values=$NAME_PREFIX-$DATE-*" --query 'Images[].Name' --output text)" \
+    || die "could not list today's images in $r — check the credentials, and that the AWS CLI is v2 with --include-disabled"
+  NAMES="$NAMES $n"
+done
+NN="$(python3 -I - "$NAMES" "$NAME_PREFIX-$DATE" <<'PY'
+import re, sys
+names, prefix = sys.argv[1].split(), sys.argv[2]
+top = 0
+for n in names:
+    m = re.fullmatch(re.escape(prefix) + r"-([0-9]{2})", n)
+    if not m:
+        sys.exit("describe-images returned %r, which is not %s-NN" % (n, prefix))
+    top = max(top, int(m.group(1), 10))
+if top >= 99:
+    sys.exit("%s-99 is taken; NN has two digits — build tomorrow" % prefix)
+print("%02d" % (top + 1))
+PY
+)" || die "could not choose today's NN — see above"
+AMI_NAME="$NAME_PREFIX-$DATE-$NN"
+
+# ---- 7. the user data ------------------------------------------------------------
+# bootstrap-solo with its placeholders rendered, then both scrub files written
+# side by side (the scrub sources "$0-solo"), then the scrub as the last line.
+for f in dev-vm-image-scrub dev-vm-image-scrub-solo; do
+  ! grep -qx 'DEV_VM_IMAGE_SCRUB' "$FILES/$f" || die "image/files/$f contains its own heredoc terminator"
+  [ "$(tail -c1 "$FILES/$f" | od -An -c | tr -d ' ')" = '\n' ] || die "image/files/$f does not end in a newline"
+done
+tmp UD_PLAIN; tmp UD
+python3 -I - "$FILES/bootstrap-solo" "$ARCHIVE_URL" "$ARCHIVE_SHA256" "$UD_PLAIN" <<'PY' \
+  || die "image/files/bootstrap-solo did not render — fix the placeholders it names"
+import sys
+src, url, sha, out = sys.argv[1:]
+s = open(src, encoding="utf-8").read()
+if not s.startswith("#!/bin/bash\n"):
+    sys.exit("bootstrap-solo does not start with #!/bin/bash")
+for p, v in (("__ARCHIVE_URL__", url), ("__ARCHIVE_SHA256__", sha)):
+    if s.count(p) != 1:
+        sys.exit("bootstrap-solo holds %s %d times; it must hold it exactly once" % (p, s.count(p)))
+for p, v in (("__ARCHIVE_URL__", url), ("__ARCHIVE_SHA256__", sha)):
+    s = s.replace(p, v)
+if not s.endswith("\n"):
+    s += "\n"
+open(out, "w", encoding="utf-8").write(s)
+PY
+{
+  printf '\n# ---- image build: scrub and power off (appended by hardened-image-build.sh) ----\n'
+  for f in dev-vm-image-scrub dev-vm-image-scrub-solo; do
+    printf 'install -m 0755 -o root -g root /dev/null /usr/local/sbin/%s\n' "$f"
+    printf "cat > /usr/local/sbin/%s <<'DEV_VM_IMAGE_SCRUB'\n" "$f"
+    cat "$FILES/$f"
+    printf 'DEV_VM_IMAGE_SCRUB\n'
+  done
+  # The scrub deletes /var/log/user-data.log while this shell holds it open;
+  # its blocks would be freed untrimmed into the public snapshot.
+  printf 'exec >/dev/console 2>&1\n'
+  printf '/usr/local/sbin/dev-vm-image-scrub --profile solo %s\n' "$ARCHIVE_SHA256"
+} >> "$UD_PLAIN"
+left="$(grep -oE '__[A-Z0-9_]+__' "$UD_PLAIN" | sort -u | tr '\n' ' ')" || true
+[ -z "$left" ] || die "the user data still holds placeholders: $left— render them in this script"
+gzip -9 -n < "$UD_PLAIN" > "$UD"
+UD_SIZE="$(stat -c %s "$UD")"
+[ "$UD_SIZE" -le 16384 ] || die "user data is $UD_SIZE bytes gzipped; EC2 takes 16384"
+
+# ---- 8. build --------------------------------------------------------------------
+echo "Building $AMI_NAME ($PLATFORM_TAG, $BASE_TAG, archive ${ARCHIVE_SHA256:0:12}, public=$HARDENED_PUBLIC) in $BUILD_REGION for: $REGIONS"
+packer init "$IMG" >/dev/null \
+  || die "packer init failed — it needs network access to the plugin registry; run 'packer init image/hardened' by hand to see why"
+tmp PKLOG
+
+# From here until the record is on the release, a failure can leave images
+# named $AMI_NAME in some regions — possibly public — that no record names.
+# scripts/hardened-image-leftovers.sh lists them (read-only) on stderr; the
+# exit status stays the failure's own. INT and TERM only exit (see the traps
+# above), so the listing runs here, before cleanup. The name is also written
+# to $HARDENED_OUT/hardened-ami-name first: a runner that kills this script
+# outright (an Actions cancel or timeout) leaves the listing to the workflow.
+IMAGES_MAY_EXIST=1
+# shellcheck disable=SC2317  # reached only through the trap
+on_exit() {
+  local rc=$?
+  if [ "$rc" -ne 0 ] && [ "$IMAGES_MAY_EXIST" = 1 ]; then
+    echo >&2
+    "$ROOT/scripts/hardened-image-leftovers.sh" "$AMI_NAME" >&2 || true
+  fi
+  cleanup
+  exit "$rc"
+}
+trap on_exit EXIT
+mkdir -p "$HARDENED_OUT"
+printf '%s\n' "$AMI_NAME" > "$HARDENED_OUT/hardened-ami-name"
+
+# -machine-readable: the artifact line is the only reliable source of the AMI
+# ids. The ui lines are echoed as they come, so the operator sees progress.
+packer build -machine-readable \
+  -var "ami_name=$AMI_NAME" \
+  -var "build_region=$BUILD_REGION" \
+  -var "ami_regions=$AMI_REGIONS" \
+  -var "user_data_file=$UD" \
+  -var "instance_type=$HARDENED_INSTANCE_TYPE" \
+  -var "subnet_id=$HARDENED_SUBNET_ID" \
+  -var "security_group_id=$HARDENED_SECURITY_GROUP_ID" \
+  -var "public=$HARDENED_PUBLIC" \
+  -var "volume_size_gb=$VOLUME_GIB" \
+  -var "platform_tag=$PLATFORM_TAG" \
+  -var "platform_sha=$PLATFORM_SHA" \
+  -var "base_tag=$BASE_TAG" \
+  -var "archive_sha256=$ARCHIVE_SHA256" \
+  -var "attached_org_id=$HARDENED_ATTACHED_ORG_ID" \
+  "$IMG" \
+  | tee "$PKLOG" \
+  | awk -F, '$3 == "ui" { m = $5; for (i = 6; i <= NF; i++) m = m "," $i; gsub(/%!\(PACKER_COMMA\)/, ",", m); gsub(/\\n/, "\n", m); print m; fflush() }' \
+  || die "packer build failed — no record is written. A failure before the image was taken left its reason on the build instance's serial console; one during the copies may have left images (listed below)"
+
+# ---- 9. the record ---------------------------------------------------------------
+# "<region>:<ami>,<region>:<ami>", commas escaped as %!(PACKER_COMMA). Every
+# region of the file, and no other, or no record at all.
+ARTIFACT="$(awk -F, '$3 == "artifact" && $4 == "0" && $5 == "id" { print $6 }' "$PKLOG")"
+mkdir -p "$HARDENED_OUT"
+RECORD="$HARDENED_OUT/hardened-ami-$DATE-$NN.json"
+tmp RECORD_TMP; tmp NOTES_ADD
+python3 -I - "$ARTIFACT" "$RECORD_TMP" "$NOTES_ADD" "$REGIONS" "$AMI_NAME" "$OWNER_ID" "$HARDENED_PUBLIC" \
+  "$VOLUME_GIB" "$PLATFORM_TAG" "$PLATFORM_SHA" "$BASE_TAG" "$ARCHIVE_SHA256" "$ARCHIVE_URL" "$ASSET" \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(basename "$RECORD")" <<'PY' \
+  || die "packer built images, but its artifact does not name exactly the regions of image/hardened/regions — no record is written; the images are listed below"
+import json, re, sys
+(artifact, record, notes, regions, name, owner, public, volume, tag, sha, base_tag,
+ archive_sha, archive_url, asset, built_at, record_name) = sys.argv[1:]
+regions = regions.split()
+amis = {}
+for part in artifact.replace("%!(PACKER_COMMA)", ",").split(","):
+    m = re.fullmatch(r"([a-z0-9-]+):(ami-[0-9a-f]{8,17})", part)
+    if not m or m.group(1) in amis:
+        sys.exit("unexpected artifact entry %r" % part)
+    amis[m.group(1)] = m.group(2)
+missing = [r for r in regions if r not in amis]
+extra = sorted(set(amis) - set(regions))
+if missing or extra:
+    sys.exit("missing: %s; not in the file: %s" % (" ".join(missing) or "none", " ".join(extra) or "none"))
+d = {
+    "format": 1,
+    "image": "ubuntu-24.04-hardened",
+    "name": name,
+    "owner_id": owner,
+    "architecture": "x86_64",
+    "public": public == "true",
+    # The same string as ami_description in image/hardened/hardened.pkr.hcl;
+    # retention reads "ever published" from the image's copy of it.
+    "description": "Idlefy hardened image for AI agents; visibility=%s"
+                   % ("public" if public == "true" else "private"),
+    "root_volume_gib": int(volume),
+    "login_user": "ubuntu",
+    "platform_tag": tag,
+    "platform_sha": sha,
+    "base_tag": base_tag,
+    "archive_sha256": archive_sha,
+    "archive_url": archive_url,
+    "built_at": built_at,
+    "amis": amis,
+}
+open(record, "w", encoding="utf-8").write(json.dumps(d, sort_keys=True, indent=2) + "\n")
+rows = "".join("| %s | %s |\n" % (r, amis[r]) for r in regions)
+open(notes, "w", encoding="utf-8").write(
+    "\n### Hardened image %s\n\n" % name
+    + "- Owner %s, public: %s, %s, %d GiB root, login user %s\n"
+      % (owner, public, d["architecture"], d["root_volume_gib"], d["login_user"])
+    + "- Platform %s (%s), cookbook %s\n" % (tag, sha, base_tag)
+    + "- Policy archive [%s](%s), sha256 %s\n" % (asset, archive_url, archive_sha)
+    + "- Built %s; record %s\n\n" % (built_at, record_name)
+    + "| region | ami |\n|---|---|\n" + rows)
+PY
+chmod 0644 "$RECORD_TMP"
+mv "$RECORD_TMP" "$RECORD"
+gh release upload -R "$GH_REPO" "$PLATFORM_TAG" "$RECORD" >/dev/null \
+  || die "the AMIs exist but the record $RECORD was not uploaded — upload it to $PLATFORM_TAG by hand (gh release upload), or treat the images below as leftovers"
+# The record names the images now: a later failure leaves nothing unnamed,
+# and the workflow's leftovers step must not list recorded images either.
+IMAGES_MAY_EXIST=0
+rm -f "$HARDENED_OUT/hardened-ami-name"
+tmp NOTES
+gh release view -R "$GH_REPO" "$PLATFORM_TAG" --json body -q .body > "$NOTES" \
+  && cat "$NOTES_ADD" >> "$NOTES" \
+  && gh release edit -R "$GH_REPO" "$PLATFORM_TAG" --notes-file "$NOTES" >/dev/null \
+  || { cat "$NOTES_ADD" >&2; die "the record is uploaded but the release notes were not updated — append the section above to $PLATFORM_TAG's notes by hand"; }
+
+echo
+for r in $REGIONS; do
+  python3 -I -c 'import json,sys; print(sys.argv[2], json.load(open(sys.argv[1]))["amis"][sys.argv[2]])' "$RECORD" "$r"
+done
+echo
+echo "Record: $RECORD (uploaded to $PLATFORM_TAG)"

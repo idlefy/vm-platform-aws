@@ -5,7 +5,7 @@ METADATA := cinc/cookbooks/base/metadata.rb
 POLICYFILE  := cinc/policyfiles/dev-vm.rb
 LOCKFILE    := cinc/policyfiles/dev-vm.lock.json
 
-.PHONY: help release test-release-gate boundary-check test-boundary-check smoke pin-check test-pin-check test-skeleton-sync test-fetch-sync test-policy-publish test-image-template test-image-scrub test-ami-build
+.PHONY: help release test-release-gate boundary-check test-boundary-check smoke pin-check test-pin-check test-skeleton-sync test-fetch-sync test-policy-publish test-image-template test-image-scrub test-ami-build test-hardened-template test-hardened-build test-hardened-guard test-hardened-retire
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -31,6 +31,18 @@ test-pin-check: ## Test the pin gate (needs a local git remote only)
 
 test-image-template: ## packer fmt + validate on image/, no AWS
 	@./test/test-image-template.sh
+
+test-hardened-template: ## packer fmt + validate on image/hardened/, no AWS
+	@./test/test-hardened-template.sh
+
+test-hardened-build: ## Test the hardened image build driver against shimmed chef/gh/aws/packer, no AWS
+	@./test/test-hardened-build.sh
+
+test-hardened-guard: ## Test the publishing account guard against a shimmed aws, no AWS
+	@./test/test-hardened-guard.sh
+
+test-hardened-retire: ## Test hardened image retention against a shimmed aws, no AWS
+	@./test/test-hardened-retire.sh
 
 test-image-scrub: ## Test the image scrub script against a fixture root
 	@./test/test-image-scrub.sh
@@ -116,6 +128,10 @@ release: ## Gate and cut an artifact tag (usage: make release TAG=base-X.Y.Z | v
 	           && ./test/test-fetch-sync.sh \
 	           && ./test/test-policy-publish.sh \
 	           && ./test/test-image-template.sh \
+	           && ./test/test-hardened-template.sh \
+	           && ./test/test-hardened-build.sh \
+	           && ./test/test-hardened-guard.sh \
+	           && ./test/test-hardened-retire.sh \
 	           && ./test/test-image-scrub.sh \
 	           && ./test/test-ami-build.sh \
 	           && ./scripts/smoke.sh ;; \

@@ -11,6 +11,8 @@
 # the reverse.
 set -euo pipefail
 
+P=fleet
+if [ "${1:-}" = --profile ]; then P=${2:-}; shift $(( $# < 2 ? $# : 2 )); fi
 REV=${1:-}
 R=${DEV_VM_IMAGE_ROOT:-}
 STATE=${DEV_VM_POLICY_STATE:-$R/var/lib/dev-vm/policy}
@@ -24,6 +26,12 @@ log() {
 # Under set -e any other failure would end the script with nothing on the
 # console and the bootstrap's own ERR trap already cleared.
 trap 'log "internal error at line $LINENO; no image will be taken"' ERR
+# shellcheck disable=SC1090
+case $P in
+  fleet) ;;
+  solo) . "$0-solo" || { log "internal error: cannot read $0-solo; no image will be taken"; exit 70; } ;;
+  *) log "internal error: unknown profile '$P'"; exit 70 ;;
+esac
 
 [[ $REV =~ ^[0-9a-f]{64}$ ]] || { log "internal error: expected a revision id, got '$REV'"; exit 70; }
 
@@ -41,6 +49,7 @@ if [ "${result:-}" != ok ] || [ "${got:-}" != "$REV" ]; then
   exit 65
 fi
 
+[ $P = fleet ] || solo_dir
 echo "$REV" > "$R/etc/dev-vm/image-revision"
 chmod 0644 "$R/etc/dev-vm/image-revision"
 
@@ -158,6 +167,7 @@ EMPTY=(
   "/var/log/fail2ban.log" # the build's fail2ban log
   "/var/log/dmesg" # the build's boot messages
 )
+[ $P = fleet ] || solo_prep
 
 shopt -s nullglob dotglob
 for g in "${REMOVE[@]}"; do
@@ -174,6 +184,7 @@ for u in "${TIMERS[@]}" alloy; do
     exit 70
   fi
 done
+[ $P = fleet ] || solo_check
 
 cloud-init clean --logs --machine-id
 fstrim -av || true

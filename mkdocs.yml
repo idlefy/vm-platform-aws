@@ -58,5 +58,6 @@ nav:
       - Serverless policy delivery: design/serverless-policy-delivery.md
       - First external review: design/first-external-review.md
       - Prebuilt image: design/ami-image.md
+      - Hardened image for AI agents: design/hardened-image.md
   - Versioning: versioning.md
   - Changelog: changelog.md
