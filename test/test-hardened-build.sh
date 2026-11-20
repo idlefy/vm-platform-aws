@@ -12,7 +12,8 @@
 #           it; download returns $GH_STORED, else what was uploaded (other
 #           bytes when ${GH_DOWNLOAD_CORRUPT}), else fails;
 #           api …/git/ref/tags/<tag> fails when ${GH_BASE_TAG_MISSING}.
-#   aws     sts get-caller-identity prints ${AWS_ACCOUNT:-995603458290};
+#   aws     sts get-caller-identity prints ${AWS_ACCOUNT:-995603458290}, or
+#           fails with AWS's error text when ${STS_FAIL};
 #           describe-images … Images[].Name prints ${EXISTING_NAMES} tab-separated.
 #   packer  build copies the user data and reports an AMI for each region in
 #           ${ARTIFACT_REGIONS:-every region of ami_regions}; exits ${PACKER_RC:-0}.
@@ -103,7 +104,9 @@ cat > "$T/bin/aws" <<'SH'
 echo "aws $*" >> "$AWS_LOG"
 echo "aws $1 $2" >> "$ORDER_LOG"
 case "$1 $2" in
-  "sts get-caller-identity") echo "${AWS_ACCOUNT:-995603458290}" ;;
+  "sts get-caller-identity")
+    if [ -n "${STS_FAIL:-}" ]; then echo "An error occurred (ExpiredToken) when calling the GetCallerIdentity operation: expired" >&2; exit 254; fi
+    echo "${AWS_ACCOUNT:-995603458290}" ;;
   "ec2 describe-images") printf '%s\n' "$(printf '%s\t' ${EXISTING_NAMES:-} | sed 's/\t$//')" ;;
   *) exit 9 ;;
 esac
@@ -240,7 +243,7 @@ check "the same-day count sees disabled and deprecated images, of this owner, in
      && grep -q -- '--include-deprecated' "$T/aws.log" && grep -q -- '--include-disabled' "$T/aws.log" \
      && grep -qF "Values=idlefy-hardened-agent-ubuntu-24.04-amd64-$DATE-*" "$T/aws.log"; echo $?)"
 check "the account is checked before anything is created" \
-  "$(grep -qx 'aws sts get-caller-identity --query Account --output text' "$T/aws.log" \
+  "$(grep -qx 'aws sts get-caller-identity --region us-east-1 --query Account --output text' "$T/aws.log" \
      && a=$(grep -n '^aws sts' "$T/order.log" | cut -d: -f1) && c=$(grep -n '^gh release create' "$T/order.log" | cut -d: -f1) \
      && [ -n "$a" ] && [ -n "$c" ] && [ "$a" -lt "$c" ]; echo $?)"
 check "the user data temp file is gone" "$(f=$(grep '^user_data_file=' "$T/packer.log" | cut -d= -f2); [ -n "$f" ] && [ ! -e "$f" ]; echo $?)"
@@ -306,6 +309,18 @@ AWS_ACCOUNT=111122223333 run_build
 check "exits non-zero, names both accounts" "$([ $? -ne 0 ] && grep -q 111122223333 "$T/stderr" && grep -q 995603458290 "$T/stderr"; echo $?)"
 check "...no release create or upload, no packer" "$(! grep -q 'release create\|release upload' "$T/gh.log" && [ ! -s "$T/packer.log" ]; echo $?)"
 
+echo "== an unreadable AWS account refuses with AWS's own words =="
+STS_FAIL=1 run_build
+check "exits non-zero, says why, nothing created" \
+  "$([ $? -ne 0 ] && grep -q 'ExpiredToken' "$T/stderr" && ! grep -q 'release create\|release upload' "$T/gh.log" && [ ! -s "$T/packer.log" ]; echo $?)"
+
+echo "== HARDENED_TODAY is a test hook: refused without HARDENED_SKIP_TAG_CHECK=1 =="
+SKIP_TAG= run_build
+check "refuses before chef, naming both hooks" \
+  "$([ $? -ne 0 ] && grep -q HARDENED_TODAY "$T/stderr" && grep -q HARDENED_SKIP_TAG_CHECK "$T/stderr" && [ ! -s "$T/chef.log" ] && [ ! -s "$T/aws.log" ]; echo $?)"
+SKIP_TAG=yes run_build
+check "...and with any value of the other hook but 1" "$([ $? -ne 0 ] && grep -q HARDENED_SKIP_TAG_CHECK "$T/stderr"; echo $?)"
+
 echo "== an asset that downloads back different refuses =="
 GH_DOWNLOAD_CORRUPT=1 run_build
 check "exits non-zero, packer never runs" "$([ $? -ne 0 ] && grep -q 'solo-v2.2.0.tgz' "$T/stderr" && [ ! -s "$T/packer.log" ]; echo $?)"
@@ -352,11 +367,12 @@ ORG=not-a-uuid run_build; refuses_early $? "a malformed attached org refuses" HA
 echo "== the tag must name PLATFORM_SHA, and the tree must be it =="
 git -C "$R" init -q && git -C "$R" add -A && git -C "$R" -c user.name=t -c user.email=t@t commit -qm t && git -C "$R" tag v2.2.0
 HEAD_SHA=$(git -C "$R" rev-parse HEAD)
-SKIP_TAG= PLATFORM_SHA=$HEAD_SHA run_build; check "the tag's commit, checked out → builds" "$?"
-SKIP_TAG= run_build; refuses_early $? "a PLATFORM_SHA the tag does not name refuses" PLATFORM_SHA
-SKIP_TAG=false run_build; refuses_early $? "HARDENED_SKIP_TAG_CHECK=false still checks the tag" PLATFORM_SHA
-SKIP_TAG=yes run_build; refuses_early $? "...and so does any value but 1" PLATFORM_SHA
-SKIP_TAG= PLATFORM_TAG=v2.2.1 PLATFORM_SHA=$HEAD_SHA run_build; refuses_early $? "a tag that does not exist refuses" v2.2.1
+# A real build: no HARDENED_TODAY (it is refused without the skip hook).
+NO_TODAY=1 SKIP_TAG= PLATFORM_SHA=$HEAD_SHA run_build; check "the tag's commit, checked out → builds" "$?"
+NO_TODAY=1 SKIP_TAG= run_build; refuses_early $? "a PLATFORM_SHA the tag does not name refuses" PLATFORM_SHA
+NO_TODAY=1 SKIP_TAG=false run_build; refuses_early $? "HARDENED_SKIP_TAG_CHECK=false still checks the tag" PLATFORM_SHA
+NO_TODAY=1 SKIP_TAG=yes run_build; refuses_early $? "...and so does any value but 1" PLATFORM_SHA
+NO_TODAY=1 SKIP_TAG= PLATFORM_TAG=v2.2.1 PLATFORM_SHA=$HEAD_SHA run_build; refuses_early $? "a tag that does not exist refuses" v2.2.1
 rm -rf "$R/.git"
 
 echo "== the user data is checked before packer runs =="

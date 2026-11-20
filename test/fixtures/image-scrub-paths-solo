@@ -47,7 +47,7 @@ remove /var/cache/tailscale                                  # tailscaled cache
 
 # --- the converge itself: nothing may act on the image after launch (law A1) -----
 remove /var/lib/dev-vm/policy/*   # never created in solo; defensive (a glob, so the test's build_root can still seed the status file there)
-remove /opt/cinc                  # dpkg --purge cinc leaves nothing here; defensive
+remove /opt/cinc                  # apt-get purge cinc leaves nothing here; defensive
 remove /etc/cinc                  # cinc-client's config dir, if the purge leaves it
 remove /root/.chef                # cinc-client's per-user state
 

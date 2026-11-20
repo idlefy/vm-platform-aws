@@ -2,7 +2,7 @@
 set -euo pipefail
 ARCHIVE_URL='__ARCHIVE_URL__'
 ARCHIVE_SHA256='__ARCHIVE_SHA256__'
-# The build-time user data of Idlefy's hardened public image (docs/design/ami-image.md).
+# The build-time user data of Idlefy's hardened public image (docs/design/hardened-image.md).
 # Packer renders the two placeholders above — the solo Policyfile export
 # archive and its sha256 — and appends the scrub as the last line:
 #   /usr/local/sbin/dev-vm-image-scrub --profile solo <sha256>

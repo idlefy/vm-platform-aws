@@ -1,6 +1,6 @@
-# shellcheck shell=bash disable=SC2154,SC2034 # R comes from, and STATE/REMOVE/EMPTY go to, dev-vm-image-scrub
+# shellcheck shell=bash disable=SC2154 # R comes from dev-vm-image-scrub
 # The solo profile of dev-vm-image-scrub: Idlefy's hardened public image,
-# converged once by image/files/bootstrap-solo (docs/design/ami-image.md).
+# converged once by image/files/bootstrap-solo (docs/design/hardened-image.md).
 #
 # SOURCED, never executed: `dev-vm-image-scrub --profile solo <sha256>` reads
 # this file from its own directory and calls the three hooks below. It lives
@@ -16,6 +16,7 @@
 # there, and test/test-image-scrub.sh fails if the two drift.
 
 # bootstrap-solo keeps the converge's state on tmpfs, off the disk.
+# shellcheck disable=SC2034 # read by dev-vm-image-scrub
 STATE=${DEV_VM_POLICY_STATE:-/run/dev-vm/solo}
 
 REMOVE_SOLO=(
@@ -42,7 +43,7 @@ REMOVE_SOLO=(
   "/var/lib/tailscale/*" # tailscaled node state and logs
   "/var/cache/tailscale" # tailscaled cache
   "/var/lib/dev-vm/policy/*" # never created in solo; defensive
-  "/opt/cinc" # dpkg --purge cinc leaves nothing here; defensive
+  "/opt/cinc" # apt-get purge cinc leaves nothing here; defensive
   "/etc/cinc" # cinc-client's config dir, if the purge leaves it
   "/root/.chef" # cinc-client's per-user state
   "/var/log/journal/*" # the build's journal
@@ -96,14 +97,21 @@ solo_prep() {
   DEBIAN_FRONTEND=noninteractive apt-get purge -y -o DPkg::Lock::Timeout=300 cinc \
     || refuse "cinc purge failed"
   [ ! -e "$R/opt/cinc/bin/cinc-client" ] || refuse "cinc still installed (/opt/cinc/bin/cinc-client is on disk)"
+  # shellcheck disable=SC2034 # read by dev-vm-image-scrub
   REMOVE=("${REMOVE_SOLO[@]}")
+  # shellcheck disable=SC2034 # read by dev-vm-image-scrub
   EMPTY=("${EMPTY_SOLO[@]}")
 }
 
-# filter_has ERE: a line of rules.v6's *filter table matches.
+# filter_has ERE: a line of rules.v6's *filter table matches, and that table
+# is closed by its COMMIT — ip6tables-restore applies no table it never sees
+# committed, so a truncated file counts as no match.
 filter_has() {
-  awk -v re="$1" '/^\*/ { t = $0 } /^COMMIT$/ { t = "" } t == "*filter" && $0 ~ re { f = 1 } END { exit !f }' \
-    "$R/etc/iptables/rules.v6" 2>/dev/null
+  awk -v re="$1" '
+    /^\*/       { t = $0; m = 0 }
+    t == "*filter" && $0 ~ re { m = 1 }
+    /^COMMIT$/  { if (t == "*filter" && m) f = 1; t = ""; m = 0 }
+    END         { exit !f }' "$R/etc/iptables/rules.v6" 2>/dev/null
 }
 
 # Hook 3, immediately before cloud-init clean, on the disk Packer is about to
@@ -111,7 +119,7 @@ filter_has() {
 # since a test's fake root cannot be chowned.
 solo_check() {
   local f g grp st mode own
-  local h=/usr/local/sbin/idlefy-share v6="$R/etc/iptables/rules.v6"
+  local h=/usr/local/sbin/idlefy-share
   # 1. The oneshot that strips cloud-init's re-grants to ubuntu on first boot.
   #    Enabled on the disk: `enabled-runtime` lives in /run, not in the image.
   systemctl is-enabled --quiet idlefy-hardened-firstboot.service \

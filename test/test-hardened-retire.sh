@@ -55,7 +55,8 @@ chmod +x "$T/bin/aws"
 # ID:AGE_DAYS:PUBLIC[:DEPRECATED_DAYS_AGO[:NAME[:STATE]]]. DEPRECATED empty
 # means what AWS does: a public image is deprecated 730 days after its creation
 # (so its DeprecationTime is in the future), a private one has none; "none" means
-# no DeprecationTime at all; a negative value is a deprecation still ahead. The
+# no DeprecationTime at all; a negative value is a deprecation still ahead;
+# a value ending in s is in seconds ago (-600s = 600 s ahead). The
 # name defaults to the build date's, NN 01; STATE defaults to available, and
 # "disabled" also makes the image private; the snapshot is snap-<the id's hex>.
 imgs() {
@@ -79,6 +80,8 @@ for spec in sys.argv[3:]:
                                    "Ebs": {"SnapshotId": "snap-" + iid.split("-", 1)[1], "VolumeSize": 20}}]}
     if dep == "" and public:
         im["DeprecationTime"] = iso(created + 730 * 86400)
+    elif dep.endswith("s"):
+        im["DeprecationTime"] = iso(now - int(dep[:-1]))
     elif dep not in ("", "none"):
         im["DeprecationTime"] = iso(now - int(float(dep) * 86400))
     out.append(im)
@@ -166,6 +169,19 @@ check "scheduled within 10 minutes (an earlier run's): waits, no call" \
   "$(! grep -qF -- '--region us-east-1' "$T/mut.log" && grep -F 'ami-0a3' "$T/stdout" | grep -qF 'deprecation pending'; echo $?)"
 check "scheduled 2 years ahead on a superseded build: deprecated now" \
   "$(grep -qxF "enable-image-deprecation --region eu-west-1 --image-id ami-0b3 --deprecate-at $DEPRECATE_AT --output json" "$T/mut.log" && [ "$(mut)" = 1 ]; echo $?)"
+echo "== the pending window: AWS rounds --deprecate-at up to the minute =="
+IMAGES_us_east_1=$(imgs ami-0a1:10:true ami-0a2:40:true ami-0a3:70:true:-600s)
+IMAGES_eu_west_1=$(imgs ami-0b1:10:true ami-0b2:40:true ami-0b3:70:true:-661s)
+run_retire --apply; check "exit 0" "$?"
+check "exactly +600 s (as this script sets it): pending, no call" \
+  "$(! grep -qF -- '--region us-east-1' "$T/mut.log" && grep -F 'ami-0a3' "$T/stdout" | grep -qF 'deprecation pending'; echo $?)"
+check "+661 s: not ours, deprecated now" \
+  "$(grep -qxF "enable-image-deprecation --region eu-west-1 --image-id ami-0b3 --deprecate-at $DEPRECATE_AT --output json" "$T/mut.log" && [ "$(mut)" = 1 ]; echo $?)"
+IMAGES_us_east_1=$(imgs ami-0a1:10:true ami-0a2:40:true ami-0a3:70:true:-659s)
+IMAGES_eu_west_1=""
+run_retire --apply; check "exit 0" "$?"
+check "+659 s (600 s rounded up to the minute): still pending" \
+  "$([ "$(mut)" = 0 ] && grep -F 'ami-0a3' "$T/stdout" | grep -qF 'deprecation pending'; echo $?)"
 IMAGES_us_east_1=$(imgs ami-0a1:10:true:none ami-0a2:40:true:none ami-0a3:70:true:none)
 IMAGES_eu_west_1=""
 run_retire; check "no DeprecationTime at all: the third would be deprecated" \

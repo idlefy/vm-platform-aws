@@ -22,10 +22,18 @@
 #       service-linked roles is explicitly denied every mutation of an image or
 #       snapshot tagged IdlefyPublishedImage=true (IAM policy simulation). Roles
 #       under /aws-reserved/ (Identity Center) cannot be simulated usefully
-#       here and are listed for a manual check.
+#       here and are listed for a manual check;
+#   G4  every region of image/hardened/regions holds no unencrypted snapshot
+#       and no image with an unencrypted snapshot that this account owns and
+#       that is not tagged IdlefyPublishedImage=true. The publisher role can
+#       copy images inside the account, and an unencrypted private disk is
+#       the only thing a compromised run could make public; while none
+#       exists, nothing can leak. Each offender is named with its region.
 #
 # The consumer's pinned AMI ids are the trust anchor; this deny is hygiene, and
 # this guard refuses a publish when it has regressed. Prints no secret.
+# A read that is denied or unreadable is a failure, never a pass.
+# Design: docs/design/hardened-image.md.
 
 set -euo pipefail
 export AWS_PAGER=""
@@ -262,6 +270,51 @@ PY
     fail "iam list-roles / list-users returned something unreadable"
   fi
 fi
+echo
+
+# ---- G4 no other unencrypted disk ---------------------------------------------------
+# strays SNAPS IMAGES — one "snapshot <id>" / "image <id>" line per self-owned
+# unencrypted disk without the fence tag; exit 1 on an answer it cannot read.
+strays() {
+  python3 -I - "$1" "$2" "$FENCE_KEY" <<'PY'
+import json, sys
+fence = sys.argv[3]
+def fenced(o):
+    return any(isinstance(t, dict) and t.get("Key") == fence and t.get("Value") == "true"
+               for t in (o.get("Tags") or []))
+try:
+    snaps = json.load(open(sys.argv[1]))["Snapshots"]
+    images = json.load(open(sys.argv[2]))["Images"]
+    for s in snaps:
+        if not isinstance(s["Encrypted"], bool):
+            raise TypeError
+        if not s["Encrypted"] and not fenced(s):
+            print("snapshot", s["SnapshotId"])
+    for i in images:
+        plain = [m["Ebs"]["Encrypted"] is False for m in i.get("BlockDeviceMappings") or [] if "Ebs" in m]
+        if any(plain) and not fenced(i):
+            print("image", i["ImageId"])
+except (OSError, ValueError, KeyError, TypeError):
+    sys.exit(1)
+PY
+}
+printf '%-16s %s
+' REGION UNENCRYPTED-UNFENCED
+for r in $REGIONS; do
+  col="?"
+  if awscall "$W/snaps.json" "$r: ec2 describe-snapshots (unencrypted, this account)"        ec2 describe-snapshots --region "$r" --owner-ids self --filters Name=encrypted,Values=false      && awscall "$W/own.json" "$r: ec2 describe-images (this account)"        ec2 describe-images --region "$r" --owners self --include-deprecated --include-disabled; then
+    if strays "$W/snaps.json" "$W/own.json" > "$W/strays"; then
+      col=$(wc -l < "$W/strays")
+      while read -r kind id; do
+        fail "$r: $kind $id is unencrypted and not tagged $FENCE_KEY=true — a compromised run could make it public; encrypt or delete it"
+      done < "$W/strays"
+    else
+      fail "$r: describe-snapshots / describe-images returned something unreadable"
+    fi
+  fi
+  printf '%-16s %s
+' "$r" "$col"
+done
 echo
 
 # ---- verdict -----------------------------------------------------------------------

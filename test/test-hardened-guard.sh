@@ -9,6 +9,11 @@
 #   service-quotas get-service-quota        ${QUOTA:-5}; fails when $QUOTA_APPLIED_MISSING
 #   service-quotas get-aws-default-service-quota  ${DEFAULT_QUOTA:-5}
 #   ec2 describe-images (public, self)      ${PUBLIC_COUNT:-1} images
+#   ec2 describe-images (self, all)         $SELF_IMAGES_<region, dashes as
+#                                           underscores>, else one published
+#                                           (fenced) unencrypted image
+#   ec2 describe-snapshots                  $SNAPS_<region>, else one published
+#                                           (fenced) unencrypted snapshot
 #   iam list-roles / list-users             the CI role, a service-linked role,
 #                                           an Identity Center role,
 #                                           github-cfn-publish; user aleksei
@@ -64,7 +69,19 @@ case "$1 $2" in
     printf '{"Quota": {"QuotaCode": "L-0E3CBAB9", "Value": %s.0}}\n' "${QUOTA:-5}" ;;
   "service-quotas get-aws-default-service-quota")
     printf '{"Quota": {"QuotaCode": "L-0E3CBAB9", "Value": %s.0}}\n' "${DEFAULT_QUOTA:-5}" ;;
+  "ec2 describe-snapshots")
+    var="SNAPS_${region//-/_}"
+    v="${!var:-}"
+    [ -n "$v" ] || v='{"Snapshots": [{"SnapshotId": "snap-0pub", "Encrypted": false, "Tags": [{"Key": "IdlefyPublishedImage", "Value": "true"}]}]}'
+    printf '%s\n' "$v" ;;
   "ec2 describe-images")
+    if [[ " $* " != *is-public* ]]; then
+      var="SELF_IMAGES_${region//-/_}"
+      v="${!var:-}"
+      [ -n "$v" ] || v='{"Images": [{"ImageId": "ami-0pub", "Tags": [{"Key": "IdlefyPublishedImage", "Value": "true"}], "BlockDeviceMappings": [{"DeviceName": "/dev/sda1", "Ebs": {"SnapshotId": "snap-0pub", "Encrypted": false}}]}]}'
+      printf '%s\n' "$v"
+      exit 0
+    fi
     python3 -I -c 'import json, sys
 n = int(sys.argv[1])
 print(json.dumps({"Images": [{"ImageId": "ami-%017x" % i, "Public": True} for i in range(n)]}))' "${PUBLIC_COUNT:-1}" ;;
@@ -203,6 +220,32 @@ check "names the principal" "$(grep -qF "user/aleksei" "$T/stderr"; echo $?)"
 FAIL_CALL="iam:list-users" run_guard; check "an unreadable user list → exit 1" "$([ $? -eq 1 ]; echo $?)"
 FAIL_CALL="sts:get-caller-identity" run_guard; check "no identity → exit 1, nothing else called" \
   "$([ $? -eq 1 ] && [ "$(wc -l < "$T/aws.log")" = 1 ]; echo $?)"
+
+echo "== G4: no unencrypted disk outside the fence =="
+run_guard; check "the published (fenced) snapshot and image pass" "$?"
+check "  …asked for this account's unencrypted snapshots in every region" \
+  "$([ "$(grep -cF -- 'ec2 describe-snapshots --region' "$T/aws.log")" = 2 ] \
+     && grep -qF -- 'ec2 describe-snapshots --region eu-central-1 --owner-ids self --filters Name=encrypted,Values=false' "$T/aws.log"; echo $?)"
+check "  …and for all of this account's images, disabled and deprecated included" \
+  "$(grep -qF -- 'ec2 describe-images --region us-east-1 --owners self --include-deprecated --include-disabled --output json' "$T/aws.log"; echo $?)"
+SNAPS_eu_central_1='{"Snapshots": [{"SnapshotId": "snap-0stray", "Encrypted": false, "Tags": [{"Key": "Name", "Value": "x"}]}]}' run_guard
+check "a stray unencrypted untagged snapshot in one region → exit 1, named with its region" \
+  "$([ $? -eq 1 ] && grep -q 'eu-central-1: snapshot snap-0stray is unencrypted' "$T/stderr" && ! grep -q 'us-east-1: snapshot' "$T/stderr"; echo $?)"
+SNAPS_us_east_1='{"Snapshots": [{"SnapshotId": "snap-0wrong", "Encrypted": false, "Tags": [{"Key": "IdlefyPublishedImage", "Value": "false"}]}]}' run_guard
+check "the fence tag with another value is no fence → exit 1" "$([ $? -eq 1 ] && grep -q 'snap-0wrong' "$T/stderr"; echo $?)"
+SNAPS_us_east_1='{"Snapshots": [{"SnapshotId": "snap-0enc", "Encrypted": true}]}' run_guard
+check "an encrypted untagged snapshot passes" "$?"
+SELF_IMAGES_us_east_1='{"Images": [{"ImageId": "ami-0stray", "Tags": [], "BlockDeviceMappings": [{"DeviceName": "/dev/sda1", "Ebs": {"SnapshotId": "snap-0x", "Encrypted": false}}]}]}' run_guard
+check "an untagged image with an unencrypted snapshot → exit 1, named" \
+  "$([ $? -eq 1 ] && grep -q 'us-east-1: image ami-0stray is unencrypted' "$T/stderr"; echo $?)"
+SELF_IMAGES_us_east_1='{"Images": [{"ImageId": "ami-0enc", "BlockDeviceMappings": [{"DeviceName": "/dev/sda1", "Ebs": {"SnapshotId": "snap-0y", "Encrypted": true}}]}]}' run_guard
+check "an untagged encrypted image passes" "$?"
+FAIL_CALL="ec2:describe-snapshots" run_guard
+check "describe-snapshots denied → exit 1, listed per region" \
+  "$([ $? -eq 1 ] && grep -q 'us-east-1: ec2 describe-snapshots.*the call failed: An error occurred (AccessDenied)' "$T/stderr" \
+     && grep -q 'eu-central-1: ec2 describe-snapshots' "$T/stderr"; echo $?)"
+SNAPS_us_east_1='{"Snapshots": [{"SnapshotId": "snap-0q"}]}' run_guard
+check "an answer without Encrypted is unreadable → exit 1" "$([ $? -eq 1 ] && grep -q 'us-east-1: describe-snapshots / describe-images returned something unreadable' "$T/stderr"; echo $?)"
 
 echo "== the CI role =="
 NO_CI_ROLE=1 run_guard; check "unset → exit 1 before any aws call" "$([ $? -ne 0 ] && [ ! -s "$T/aws.log" ]; echo $?)"

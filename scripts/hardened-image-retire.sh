@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # hardened-image-retire.sh — retire old builds of Idlefy's hardened image, or
 # yank one. Run by hand through the retire workflow; not a tenant tool. Design:
-# docs/design/ami-image.md.
+# docs/design/hardened-image.md.
 #
 # Every region of image/hardened/regions is read on its own; a problem in one
 # region stops that region and no other.
@@ -33,8 +33,9 @@ of this account tagged $FENCE_KEY=true and named $NAME_PREFIX-YYYYMMDD-NN:
              future date is not a deprecation;
   deprecate  any other public build once the newest is 7 days old, and a
              private build once it is itself 7 days old (deprecation is set
-             10 minutes ahead: AWS refuses a time in the past; a date already
-             within those 10 minutes is a pending deprecation and is left be);
+             10 minutes ahead: AWS refuses a time in the past; a date within
+             the next 11 minutes — AWS rounds it up to the minute — is a
+             pending deprecation and is left be);
   deregister a build deprecated 7 days ago or more, or disabled and created 7
              days ago or more and not one of the two newest builds — then
              delete its snapshots.
@@ -132,7 +133,9 @@ import calendar, json, re, sys, time
 path, now, prefix, target, disable = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5] == "1"
 DAY = 86400
 GRACE = 7 * DAY
-PENDING = 600  # how far ahead this script sets a deprecation
+# This script sets a deprecation 600 s ahead and AWS rounds --deprecate-at up
+# to the next minute, so an earlier run's date can lie up to 659 s ahead.
+PENDING = 660
 NAME = re.compile(re.escape(prefix) + r"-[0-9]{8}-[0-9]{2}")
 STAMP = re.compile(r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(\.[0-9]+)?Z")
 
@@ -216,7 +219,7 @@ for i in images:
 
 # A DeprecationTime is not a deprecation until it has passed: AWS gives every
 # public image one, two years after its creation. Ours, set by an earlier run,
-# lies within the next 10 minutes.
+# lies within the next PENDING seconds.
 def past(b):
     return b["deprecated"] is not None and b["deprecated"] <= now
 
@@ -261,11 +264,11 @@ for b in builds:
         else:
             says.append("%s waits: deprecated %s ago; deregistered once 7 days have passed" % (b["id"], days(since)))
     elif pending(b):
-        says.append("%s waits: deprecation pending (scheduled within 10 minutes)" % b["id"])
+        says.append("%s waits: deprecation pending (scheduled within 11 minutes)" % b["id"])
     elif b["public"]:
-        if not keep:
-            says.append("%s waits: there is no current public build" % b["id"])
-        elif current_age >= GRACE:
+        # Public, live and not kept: two newer live public builds exist, so
+        # keep[0] and current_age are set.
+        if current_age >= GRACE:
             deprecations.append((b, "superseded; the current build %s is %s old" % (keep[0]["id"], days(current_age))))
         else:
             says.append("%s waits: the current build is %s old; older builds are deprecated once it is 7 days old"

@@ -271,6 +271,9 @@ solo_refuses "rules.v6 without the IMDS drop" "rules.v6" "printf '%s\n' '*filter
 solo_refuses "INPUT DROP only in *mangle"   "rules.v6" "printf '%s\n' '*mangle' ':INPUT DROP [0:0]' 'COMMIT' '*filter' ':INPUT ACCEPT [0:0]' '-A OUTPUT -d fd00:ec2::254/128 -j DROP' 'COMMIT' > etc/iptables/rules.v6"
 solo_refuses "IMDS drop in another chain"   "rules.v6" "printf '%s\n' '*filter' ':INPUT DROP [0:0]' '-A FORWARD -d fd00:ec2::254/128 -j DROP' 'COMMIT' > etc/iptables/rules.v6"
 solo_refuses "IMDS drop only in *mangle"    "rules.v6" "printf '%s\n' '*mangle' '-A OUTPUT -d fd00:ec2::254/128 -j DROP' 'COMMIT' '*filter' ':INPUT DROP [0:0]' 'COMMIT' > etc/iptables/rules.v6"
+# Both lines present, but the file stops before *filter's COMMIT (truncated):
+# ip6tables-restore would apply nothing of that table.
+solo_refuses "rules.v6 truncated before COMMIT" "rules.v6" "printf '%s\n' '*filter' ':INPUT DROP [0:0]' '-A OUTPUT -d fd00:ec2::254/128 -j DROP' > etc/iptables/rules.v6"
 solo_refuses "SSM snap still installed"     "amazon-ssm-agent"   ":" SHIM_SSM_SNAP_PRESENT=1
 # snap list fails when snapd is unreachable; the disk still tells.
 solo_refuses "SSM snap mounted though snap list fails" "amazon-ssm-agent" "mkdir -p snap/amazon-ssm-agent/current"

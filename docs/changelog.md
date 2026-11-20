@@ -89,8 +89,9 @@ publishes it from Idlefy's account; design record:
   its sha256 in the user data, builds, and writes the release record.
 - `scripts/hardened-guard-check.sh`: refuses to publish unless the account is
   still safe to publish from (encryption by default off, public sharing
-  unblocked, SSM Default Host Management unset, quota room, and the deny on
-  published images intact for every principal).
+  unblocked, SSM Default Host Management unset, quota room, the deny on
+  published images intact for every principal, and no unencrypted snapshot
+  or image outside the published ones).
 - `scripts/hardened-image-retire.sh`: keeps the newest two public builds,
   deprecates and deregisters older ones on a 7-day cadence, never
   deregisters one of the two newest, yanks one build with `--disable`, and

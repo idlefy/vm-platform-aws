@@ -2,7 +2,7 @@
 # hardened-image-build.sh — build and publish Idlefy's hardened image for AI
 # agents, idlefy-hardened-agent-ubuntu-24.04-amd64-YYYYMMDD-NN, from a platform
 # tag. Run by the release workflow; not a tenant tool. Design:
-# docs/design/ami-image.md.
+# docs/design/hardened-image.md.
 #
 #   PLATFORM_TAG=vX.Y.Z PLATFORM_SHA=<40 hex> HARDENED_SECURITY_GROUP_ID=sg-… \
 #     scripts/hardened-image-build.sh
@@ -11,7 +11,9 @@
 # (a UUID), HARDENED_INSTANCE_TYPE (default c7a.xlarge), HARDENED_SUBNET_ID,
 # HARDENED_OUT (default dist), GH_REPO (default idlefy/vm-platform-aws).
 # Test hooks, never set in a real build: HARDENED_SKIP_TAG_CHECK=1 (exactly 1)
-# skips the tag check; HARDENED_TODAY=YYYYMMDD replaces today's UTC date.
+# skips the tag check; HARDENED_TODAY=YYYYMMDD replaces today's UTC date, and
+# is refused unless HARDENED_SKIP_TAG_CHECK=1 is set too — a forward-dated
+# name would stay the "newest" build for retention forever.
 #
 # What it does, refusing at the first thing that is not so:
 #   1. the tag names PLATFORM_SHA and the tree is that commit;
@@ -69,6 +71,9 @@ GH_REPO="${GH_REPO:-idlefy/vm-platform-aws}"
   || die "HARDENED_SUBNET_ID='$HARDENED_SUBNET_ID' is not a subnet id"
 [[ $GH_REPO =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "GH_REPO='$GH_REPO' is not owner/name"
 # Taken once: a build that crosses UTC midnight keeps the date it started on.
+if [ -n "${HARDENED_TODAY:-}" ] && [ "${HARDENED_SKIP_TAG_CHECK:-}" != 1 ]; then
+  die "HARDENED_TODAY is set without HARDENED_SKIP_TAG_CHECK=1 — both are test hooks, never set in a real build; unset HARDENED_TODAY"
+fi
 DATE="${HARDENED_TODAY:-$(date -u +%Y%m%d)}"
 [[ $DATE =~ ^[0-9]{8}$ ]] || die "HARDENED_TODAY='$DATE' is not YYYYMMDD (it is a test hook; unset it)"
 
@@ -120,8 +125,8 @@ eval "$REGIONS_VARS"
 
 # The image is published as Idlefy's: refuse any other account before anything
 # is created, here or on GitHub.
-ACCOUNT="$(aws sts get-caller-identity --query Account --output text 2>/dev/null)" \
-  || die "could not read the AWS account (aws sts get-caller-identity) — check the credentials in the environment"
+ACCOUNT="$(aws sts get-caller-identity --region "$BUILD_REGION" --query Account --output text 2>"$W/sts.err")" \
+  || die "could not read the AWS account (aws sts get-caller-identity): $(tr '\n' ' ' < "$W/sts.err")— check the credentials in the environment"
 [ "$ACCOUNT" = "$OWNER_ID" ] \
   || die "the AWS credentials are for account '$ACCOUNT', the image is published by $OWNER_ID — use the publishing account's credentials"
 
