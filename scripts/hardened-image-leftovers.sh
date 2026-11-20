@@ -104,11 +104,15 @@ fi
 # pairs Packer names packer_*: the publisher role may terminate and delete
 # exactly these.
 INSTANCES="" KEYS=""
-echo "Build resources in $BUILD_REGION (Name=$BUILD_TAG):"
-if out="$(aws ec2 describe-instances --region "$BUILD_REGION" \
-            --filters "Name=tag:Name,Values=$BUILD_TAG" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-            --output json 2>"$ERR" < /dev/null)" \
-   && INSTANCES="$(python3 -I -c '
+# list_instances — INSTANCES ("id:state …") from one describe; 1 on a failed
+# or unreadable answer, with the reason in $ERR.
+list_instances() {
+  local out
+  INSTANCES=""
+  out="$(aws ec2 describe-instances --region "$BUILD_REGION" \
+           --filters "Name=tag:Name,Values=$BUILD_TAG" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+           --output json 2>"$ERR" < /dev/null)" || return 1
+  INSTANCES="$(python3 -I -c '
 import json, re, sys
 rows = []
 for res in json.loads(sys.argv[1])["Reservations"]:
@@ -116,9 +120,28 @@ for res in json.loads(sys.argv[1])["Reservations"]:
         if not re.fullmatch(r"i-[0-9a-f]+", i["InstanceId"]):
             raise ValueError(i["InstanceId"])
         rows.append("%s:%s" % (i["InstanceId"], i["State"]["Name"]))
-print(" ".join(rows))' "$out" 2>/dev/null)"; then
+print(" ".join(rows))' "$out" 2>/dev/null)" || { INSTANCES=""; echo "unreadable answer" > "$ERR"; return 1; }
+}
+# With --clean-build, an empty listing is asked again: EC2 may have accepted
+# a launch just before the runner killed Packer, and a new instance can take
+# a moment to be listable. CLEAN_TRIES listings, CLEAN_PAUSE seconds apart
+# (HARDENED_LEFTOVERS_PAUSE, for the tests). Anything listed is acted on at
+# once; a plain listing asks once.
+CLEAN_TRIES=3
+CLEAN_PAUSE="${HARDENED_LEFTOVERS_PAUSE:-10}"
+[[ $CLEAN_PAUSE =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "HARDENED_LEFTOVERS_PAUSE='$CLEAN_PAUSE' is not a number of seconds"
+echo "Build resources in $BUILD_REGION (Name=$BUILD_TAG):"
+try=1 listed=0
+while :; do
+  if list_instances; then listed=1; else listed=0; fi
+  [ "$CLEAN" = 1 ] && [ "$listed" = 1 ] && [ -z "$INSTANCES" ] && [ "$try" -lt "$CLEAN_TRIES" ] || break
+  try=$((try + 1)); sleep "$CLEAN_PAUSE"
+done
+if [ "$listed" = 1 ]; then
   if [ -n "$INSTANCES" ]; then
     for x in $INSTANCES; do echo "   instance ${x%%:*}  state=${x#*:}"; done
+  elif [ "$CLEAN" = 1 ]; then
+    echo "   instances: none (listed $CLEAN_TRIES times, ${CLEAN_PAUSE} s apart)"
   else
     echo "   instances: none"
   fi

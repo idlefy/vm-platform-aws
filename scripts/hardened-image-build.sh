@@ -11,7 +11,10 @@
 # (a UUID), HARDENED_INSTANCE_TYPE (default c7a.xlarge), HARDENED_SUBNET_ID,
 # HARDENED_OUT (default dist), GH_REPO (default idlefy/vm-platform-aws),
 # HARDENED_CONSOLE_POLL (seconds between reads of the build instance's
-# console, default 30).
+# console, default 30), HARDENED_PACKER_GRACE (seconds an interrupted Packer
+# is given to clean up before this script stops waiting, default 900). Both
+# take a positive number, fractions allowed (the tests use them); zero in
+# any form is refused.
 # Test hooks, never set in a real build: HARDENED_SKIP_TAG_CHECK=1 (exactly 1)
 # skips the tag check and the clean-tree check with it; HARDENED_TODAY=YYYYMMDD replaces today's UTC date, and
 # is refused unless HARDENED_SKIP_TAG_CHECK=1 is set too — a forward-dated
@@ -76,9 +79,22 @@ GH_REPO="${GH_REPO:-idlefy/vm-platform-aws}"
 [ -z "$HARDENED_ATTACHED_ORG_ID" ] \
   || [[ $HARDENED_ATTACHED_ORG_ID =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
   || die "HARDENED_ATTACHED_ORG_ID='$HARDENED_ATTACHED_ORG_ID' is not a lowercase UUID"
+# The console watcher reads `get-console-output --latest`, which only Nitro
+# instance types serve: a non-Nitro type loses the fast failure path (Packer's
+# own 2 h stop timeout remains). The publisher role allows exactly c7a.xlarge,
+# so only a hand run with other credentials could choose another type.
 [[ $HARDENED_INSTANCE_TYPE =~ ^[a-z0-9-]+\.[a-z0-9]+$ ]] || die "HARDENED_INSTANCE_TYPE='$HARDENED_INSTANCE_TYPE' is not an instance type"
+# positive_seconds VALUE: a decimal number of seconds above zero.
+positive_seconds() { [[ $1 =~ ^[0-9]+(\.[0-9]+)?$ ]] && [[ $1 =~ [1-9] ]]; }
 CONSOLE_POLL="${HARDENED_CONSOLE_POLL:-30}"
-[[ $CONSOLE_POLL =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "HARDENED_CONSOLE_POLL='$CONSOLE_POLL' is not a number of seconds"
+positive_seconds "$CONSOLE_POLL" || die "HARDENED_CONSOLE_POLL='$CONSOLE_POLL' is not a positive number of seconds"
+# How long an interrupted Packer gets to clean up (terminate the instance,
+# delete the key pair) before this script stops waiting for it: 15 minutes.
+PACKER_GRACE_DEFAULT=900
+PACKER_GRACE="${HARDENED_PACKER_GRACE:-$PACKER_GRACE_DEFAULT}"
+positive_seconds "$PACKER_GRACE" || die "HARDENED_PACKER_GRACE='$PACKER_GRACE' is not a positive number of seconds"
+# In tenths of a second, the unit stop_packer polls in; at least one.
+PACKER_GRACE_TICKS=$(awk -v g="$PACKER_GRACE" 'BEGIN { t = int(g * 10); print (t < 1 ? 1 : t) }')
 [ -z "$HARDENED_SUBNET_ID" ] || [[ $HARDENED_SUBNET_ID =~ ^subnet-[0-9a-f]+$ ]] \
   || die "HARDENED_SUBNET_ID='$HARDENED_SUBNET_ID' is not a subnet id"
 [[ $GH_REPO =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "GH_REPO='$GH_REPO' is not owner/name"
@@ -344,8 +360,14 @@ stop_watch() {
 #   - PK_STATE is "run" from just before the pipeline is started until its
 #     wait returns. Interrupted between the start and the assignment of
 #     PIPE_PID, the pipeline is the one job left once the watcher is reaped.
-#   - It waits, without a cap, until the launcher has recorded Packer's group
-#     or the pipeline has ended (it can only end by Packer exiting).
+#   - It waits until the launcher has recorded Packer's group or the
+#     pipeline has ended (it can only end by Packer exiting), then for
+#     Packer's group to end — both within one grace period, PACKER_GRACE
+#     (15 minutes). When that runs out — Packer or a plugin stalled in its
+#     clean-up — it stops waiting (no KILL), says the clean-up was not
+#     confirmed and points at `hardened-image-leftovers.sh --clean-build`;
+#     on_exit keeps the first exit status and still lists leftovers and
+#     cleans up. Under Actions the runner's own kill comes much sooner.
 #   - The SIGINT is repeated every 10 s while the group lives: Packer's worker
 #     takes the first and drops the rest (its handler reads one signal; the
 #     plugins discard every interrupt), and a repeat covers the instant after
@@ -358,20 +380,30 @@ stop_packer() {
   local pg="" n=0
   [ "$PK_STATE" = run ] || return 0
   [ -n "$PIPE_PID" ] || PIPE_PID="$(jobs -p | tail -n 1)"
-  while :; do
+  while [ "$n" -lt "$PACKER_GRACE_TICKS" ]; do
     pg="$(cat "$W/packer.pid" 2>/dev/null)" || pg=""
     [[ ! $pg =~ ^[0-9]+$ ]] || break
     [ -n "$PIPE_PID" ] && kill -0 "$PIPE_PID" 2>/dev/null || break
-    sleep 0.1
+    n=$((n + 1)); sleep 0.1
   done
   if [[ $pg =~ ^[0-9]+$ ]] && kill -0 -- "-$pg" 2>/dev/null; then
-    echo "Interrupting Packer; waiting for it to terminate the build instance and delete its key pair…" >&2
-    while kill -0 -- "-$pg" 2>/dev/null; do
+    echo "Interrupting Packer; waiting up to $PACKER_GRACE s for it to terminate the build instance and delete its key pair…" >&2
+    while kill -0 -- "-$pg" 2>/dev/null && [ "$n" -lt "$PACKER_GRACE_TICKS" ]; do
       [ $((n % 100)) -ne 0 ] || kill -INT -- "-$pg" 2>/dev/null || true
       n=$((n + 1)); sleep 0.1
     done
   fi
-  [ -z "$PIPE_PID" ] || wait "$PIPE_PID" 2>/dev/null || true
+  if [ "$n" -ge "$PACKER_GRACE_TICKS" ]; then
+    # Stop waiting; never KILL. Packer keeps running in its own session.
+    {
+      echo
+      echo "!! Packer's clean-up was NOT confirmed within $PACKER_GRACE s: the build instance"
+      echo "!! (Name=idlefy-hardened-image-build) and its packer_* key pair may still exist."
+      echo "!! Remove them: scripts/hardened-image-leftovers.sh --clean-build (publisher credentials)."
+    } >&2
+  else
+    [ -z "$PIPE_PID" ] || wait "$PIPE_PID" 2>/dev/null || true
+  fi
   PIPE_PID="" PK_STATE=done
 }
 # on_exit — first, INT and TERM are ignored from here on and the first exit
