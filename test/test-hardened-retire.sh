@@ -428,8 +428,26 @@ IMAGES_us_east_1=$(imgs "ami-0a0:0:true::$PREFIX-20991231-01:pending::none" ami-
 run_retire --apply; check "a pending image newer than the kept builds → exit 1, nothing in us-east-1" \
   "$([ $? -eq 1 ] && [ "$(mut)" = 0 ] && grep -F 'us-east-1' "$T/stderr" | grep -F 'ami-0a0' | grep -qF 'pending'; echo $?)"
 IMAGES_us_east_1=$(imgs ami-0a1:10:true ami-0a2:40:true ami-0a3:70:true:8 \
-  | python3 -I -c 'import json, sys; d = json.load(sys.stdin); del d["Images"][1]["State"]; print(json.dumps(d))')
+  | python3 -I -c 'import json, sys; d = json.load(sys.stdin); d["Images"][1].pop("State"); print(json.dumps(d))')
 run_retire --apply; check "no State → exit 1, nothing in us-east-1" "$([ $? -eq 1 ] && [ "$(mut)" = 0 ]; echo $?)"
+# After an --apply run, a dry run the same day still lists what it
+# deregistered. us-east-1: a just-deregistered private build and fewer than
+# two published builds; eu-west-1: a deregistered image newer than the
+# second-newest public build.
+IMAGES_us_east_1=$(imgs ami-0a1:10:true "ami-0a5:20:false::$PREFIX-20000101-01:deregistered")
+IMAGES_eu_west_1=$(imgs "ami-0b1:10:true::$PREFIX-20260301-01" "ami-0b9:15:true::$PREFIX-20260201-01:deregistered" \
+  "ami-0b2:40:true::$PREFIX-20240101-01")
+run_retire; check "a deregistered image still listed is ignored wherever it sorts → exit 0, no doubt" \
+  "$([ $? -eq 0 ] && ! grep -qF 'left alone' "$T/stderr" && grep -qF 'ami-0a5 ignored: state deregistered' "$T/stdout" \
+     && grep -qF 'ami-0b9 ignored: state deregistered' "$T/stdout" && [ "$(would)" = 0 ]; echo $?)"
+for st in pending failed; do
+  IMAGES_us_east_1=$(imgs ami-0a1:10:true "ami-0a5:20:false::$PREFIX-20000101-01:$st")
+  IMAGES_eu_west_1=$(imgs "ami-0b1:10:true::$PREFIX-20260301-01" "ami-0b9:15:true::$PREFIX-20260201-01:$st" \
+    "ami-0b2:40:true::$PREFIX-20240101-01")
+  run_retire; check "$st in the same places → a doubt in both regions" \
+    "$([ $? -eq 1 ] && grep -F 'us-east-1' "$T/stderr" | grep -qF "ami-0a5" && grep -F 'eu-west-1' "$T/stderr" | grep -qF "ami-0b9"; echo $?)"
+done
+IMAGES_eu_west_1=""
 
 echo "== block-device mappings must all be readable =="
 for bad in None '"x"' '{"DeviceName": "/dev/sdb"}'; do

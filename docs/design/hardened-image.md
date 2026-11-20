@@ -157,7 +157,8 @@ reaches it only through what the customer's own account does to the instance
    - **deregister** a build deprecated 7 or more days ago, or disabled, 7 or
      more days old and not one of the two newest builds ever published; then
      delete its snapshots. A snapshot AWS still reports in use
-     (`InvalidSnapshot.InUse`) is retried 6 times, 10 s apart; the other
+     (`InvalidSnapshot.InUse`) is tried 6 times in all, 10 s apart (5
+     retries, about 50 s); the other
      snapshots are still deleted, and every one left is named and the run
      exits 1. Each deprecation time is computed right before its call;
    - **ever published** is read from the image's `Description`, which the
@@ -172,15 +173,16 @@ reaches it only through what the customer's own account does to the instance
      deregistered. If one of them has passed its deprecation date (the
      two-year default, should publishing stop), the region is reported,
      nothing is done in it, and the script exits 1;
-   - only images in state `available` or `disabled` are acted on; another
-     state (`pending`, `failed`, `deregistered` — a deregistered image stays
-     listed for a while) is ignored, unless the image is newer than a build
-     retention would keep;
+   - only images in state `available` or `disabled` are acted on. A
+     `deregistered` image, which AWS lists for a while after a
+     deregistration, is ignored. Any other state (`pending`, `failed`, …) is
+     ignored unless the image would be one of the two newest published
+     builds, or fewer than two exist — then it is a doubt;
    - a region the script is unsure of — a name outside the pattern, a name
      twice, a date, snapshot, block-device mapping, state or `Description` it
      cannot read, a public image whose `Description` says private, a
-     not-disabled private image whose `Description` says public, or an image
-     in another state among the two newest — is left alone, named, and the
+     not-disabled private image whose `Description` says public, or a
+     pending or failed image among the two newest — is left alone, named, and the
      run exits 1. The retire workflow prints the plan into the job summary and
      fails visibly; it never hides a doubt behind a green run.
 
@@ -384,9 +386,10 @@ UTC):
   a pending one, as GitHub concurrency does. The retire workflow has its own
   group, `hardened-retire`, so a publish waiting for approval never blocks a
   yank and a queued publish never replaces a pending retire. A retention that
-  runs during a build changes nothing in a region where the new image is
-  still `pending`, or registered but not yet shared: it is newer than the
-  kept builds, so the region is left alone and the run exits 1.
+  runs during a build does not see it: Packer adds the fence tag
+  `IdlefyPublishedImage=true` in its last step, after the copies and the
+  sharing, and retention lists only tagged images, so it plans as if the
+  build had not started.
 - The first scheduled run after this workflow reaches `main` builds the
   newest existing `v*` tag, whichever that is.
 - `public` is a boolean input, default `true`; the schedule always builds

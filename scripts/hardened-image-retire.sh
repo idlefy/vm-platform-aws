@@ -38,15 +38,16 @@ of this account tagged $FENCE_KEY=true and named $NAME_PREFIX-YYYYMMDD-NN:
              pending deprecation and is left be);
   deregister a build deprecated 7 days ago or more, or disabled and created 7
              days ago or more and not one of the two newest published builds
-             — then delete its snapshots (a snapshot still in use is retried
-             for a minute).
+             — then delete its snapshots (a snapshot still in use is tried
+             6 times, 10 s apart: 5 retries, about 50 s).
              "Published" is read from the Description the build set
              (visibility=public|private): a yanked public build still counts,
              a private build never does and is retired by its own age. A
              Description that does not say, an unreadable block-device
-             mapping, or an image in another state (pending, failed,
-             deregistered) that is newer than a kept build leaves the region
-             alone.
+             mapping, or an image in another state (pending, failed, …) that
+             would be one of the two newest published builds — any such image
+             when fewer than two exist — leaves the region alone. A
+             deregistered image AWS still lists is ignored.
   safety net one of the two newest public builds whose DeprecationTime has
              passed (the two-year default, if publishing stopped) is never
              deregistered: the region is reported, nothing is done in it, and
@@ -280,11 +281,15 @@ keep_ids = {b["id"] for b in keep}
 # by its own age.
 newest = [b for b in builds if b["published"]][:2]
 newest_ids = {b["id"] for b in newest}
-# An image in another state (pending, failed, deregistered) is not acted on.
-# If it would be one of the two newest, the region is left alone: a pending
-# copy of the build being published must not let an older one go.
+# An image in another state is not acted on. A deregistered one (AWS lists it
+# for a while after a deregistration) is terminal: nothing to protect, so it
+# is only said. Any other state (pending, failed, …) of an image that would be
+# one of the two newest — or of any image while fewer than two published
+# builds exist — leaves the region alone: its state may yet become a build
+# the consumer pins. A build in progress is not seen here at all: Packer adds
+# the fence tag in its last step, after the image is shared.
 for o in sorted(odd, key=lambda o: o["name"], reverse=True):
-    if len(newest) < 2 or o["name"] > newest[-1]["name"]:
+    if o["state"] != "deregistered" and (len(newest) < 2 or o["name"] > newest[-1]["name"]):
         doubt("%s (%s) is in state %s and newer than a build retention would keep — wait, or clean it up by hand"
               % (o["id"], o["name"], o["state"]))
     out("say", "%s ignored: state %s" % (o["id"], o["state"]))
@@ -354,8 +359,9 @@ mutate() {
 
 # delete_snapshot REGION SNAPSHOT — deletes one snapshot of a just
 # deregistered image. AWS may still hold it for the image for a moment
-# (InvalidSnapshot.InUse): that one error is retried SNAP_TRIES times,
-# SNAP_DELAY seconds apart. Any other error, or the last try, fails.
+# (InvalidSnapshot.InUse): on that one error the delete is tried SNAP_TRIES
+# times in all, SNAP_DELAY seconds apart (5 retries, about 50 s). Any other
+# error, or the last try, fails.
 SNAP_TRIES=6 SNAP_DELAY=10
 delete_snapshot() {
   local r=$1 s=$2 n=1
