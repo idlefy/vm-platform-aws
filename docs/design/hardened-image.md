@@ -310,13 +310,16 @@ reaches it only through what the customer's own account does to the instance
       8. dpkg reports `cinc` as unknown or not installed, by the same strict
          rule;
       9. `/etc/dev-vm` — checked by `solo_dir` above;
-      10. last, `fstrim -v /` succeeds. A public snapshot's freed blocks are
-          readable (Security notes), and the removals above include the
-          build's snapd device key, so for this image a failed trim of the
-          root filesystem refuses it. The shared scrub's own `fstrim -av ||
-          true`, after `cloud-init clean`, stays best-effort: the fleet's
-          behaviour does not change, and the solo profile's strictness lives
-          only in its own hook.
+      10. last, `cloud-init clean --logs --machine-id`, then a **zero-fill
+          of `/`'s free space**: `dd if=/dev/zero` into one file on `/` until
+          the filesystem is full (root fills the reserved blocks too),
+          `sync`, remove the file, `sync`. The image is refused unless the
+          fill ended on "No space left on device" after writing something,
+          and the file is gone afterwards. The clean runs here, before the
+          fill, so that what it deletes is overwritten too; the shared
+          scrub's own clean after this hook then finds nothing left to
+          delete. A refusal from the fill comes after that clean. Why a
+          fill and not a trim: see "Freed blocks" in Security notes.
 
 13. **The publisher role is scoped to the build's own tags and a fixed,
     no-ingress security group.** The account also runs the dev organization's
@@ -540,15 +543,33 @@ trailing comment. No input or ref name is interpolated into a `run:` script.
   residuals below are what they leave.
 - **Freed blocks of a public snapshot are readable.** Anyone can copy a public
   snapshot and read every block, including blocks a deleted file used to
-  occupy. The scrub removes files; it does not wipe free space. What the
-  build ever wrote to disk is therefore public: the converge state stays on
-  tmpfs (`/run/dev-vm/solo`), no credential ever reaches the instance, and
-  the scrub list names nothing secret — only per-instance identity (host keys,
-  machine id, engine ids) that must differ between clones. The one exception
-  was snapd's device key, which the scrub now removes with snapd; the solo
-  profile therefore requires a successful trim of `/` after the removals
-  (decision 12, check 10). What `cloud-init clean` deletes after that check
-  (cloud-init's own logs and state) is trimmed only best-effort.
+  occupy. **The first line of defence stays the law that nothing secret is
+  written to the build disk**: the converge state stays on tmpfs
+  (`/run/dev-vm/solo`), no credential ever reaches the instance, and the
+  scrub list names nothing secret — only per-instance identity (host keys,
+  machine id, engine ids) that must differ between clones. snapd's device
+  key broke that law (the scrub now removes snapd), so the solo image also
+  **zero-fills its free space** (decision 12, check 10).
+  - Trimming does not help: EBS root volumes accept no discard (measured on a
+    c7a.xlarge with a gp3 root: "fstrim: /: the discard operation is not
+    supported"). The fleet scrub's `fstrim -av || true` has always been a
+    no-op there, and freed blocks have always reached the fleet's private
+    snapshots; the fleet is unchanged.
+  - The fill covers every block freed before it: everything the scrub lists
+    remove, the CINC and snapd purges, `apt-get clean`, the bootstrap's log,
+    whatever the converge deleted, and cloud-init's state, its copy of the
+    user data and its logs (the solo hook runs `cloud-init clean` before the
+    fill).
+  - It does not cover what lives outside free data blocks: the slack at the
+    end of a file's last block, directory entries that still name deleted
+    files, inode tables and other metadata, and the ext4 journal. Nor does
+    it cover what happens after it: the shared scrub's second `cloud-init
+    clean` (nothing left to delete; it rewrites `/etc/machine-id`), its
+    no-op `fstrim`, and what shutdown and cloud-init's final modules write
+    (written, not freed — for example the instance-id directory below).
+  - The cost: about two minutes of build time, and the snapshot stores the
+    zeroed blocks — roughly 16 GB more per region for the 20 GB root. Both
+    are estimates until the first Packer-built image is measured.
 - **The build instance's id directory.** `/var/lib/cloud/instances/<id>`
   (three semaphore files) stays in the image: cloud-init's final modules write
   it after the scrub returns. It names a terminated instance and nothing
@@ -672,6 +693,9 @@ build — none of it was exercised by hand:
 - **snapd is gone** from the image: no `snapd` package, no
   `/var/lib/snapd`, no `snap` command, and nothing else the purge removed
   matters (read the purge's package list on the console);
+- **The zero-fill** ends on "No space left on device", how long it takes,
+  and how much the snapshot grows (the estimates above: about two minutes,
+  roughly 16 GB per region);
 - **CreateImage** under the publisher role, and **CopyImage** to every
   region under the fence deny;
 - **Tags on the copies and their snapshots**: every copy and its snapshot
@@ -688,6 +712,11 @@ build — none of it was exercised by hand:
   2).
 
 ## Measured
+
+- EBS root volumes accept no discard: `fstrim: /: the discard operation is
+  not supported` (c7a.xlarge, gp3 root, a real build instance on
+  `f713504`, whose strict trim therefore refused every build; everything
+  before it — the snapd purge and every other check — passed).
 
 - `ec2:Owner` for Canonical's images is the alias `amazon`, not the account
   id (run 1, a refused RunInstances).

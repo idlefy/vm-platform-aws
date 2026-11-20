@@ -189,8 +189,35 @@ no_units_left() {
   done
 }
 
-# Hook 3, immediately before cloud-init clean, on the disk Packer is about to
-# snapshot. Paths under $R; the root-ownership check only on a real root,
+# zero_fill: overwrite the free space of / with zeros, so no block a removal
+# freed (the snapd device key, the build's logs, cloud-init's state) reaches
+# the public snapshot with its old contents. EBS root volumes accept no
+# discard (measured: "fstrim: /: the discard operation is not supported"),
+# so trimming frees nothing in a snapshot. One file is written until the
+# filesystem is full — root writes into the reserved blocks too — then
+# synced and removed. Fails closed: the fill must end with "No space left on
+# device" after writing something, and the file must be gone afterwards.
+# Nothing else writes to / at this point: journald is on /run, the scrub
+# logs to the console, and the services that write were stopped earlier.
+ZERO_FILL=/.idlefy-zero-fill
+zero_fill() {
+  local f="$R$ZERO_FILL" out rc=0 size
+  rm -f -- "$f"
+  out=$(LC_ALL=C dd if=/dev/zero of="$f" bs=1M status=none 2>&1) || rc=$?
+  if [ "$rc" -eq 0 ] || [[ $out != *"No space left on device"* ]]; then
+    rm -f -- "$f"
+    refuse "zero-fill of / did not end on a full filesystem (dd exit $rc: ${out:-no message})"
+  fi
+  size=$(stat -c %s "$f" 2>/dev/null) || size=0
+  if [ "$size" -le 0 ]; then rm -f -- "$f"; refuse "zero-fill of / wrote nothing"; fi
+  sync || { rm -f -- "$f"; refuse "sync after the zero-fill failed"; }
+  rm -f -- "$f" || true   # checked below
+  sync || refuse "sync after removing the zero-fill failed"
+  [ ! -e "$f" ] && [ ! -L "$f" ] || refuse "the zero-fill file $ZERO_FILL is still on disk"
+}
+
+# Hook 3, immediately before the shared scrub's cloud-init clean, on the disk
+# Packer is about to snapshot; it ends with its own clean and the zero-fill. Paths under $R; the root-ownership check only on a real root,
 # since a test's fake root cannot be chowned.
 solo_check() {
   local f g grp st mode own eic
@@ -259,10 +286,12 @@ solo_check() {
   #    purge). A purged package dpkg still remembers reads not-installed.
   pkg_absent cinc || refuse "cinc still installed, or dpkg cannot say (dpkg-query: '${PKG_SAID:-?}')"
   # 9. /etc/dev-vm ran in solo_dir, before image-revision was written.
-  # 10. Last, after every removal: trim the root filesystem, strictly. A public
-  #     snapshot's freed blocks are readable by anyone, and the removals above
-  #     include the build's snapd device key. The shared scrub's own
-  #     `fstrim -av || true` after cloud-init clean stays best-effort for the
-  #     fleet; for this image a failed trim of / refuses it.
-  fstrim -v "$R/" || refuse "fstrim of the root filesystem failed; removed files (the snapd device key among them) could sit in the snapshot's freed blocks"
+  # 10. Last, after every check: cloud-init clean, then zero-fill the free
+  #     space of / (zero_fill, above). The clean runs here, not only in the
+  #     shared scrub after this hook, so that what it deletes (cloud-init's
+  #     state, its copy of the user data, its logs) is freed before the fill
+  #     and overwritten by it; the shared scrub's own clean then finds
+  #     nothing left to delete. A refusal from here on comes after the clean.
+  cloud-init clean --logs --machine-id || refuse "cloud-init clean failed"
+  zero_fill
 }

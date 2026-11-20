@@ -23,9 +23,13 @@ the cookbook does not. No base release: the image still converges
   A `dpkg-query` that cannot answer refuses too. `apt-get clean` drops the
   package cache (321 MB); the apt lists stay. To use a snap, the admin
   installs snapd.
-- The solo scrub requires a successful `fstrim` of `/` after its removals:
-  freed blocks of a public snapshot are readable. The fleet scrub's trim
-  stays best-effort.
+- The solo scrub zero-fills the free space of `/` as its last step, after
+  every removal and after `cloud-init clean`: freed blocks of a public
+  snapshot are readable, and EBS root volumes accept no discard, so a trim
+  frees nothing (measured). The image is refused unless the fill ended on a
+  full filesystem and its file is gone. This costs about two minutes of
+  build time and roughly 16 GB more snapshot storage per region. The fleet
+  scrub is unchanged; its `fstrim` has always been a no-op on EBS.
 - The build driver reads the build instance's serial console while Packer
   runs. On the bootstrap's `BOOTSTRAP FAILED` banner or a scrub refusal, as a
   whole line, it prints the console's tail and interrupts Packer, so the

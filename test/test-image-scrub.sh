@@ -17,7 +17,7 @@ T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 REV=$(printf 'a%.0s' {1..64})
 mkdir -p "$T/bin"
 # shellcheck disable=SC2016 # $* and $SHIM_LOG expand in the shim, not here
-for c in systemctl journalctl cloud-init fstrim poweroff; do
+for c in systemctl journalctl cloud-init fstrim poweroff sync dd; do
   printf '#!/usr/bin/env bash\necho "%s $*" >> "$SHIM_LOG"\n' "$c" > "$T/bin/$c"; chmod +x "$T/bin/$c"
 done
 # `systemctl is-enabled` answers "nothing enabled" unless SHIM_ENABLED=0. A
@@ -43,10 +43,21 @@ exit 0
 SHIM
 # shellcheck disable=SC2016
 printf '[ -n "${SHIM_FAIL_CLOUDINIT:-}" ] && exit 1\nexit 0\n' >> "$T/bin/cloud-init"
-# fstrim -v <root> (the solo profile's strict trim) answers SHIM_FSTRIM_ROOT_RC;
-# the shared scrub's `fstrim -av` always succeeds here.
+# dd: never a real fill here. It writes a few bytes to of= and reports what
+# SHIM_DD says: enospc (default, as a full filesystem ends the fill), other
+# (another write error), ok (exit 0, no error), empty (ENOSPC after zero
+# bytes), stuck (leaves a directory rm -f cannot remove).
 # shellcheck disable=SC2016
-printf '[ "$1" = -v ] && exit "${SHIM_FSTRIM_ROOT_RC:-0}"\nexit 0\n' >> "$T/bin/fstrim"
+cat >> "$T/bin/dd" <<'SHIM'
+of=""; for a in "$@"; do case "$a" in of=*) of=${a#of=} ;; esac; done
+case "${SHIM_DD:-enospc}" in
+  enospc) printf 'zeros' > "$of"; echo "dd: error writing '$of': No space left on device" >&2; exit 1 ;;
+  other)  printf 'zeros' > "$of"; echo "dd: error writing '$of': Input/output error" >&2; exit 1 ;;
+  ok)     printf 'zeros' > "$of"; exit 0 ;;
+  empty)  : > "$of"; echo "dd: error writing '$of': No space left on device" >&2; exit 1 ;;
+  stuck)  mkdir -p "$of/x"; echo "dd: error writing '$of': No space left on device" >&2; exit 1 ;;
+esac
+SHIM
 # The solo profile's shims. Each logs like the others, then answers from the
 # environment: by default a clean solo build (cinc purged and gone, sudoers
 # valid, ubuntu in no admin group, no SSM snap).
@@ -133,7 +144,7 @@ check "checks the timers are off before powering off" "$(grep -q 'systemctl is-e
 check "cleans cloud-init with the machine id" "$(grep -q 'cloud-init clean --logs --machine-id' "$T/log"; echo $?)"
 check "powers off last" "$(tail -1 "$T/log" | grep -q '^poweroff'; echo $?)"
 echo "== fleet mode never purges cinc or runs the solo checks =="
-check "no dpkg/visudo/snap/id in fleet mode" "$(! grep -qE '^(apt-get|dpkg|dpkg-query|visudo|snap|id) ' "$T/log"; echo $?)"
+check "no dpkg/visudo/snap/id, no zero-fill in fleet mode" "$(! grep -qE '^(apt-get|dpkg|dpkg-query|visudo|snap|id|dd|sync)( |$)' "$T/log"; echo $?)"
 
 echo "== a unit still enabled at the end means no image =="
 : > "$T/log"; build_root "$R" "2026-10-16T00:00:00Z ok $REV"
@@ -264,8 +275,14 @@ SNAPD_PURGE='apt-get purge -y -o DPkg::Lock::Timeout=300 snapd'
 check "purges snapd, waiting for the dpkg lock" "$(grep -qx "$SNAPD_PURGE" "$T/log"; echo $?)"
 check "  …after the SSM snap check and the cinc purge" \
   "$([ "$(lineno '^snap list amazon-ssm-agent')" -lt "$(lineno "^$SNAPD_PURGE\$")" ] && [ "$(lineno "^$PURGE\$")" -lt "$(lineno "^$SNAPD_PURGE\$")" ]; echo $?)"
-check "trims the root filesystem strictly, after the checks, before cloud-init clean" \
-  "$(between "$(lineno "^fstrim -v $R/\$")" "$(lineno '^visudo -c')" "$(lineno 'cloud-init clean')"; echo $?)"
+check "cloud-init clean, then the zero-fill of /, after every check and before poweroff" \
+  "$(c=$(lineno '^cloud-init clean'); d=$(lineno "^dd if=/dev/zero of=$R/.idlefy-zero-fill bs=1M status=none\$"); \
+     [ -n "$c" ] && [ -n "$d" ] && [ "$(lineno '^visudo -c')" -lt "$c" ] && [ "$(lineno '^id -nG ubuntu')" -lt "$c" ] \
+     && [ "$(lineno '^dpkg-query .*cinc$')" -lt "$c" ] && [ "$c" -lt "$d" ] && [ "$d" -lt "$(lineno '^poweroff')" ]; echo $?)"
+check "  …synced, the file removed, synced again" \
+  "$([ "$(grep -c '^sync' "$T/log")" = 2 ] && [ "$(lineno '^dd ')" -lt "$(lineno '^sync')" ] && [ ! -e "$R/.idlefy-zero-fill" ]; echo $?)"
+check "  …and the removals all came before it (nothing on the lists is left)" \
+  "$(! grep -v '^\s*#' "$LIST_SOLO" | awk '$1 == "remove" { print $2 }' | while read -r g; do compgen -G "$R$g" >/dev/null && echo left; done | grep -q left; echo $?)"
 check "  …then cleans apt's cache" "$([ "$(lineno "^$SNAPD_PURGE\$")" -lt "$(lineno '^apt-get clean$')" ]; echo $?)"
 check "checks snapd and an SSM package are gone after the purge" \
   "$(between "$(lineno '^dpkg-query .*snapd$')" "$(lineno "^$SNAPD_PURGE\$")" "$(lineno 'cloud-init clean')" \
@@ -398,7 +415,20 @@ solo_refuses "a unit directory find cannot read" "cannot scan /etc/systemd/user"
   "mkdir -p etc/systemd/user/x && chmod 000 etc/systemd/user"
 chmod 755 "$R/etc/systemd/user"   # so the next build_root can remove it
 solo_passes "a directory named like a unit is not a unit" "mkdir -p etc/systemd/system/snap.d-not-a-unit"
-solo_refuses "the strict root trim fails" "fstrim of the root filesystem failed" ":" SHIM_FSTRIM_ROOT_RC=1
+# A failed fill refuses after cloud-init clean has run (it must free its
+# files before the fill), so these check the rest by hand.
+fill_refuses() {  # fill_refuses LABEL CONSOLE MODE
+  local got
+  build_root "$R" "2026-11-01T00:00:00Z ok $REV" "$LIST_SOLO"; seed_solo "$R"; : > "$T/log"
+  ( export DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$FIRSTBOOT" SHIM_DD="$3"; run_scrub "$R" solo ); got=$?
+  check "$1 → exit 70, console names it, no poweroff" \
+    "$([ "$got" = 70 ] && grep -qF -- "$2" "$T/console" && ! grep -q '^poweroff' "$T/log"; echo $?)"
+}
+fill_refuses "the fill ends on another write error" "did not end on a full filesystem" other
+fill_refuses "the fill ends without an error"       "did not end on a full filesystem" ok
+fill_refuses "the fill writes nothing"              "wrote nothing" empty
+fill_refuses "the fill file cannot be removed"      "zero-fill file /.idlefy-zero-fill is still on disk" stuck
+chmod -R u+rwx "$R" 2>/dev/null || true
 for u in etc/systemd/system/snap-core22-1380.mount etc/systemd/system/multi-user.target.wants/snap-lxd-1.mount \
          usr/lib/systemd/system/snapd.service etc/systemd/system/snap.amazon-ssm-agent.amazon-ssm-agent.service \
          lib/systemd/system/amazon-ssm-agent.service; do
