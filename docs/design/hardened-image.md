@@ -510,6 +510,11 @@ finding becomes a scrub or guard change and a new `v` release first.
 - **Tags on copied snapshots**: the snapshot of the copy in a region other
   than the build region carries `IdlefyPublishedImage=true` (the fence and G4
   depend on it).
+- **The Description on every copy**: the image in every region reads
+  `Idlefy hardened image for AI agents; visibility=private` (the plugin sets
+  it with `ModifyImageAttribute` after the copies, so the publisher role needs
+  that action for a private build too), and a retire dry run plans the
+  region without a doubt.
 - **The publisher role can make every guard read** (G1–G4): a guard run
   under the role itself, not the owner's credentials, ends with no "the call
   failed" line.
