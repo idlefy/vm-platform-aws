@@ -26,17 +26,29 @@ usage: scripts/hardened-image-retire.sh [--apply] [--disable <ami-name>]
 
 Retention (no --disable), per region of image/hardened/regions, over the images
 of this account tagged $FENCE_KEY=true and named $NAME_PREFIX-YYYYMMDD-NN:
-  keep       the two newest (by name) public, non-deprecated builds — never
-             touched, whatever their age; the consumer pins exactly these two;
+  keep       the two newest (by name) public builds not yet deprecated — never
+             touched, whatever their age; the consumer pins exactly these two.
+             A build is deprecated once its DeprecationTime has PASSED: AWS
+             gives every public image one two years after creation, and a
+             future date is not a deprecation;
   deprecate  any other public build once the newest is 7 days old, and a
              private build once it is itself 7 days old (deprecation is set
-             10 minutes ahead: AWS refuses a time in the past);
-  deregister a build deprecated 7 days ago or more, then delete its snapshots.
+             10 minutes ahead: AWS refuses a time in the past; a date already
+             within those 10 minutes is a pending deprecation and is left be);
+  deregister a build deprecated 7 days ago or more, or disabled and created 7
+             days ago or more and not one of the two newest builds — then
+             delete its snapshots.
+  safety net one of the two newest public builds whose DeprecationTime has
+             passed (the two-year default, if publishing stopped) is never
+             deregistered: the region is reported, nothing is done in it, and
+             the run exits 1 — publish a new build.
 
 --disable <ami-name>  yank one build: disable-image on that exact name in every
              region, and nothing else. A disabled image can no longer launch,
              so the costpilot PR that removes its ids from the consumer's pin
-             must ship FIRST; disable only after it is live.
+             must ship FIRST; disable only after it is live. A later retention
+             run deregisters it once it is 7 days old and two newer builds
+             exist.
 
 Without --apply nothing changes: every action is printed as "would …".
 Exit 0 unless an AWS call failed or a region was left alone out of doubt.
@@ -120,6 +132,7 @@ import calendar, json, re, sys, time
 path, now, prefix, target, disable = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4], sys.argv[5] == "1"
 DAY = 86400
 GRACE = 7 * DAY
+PENDING = 600  # how far ahead this script sets a deprecation
 NAME = re.compile(re.escape(prefix) + r"-[0-9]{8}-[0-9]{2}")
 STAMP = re.compile(r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(\.[0-9]+)?Z")
 
@@ -157,6 +170,8 @@ if disable:
         doubt("%d images are named %s" % (len(hits), target))
     elif not re.fullmatch(r"ami-[0-9a-f]+", str(hits[0].get("ImageId"))):
         doubt("%s has an unreadable image id %r" % (target, hits[0].get("ImageId")))
+    elif hits[0].get("State") == "disabled":
+        out("already", hits[0]["ImageId"], target)
     else:
         out("disable", hits[0]["ImageId"], target)
     sys.exit(0)
@@ -193,12 +208,33 @@ for i in images:
         if not isinstance(s, str) or not re.fullmatch(r"snap-[0-9a-f]+", s):
             doubt("%s has an EBS mapping without a readable snapshot id" % iid)
         snaps.append(s)
+    state = i.get("State", "available")
+    if not isinstance(state, str):
+        doubt("%s has no readable State" % iid)
     builds.append(dict(id=iid, name=name, public=i["Public"], created=created,
-                       deprecated=deprecated, snaps=snaps))
+                       deprecated=deprecated, snaps=snaps, disabled=state == "disabled"))
+
+# A DeprecationTime is not a deprecation until it has passed: AWS gives every
+# public image one, two years after its creation. Ours, set by an earlier run,
+# lies within the next 10 minutes.
+def past(b):
+    return b["deprecated"] is not None and b["deprecated"] <= now
+
+def pending(b):
+    return b["deprecated"] is not None and now < b["deprecated"] <= now + PENDING
 
 builds.sort(key=lambda b: b["name"], reverse=True)
-keep = [b for b in builds if b["public"] and b["deprecated"] is None][:2]
+keep = [b for b in builds if b["public"] and not b["disabled"] and not past(b)][:2]
 keep_ids = {b["id"] for b in keep}
+# The two newest builds that were ever published (public now, or disabled by a
+# yank). Nothing among them is deregistered, whatever its dates say.
+newest = [b for b in builds if b["public"] or b["disabled"]][:2]
+newest_ids = {b["id"] for b in newest}
+for b in newest:
+    if b["public"] and not b["disabled"] and past(b):
+        doubt("%s (%s), one of the two newest public builds, passed its deprecation date %s ago — "
+              "the consumer no longer accepts it; publish a new build. Nothing here deregisters it"
+              % (b["id"], b["name"], days(now - b["deprecated"])))
 current_age = now - keep[0]["created"] if keep else None
 says, deprecations, deregistrations = [], [], []
 for label, b in zip(("current", "previous"), keep):
@@ -206,29 +242,39 @@ for label, b in zip(("current", "previous"), keep):
 for b in builds:
     if b["id"] in keep_ids:
         continue
-    if b["deprecated"] is None:
-        if b["public"]:
-            if keep and current_age >= GRACE:
-                deprecations.append((b, "superseded; the current build %s is %s old" % (keep[0]["id"], days(current_age))))
-            else:
-                says.append("%s waits: the current build is %s old; older builds are deprecated once it is 7 days old"
-                            % (b["id"], days(current_age or 0)))
+    age = now - b["created"]
+    if b["disabled"]:
+        if b["id"] in newest_ids:
+            says.append("%s waits: disabled, and one of the two newest builds; deregistered once two newer ones exist" % b["id"])
+        elif age >= GRACE:
+            if not b["snaps"]:
+                doubt("%s is due for deregistration but lists no snapshot" % b["id"])
+            deregistrations.append((b, "disabled, %s old" % days(age)))
         else:
-            age = now - b["created"]
-            if age >= GRACE:
-                deprecations.append((b, "private build, %s old" % days(age)))
-            else:
-                says.append("%s waits: a private build, %s old; deprecated once 7 days old" % (b["id"], days(age)))
-    else:
+            says.append("%s waits: disabled, %s old; deregistered once 7 days old" % (b["id"], days(age)))
+    elif past(b):
         since = now - b["deprecated"]
         if since >= GRACE:
             if not b["snaps"]:
                 doubt("%s is due for deregistration but lists no snapshot" % b["id"])
             deregistrations.append((b, "deprecated %s ago" % days(since)))
-        elif since >= 0:
-            says.append("%s waits: deprecated %s ago; deregistered once 7 days have passed" % (b["id"], days(since)))
         else:
-            says.append("%s waits: its deprecation is scheduled, not yet reached" % b["id"])
+            says.append("%s waits: deprecated %s ago; deregistered once 7 days have passed" % (b["id"], days(since)))
+    elif pending(b):
+        says.append("%s waits: deprecation pending (scheduled within 10 minutes)" % b["id"])
+    elif b["public"]:
+        if not keep:
+            says.append("%s waits: there is no current public build" % b["id"])
+        elif current_age >= GRACE:
+            deprecations.append((b, "superseded; the current build %s is %s old" % (keep[0]["id"], days(current_age))))
+        else:
+            says.append("%s waits: the current build is %s old; older builds are deprecated once it is 7 days old"
+                        % (b["id"], days(current_age)))
+    else:
+        if age >= GRACE:
+            deprecations.append((b, "private build, %s old" % days(age)))
+        else:
+            says.append("%s waits: a private build, %s old; deprecated once 7 days old" % (b["id"], days(age)))
 
 for s in says:
     out("say", s)
@@ -250,7 +296,7 @@ mutate() {
 
 RC=0 ACTIONS=0 FOUND=0
 for r in $REGIONS; do
-  if ! aws ec2 describe-images --region "$r" --owners self --include-deprecated \
+  if ! aws ec2 describe-images --region "$r" --owners self --include-deprecated --include-disabled \
          --filters "Name=tag:$FENCE_KEY,Values=true" "Name=name,Values=$NAME_PREFIX-*" \
          --output json > "$W/images.json" 2> "$W/err" < /dev/null; then
     echo "✗ $r: describe-images failed: $(head -n1 "$W/err") — nothing is done in $r" >&2
@@ -266,7 +312,8 @@ for r in $REGIONS; do
   while IFS=$'\t' read -r kind a b c d; do
     case "$kind" in
       none) echo "$r: no published images" ;;
-      notfound) echo "$r: no image named $DISABLE (or it is already disabled)" ;;
+      notfound) echo "$r: no image named $DISABLE" ;;
+      already) FOUND=1; echo "$r: $a $b is already disabled" ;;
       say) echo "$r: $a" ;;
       deprecate)
         ACTIONS=$((ACTIONS+1))
@@ -283,11 +330,15 @@ for r in $REGIONS; do
           for s in $c; do echo "would delete-snapshot $s ($r)"; done
         else
           mutate "$r" "deregister $a $b" ec2 deregister-image --region "$r" --image-id "$a" || { RC=1; break; }
-          ok=1
-          for s in $c; do
-            mutate "$r" "delete-snapshot $s" ec2 delete-snapshot --region "$r" --snapshot-id "$s" || { ok=0; break; }
+          read -ra left <<< "$c"
+          while [ ${#left[@]} -gt 0 ]; do
+            mutate "$r" "delete-snapshot ${left[0]}" ec2 delete-snapshot --region "$r" --snapshot-id "${left[0]}" || break
+            left=("${left[@]:1}")
           done
-          [ "$ok" = 1 ] || { RC=1; break; }
+          if [ ${#left[@]} -gt 0 ]; then
+            echo "✗ $r: $a is deregistered, but these snapshots are left — delete them by hand in $r: ${left[*]}" >&2
+            RC=1; break
+          fi
         fi ;;
       disable)
         ACTIONS=$((ACTIONS+1)); FOUND=1
@@ -301,7 +352,7 @@ done
 
 echo
 if [ "$HAVE_DISABLE" = 1 ] && [ "$FOUND" = 0 ]; then
-  echo "✗ hardened-image-retire: no region holds an enabled image named $DISABLE" >&2
+  echo "✗ hardened-image-retire: no region holds an image named $DISABLE" >&2
   RC=1
 fi
 if [ "$ACTIONS" = 0 ]; then
