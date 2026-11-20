@@ -29,7 +29,9 @@ Traefik, no Falco, no Alloy and no SSM agent. No `v` release.
   cloud-init and before SSH, removes the cloud-init sudoers fragments and the
   `sudo`/`admin`/`adm`/`lxd` groups from `ubuntu` on every boot.
 - `base::share_helper` installs `/usr/local/sbin/idlefy-share`, which publishes
-  one `127.0.0.1` port through Tailscale Funnel or turns the share off; see
+  one `127.0.0.1` port through Tailscale Funnel or turns the share off. A share
+  is published only after the previous one was reset; a failed reset publishes
+  nothing and exits non-zero. See
   "idlefy-share" in `cinc/README.md`. The grant,
   `/etc/sudoers.d/51-idlefy-share`, is written by `base::sudoers` only when
   `base.share_helper.enabled` is true, and the attribute defaults to `false`.
@@ -37,7 +39,9 @@ Traefik, no Falco, no Alloy and no SSM agent. No `v` release.
   matching Falco exclusion pages on every legitimate share (the same coupling as
   AGENTS.md trap 7).
 - `base::no_ssm_agent` removes the `amazon-ssm-agent` snap Canonical's AMIs
-  ship, after waiting for snapd to finish seeding. `solo` only.
+  ship, after waiting (at most 600 s) for snapd to finish seeding. A failed
+  wait or a failed `snap list` fails the converge rather than skipping the
+  removal, and a snap still listed after the removal fails it too. `solo` only.
 - `base.firewall.public_web_ports` (default `[80, 443]`, what the fleet has
   always opened) names the ports opened to the world beyond SSH.
 - **Fleet-visible:** `base::firewall` and `base::imds` now do on IPv6 what they
@@ -47,13 +51,21 @@ Traefik, no Falco, no Alloy and no SSM agent. No `v` release.
   Instance Connect uid, as `169.254.169.254` already was. Rules are saved to
   `/etc/iptables/rules.v6`. The v6 default policies are set after every v6
   accept, so a converge that fails midway cannot leave v6 at `DROP` without
-  them.
-- **Fleet-visible:** the SSH and `public_web_ports` guards, v4 and v6, match
-  the whole `--dport N -j ACCEPT` token. The old `dport 22.*ACCEPT` was
-  satisfied by a rule for 2222 (and 80 by 8080), silently skipping the real
-  port. Rules the old guards created still match, so a converged VM adds
-  nothing. Removing a port from `public_web_ports` does not close it on a
-  converged VM.
+  them. Every v6 accept is guarded by `ip6tables -C` with its own arguments,
+  and the v6 policy guards match the whole `-P` line.
+- **Fleet-visible:** the SSH and `public_web_ports` guards, v4 and v6, are
+  `-C INPUT -p tcp --dport N -j ACCEPT`: only that exact rule satisfies them.
+  The old `dport 22.*ACCEPT` was satisfied by a rule for 2222 (and 80 by
+  8080), and a substring match by a UDP or source-restricted rule for the same
+  port, each silently skipping the real one. Rules the old guards created are
+  that exact rule, so a converged VM adds nothing. Removing a port from
+  `public_web_ports` does not close it on a converged VM.
+- **Fleet-visible:** `base::imds` guards, v4 and v6, are `-C OUTPUT` checks of
+  their own rule, so the same text in another chain or table no longer skips
+  the OUTPUT rule. The DROP goes in right after the last owner-allow present:
+  `-I OUTPUT 3` on a normal host, as before; on a host without the Instance
+  Connect user, where a fixed 3 failed with "Index of insertion too big" and
+  aborted the converge before the DROP, it now lands after the root allow.
 - New gate: `make test-share-helper` (stubs `tailscale`; no tailnet needed),
   part of the `base` stream.
 

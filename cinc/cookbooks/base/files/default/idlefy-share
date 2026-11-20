@@ -4,8 +4,9 @@
 # ubuntu may run as root; sudoers grants it with `*`, so THIS FILE is the whole
 # control: one argument, a port or "off", nothing else is ever passed on.
 #
-#   sudo idlefy-share <port 1024-65535>   reset any share, then funnel
-#                                          http://127.0.0.1:<port> on public 443
+#   sudo idlefy-share <port 1024-65535>   reset any share; only if that worked,
+#                                          funnel http://127.0.0.1:<port> on
+#                                          public 443
 #   sudo idlefy-share off                 reset (remove the share)
 #   anything else                          usage on stderr, exit 64, no tailscale call
 #
@@ -45,6 +46,9 @@ case "$1" in
   off) exec "$TAILSCALE" funnel reset ;;
   *) [[ $1 =~ ^[1-9][0-9]{3,4}$ ]] || usage
      port=$((10#$1)); [ "$port" -ge 1024 ] && [ "$port" -le 65535 ] || usage
-     "$TAILSCALE" funnel reset >/dev/null 2>&1 || true   # one share at a time; nothing configured is not an error
+     # One share at a time: publish only after the reset succeeded, or the old
+     # share could stay live beside the new one. Its stderr and exit status
+     # reach the caller. (A reset with nothing configured succeeds.)
+     "$TAILSCALE" funnel reset >/dev/null || { rc=$?; echo 'idlefy-share: reset failed; nothing published' >&2; exit "$rc"; }
      exec "$TAILSCALE" funnel --bg "http://127.0.0.1:$port" ;;
 esac

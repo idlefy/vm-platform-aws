@@ -101,10 +101,12 @@ sudo idlefy-share off    # stop sharing
 ```
 
 - `<port>` must match `^[1-9][0-9]{3,4}$` and lie in 1024–65535. The helper runs
-  `/usr/bin/tailscale funnel reset` (a failure there is tolerated — nothing may
-  be configured yet), then `/usr/bin/tailscale funnel --bg
-  http://127.0.0.1:<port>`. The public side is always port 443, and there is one
-  share at a time: every share starts with that reset.
+  `/usr/bin/tailscale funnel reset`, and only if that succeeded `/usr/bin/tailscale
+  funnel --bg http://127.0.0.1:<port>`. The public side is always port 443, and
+  there is one share at a time: every share starts with that reset. A failed
+  reset publishes nothing — the old share might still be live — and the helper
+  exits with the reset's status after its message. (A reset with nothing
+  configured succeeds.)
 - `off` runs `/usr/bin/tailscale funnel reset`.
 - Anything else — no argument, two, `080`, `3000x`, a path, a URL — prints
   `usage: idlefy-share <port 1024-65535> | off` to stderr and exits **64**
@@ -137,6 +139,11 @@ containers**. On both, OUTPUT lets two uids through and drops everyone else:
 - **ec2-instance-connect** — fetches ephemeral SSH keys. `recipes/imds.rb`
   resolves the uid at converge time rather than hard-coding it, because it is
   not fixed across images
+
+The DROP goes in right after the last of those allows present, so a host
+without the Instance Connect user still gets it (after the root allow) rather
+than failing the converge. Each rule's guard is `-C OUTPUT` with that rule's
+own arguments: the same text in another chain or table does not count.
 
 This prevents developers/containers from accessing IAM role credentials and SSM secrets.
 

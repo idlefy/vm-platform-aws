@@ -7,6 +7,8 @@
 # Policyfile's attributes actually win at the precedence a Policyfile uses.
 require 'chefspec'
 require_relative '../../libraries/imds'
+require_relative '../../libraries/imds_firewall'
+require_relative '../../libraries/snap'
 require_relative '../support/home_boundary'
 
 SOLO_RECIPES = %w(
@@ -53,7 +55,9 @@ describe 'base::solo' do
     # whether its action runs — so one answer for all of them is enough.
     stub_command(/.*/).and_return(false)
     # Except the SSM snap guard: answer "installed", so the removal is in the run.
-    stub_command('snap wait system seed.loaded && snap list amazon-ssm-agent').and_return(true)
+    allow(DevVm::Snap).to receive(:installed?).with('amazon-ssm-agent').and_return(true)
+    # base::imds computes the DROP's position from the live OUTPUT chain.
+    allow(DevVm::ImdsFirewall).to receive(:list_output).and_return("-P OUTPUT ACCEPT\n")
   end
 
   before { stub_world }

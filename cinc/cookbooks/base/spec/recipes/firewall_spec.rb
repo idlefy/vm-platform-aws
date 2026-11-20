@@ -60,46 +60,86 @@ describe 'base::firewall' do
     expect(names.index('ip6tables-default-drop-input')).to be < names.index('save-ip6tables')
   end
 
-  # Each port guard runs for real against a fake iptables/ip6tables that prints
-  # a given rule set. The old guards (`dport 22.*ACCEPT`) were satisfied by a
-  # 2222 rule, so 22 was silently never opened; same for 80 vs 8080.
-  context 'port guards match the whole --dport N -j ACCEPT token' do
-    let(:chef_run) { converge }
-
-    def guard_holds?(resource_name, rules)
-      guard = chef_run.execute(resource_name).not_if.first.command
-      Dir.mktmpdir do |dir|
-        File.write(File.join(dir, 'rules'), rules)
-        %w(iptables ip6tables iptables-save ip6tables-save).each do |bin|
-          path = File.join(dir, bin)
-          File.write(path, "#!/bin/sh\ncat '#{dir}/rules'\n")
-          File.chmod(0o755, path)
-        end
-        _out, status = Open3.capture2e({ 'PATH' => "#{dir}:/usr/bin:/bin" }, '/bin/sh', '-c', guard)
-        status.success?
+  # Each guard runs for real against a fake iptables/ip6tables: `-C` succeeds
+  # only for an exact argument list in `checks` (as the kernel matches a rule,
+  # not its text), while `-S` and `*-save` print `rendered`, the real `-S`
+  # rendering. The old guards (`dport 22.*ACCEPT`) were satisfied by a 2222
+  # rule, and the `--dport N -j ACCEPT` substring guards by a UDP or a
+  # source-restricted rule for N: each silently skipped the real TCP accept.
+  def guard_holds?(chef_run, resource_name, checks, rendered)
+    guard = chef_run.execute(resource_name).not_if.first.command
+    Dir.mktmpdir do |dir|
+      File.write(File.join(dir, 'checks'), checks)
+      File.write(File.join(dir, 'rendered'), rendered)
+      %w(iptables ip6tables).each do |bin|
+        File.write(File.join(dir, bin), <<~SH)
+          #!/bin/sh
+          if [ "$1" = -C ]; then shift; grep -qxF -- "$*" '#{dir}/checks'; else cat '#{dir}/rendered'; fi
+        SH
+        File.write(File.join(dir, "#{bin}-save"), "#!/bin/sh\ncat '#{dir}/rendered'\n")
+        [bin, "#{bin}-save"].each { |b| File.chmod(0o755, File.join(dir, b)) }
       end
+      _out, status = Open3.capture2e({ 'PATH' => "#{dir}:/usr/bin:/bin" }, '/bin/sh', '-c', guard)
+      status.success?
     end
+  end
 
-    lookalikes = <<~RULES
-      -P INPUT DROP
-      -A INPUT -p tcp -m tcp --dport 2222 -j ACCEPT
-      -A INPUT -p tcp -m tcp --dport 8080 -j ACCEPT
-      -A INPUT -p tcp -m tcp --dport 4443 -j ACCEPT
-      -A INPUT -p tcp -m tcp --dport 1443 -j ACCEPT
-    RULES
+  context 'port guards match only the exact TCP accept' do
+    let(:chef_run) { converge }
 
     { 22 => 'ssh', 80 => 'tcp-80', 443 => 'tcp-443' }.each do |port, suffix|
       %w(iptables ip6tables).each do |family|
         name = "#{family}-allow-#{suffix}"
+        src = family == 'iptables' ? '192.0.2.0/24' : '2001:db8::/32'
+        lookalikes = {
+          'a look-alike port' => ["INPUT -p tcp --dport #{port}0 -j ACCEPT", "-A INPUT -p tcp -m tcp --dport #{port}0 -j ACCEPT"],
+          'a UDP rule for the port' => ["INPUT -p udp --dport #{port} -j ACCEPT", "-A INPUT -p udp -m udp --dport #{port} -j ACCEPT"],
+          'a source-restricted rule for the port' => ["INPUT -s #{src} -p tcp --dport #{port} -j ACCEPT",
+                                                      "-A INPUT -s #{src} -p tcp -m tcp --dport #{port} -j ACCEPT"],
+        }
 
-        it "#{name}: a look-alike port does not suppress it" do
-          expect(guard_holds?(name, lookalikes)).to be(false)
+        lookalikes.each do |label, (check, rendered)|
+          it "#{name}: #{label} does not suppress it" do
+            expect(guard_holds?(chef_run, name, "#{check}\n", "-P INPUT DROP\n#{rendered}\n")).to be(false)
+          end
         end
 
         it "#{name}: its own rule does" do
-          expect(guard_holds?(name, lookalikes + "-A INPUT -p tcp -m tcp --dport #{port} -j ACCEPT\n")).to be(true)
+          expect(guard_holds?(chef_run, name, "INPUT -p tcp --dport #{port} -j ACCEPT\n",
+                              "-P INPUT DROP\n-A INPUT -p tcp -m tcp --dport #{port} -j ACCEPT\n")).to be(true)
         end
       end
+    end
+  end
+
+  # Every v6 accept, and every v4 port accept, is guarded by `-C` with exactly
+  # the arguments its command inserts — nothing narrower or different can
+  # satisfy it.
+  it 'guards each v6 accept and each v4 port accept with -C on its own arguments' do
+    executes = converge.resource_collection.all_resources.select { |r| r.declared_type.to_s == 'execute' }
+    checked = executes.select do |r|
+      r.command.to_s.start_with?('ip6tables -A INPUT', 'ip6tables -I INPUT') ||
+        r.command.to_s.match?(/\Aiptables -A INPUT -p tcp --dport \d+ -j ACCEPT\z/)
+    end
+    expect(checked.size).to eq(11)
+    checked.each do |r|
+      expected = r.command.sub(/\A(ip6?tables) -[AI] INPUT (\d+ )?/, '\1 -C INPUT ')
+      expect(r.not_if.map(&:command)).to eq([expected]), r.to_s
+    end
+  end
+
+  context 'v6 policy guards match the whole -P line' do
+    let(:chef_run) { converge }
+    comment = "-A INPUT -m comment --comment \"-P INPUT DROP -P OUTPUT ACCEPT\" -j ACCEPT\n"
+
+    it 'a rule whose comment spells the policy does not suppress it' do
+      expect(guard_holds?(chef_run, 'ip6tables-default-drop-input', '', "-P INPUT ACCEPT\n#{comment}")).to be(false)
+      expect(guard_holds?(chef_run, 'ip6tables-default-accept-output', '', "-P OUTPUT DROP\n#{comment}")).to be(false)
+    end
+
+    it 'the policy line does' do
+      expect(guard_holds?(chef_run, 'ip6tables-default-drop-input', '', "-P INPUT DROP\n")).to be(true)
+      expect(guard_holds?(chef_run, 'ip6tables-default-accept-output', '', "-P OUTPUT ACCEPT\n")).to be(true)
     end
   end
 end

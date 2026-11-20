@@ -5,6 +5,7 @@
 # what a recipe added next year fails.
 require 'chefspec'
 require_relative '../../libraries/imds'
+require_relative '../../libraries/imds_firewall'
 require_relative '../support/home_boundary'
 
 SIGNER = 'ops namespaces="dev-vm-policy-production" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMkEu+CUWYGvccB0PoBw6SX1d6kJOSy2vALB7cAntO+E'.freeze
@@ -25,6 +26,8 @@ describe 'base::default' do
 
   before do
     allow(DevVm::Imds).to receive(:region).and_return('eu-central-1')
+    # base::imds computes the DROP's position from the live OUTPUT chain.
+    allow(DevVm::ImdsFirewall).to receive(:list_output).and_return("-P OUTPUT ACCEPT\n")
     # base::nvidia_docker returns at compile time unless /dev/nvidia0 exists, so
     # on a GPU-less runner none of its resources would enter the collection and
     # the boundary would not be checked there. Pretend the device exists.

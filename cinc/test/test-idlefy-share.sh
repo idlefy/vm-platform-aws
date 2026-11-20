@@ -40,6 +40,7 @@ setup() {
 printf '%s\n' "$*" >> "$STUB_CALLS"
 echo "stub: $*"
 if [ "${1:-} ${2:-}" = "funnel reset" ]; then
+  [ "${STUB_RESET_RC:-0}" = 0 ] || echo "stub-err: reset failed" >&2
   exit "${STUB_RESET_RC:-0}"
 fi
 exit "${STUB_RC:-0}"
@@ -76,11 +77,16 @@ check "reset's output is not shown" "$(grep -c 'stub: funnel reset' "$WORK/out")
 check "nothing on stderr" "$(wc -c < "$WORK/err")" "0"
 teardown
 
-echo "--- a failing reset does not stop the share ---"
+# A failed reset may leave the previous share live; publishing a second one
+# beside it would break "one share at a time" while reporting success.
+echo "--- a failing reset publishes nothing ---"
 setup
-STUB_RESET_RC=1 run 3000
-check "exit code" "$rc" "0"
-check "still proceeds to funnel --bg" "$(calls)" "funnel reset|funnel --bg http://127.0.0.1:3000|"
+STUB_RESET_RC=3 run 3000
+check "exit code is reset's" "$rc" "3"
+check "no funnel --bg after the reset" "$(calls)" "funnel reset|"
+check "reset's stderr reaches the caller" "$(grep -c '^stub-err: reset failed$' "$WORK/err")" "1"
+check "says nothing was published" "$(grep -c '^idlefy-share: reset failed; nothing published$' "$WORK/err")" "1"
+check "nothing on stdout" "$(wc -c < "$WORK/out")" "0"
 teardown
 
 echo "--- funnel failure passes through ---"
@@ -127,8 +133,9 @@ teardown
 
 echo "--- off passes reset's failure through ---"
 setup
-STUB_RESET_RC=1 run off
-check "exit code is reset's" "$rc" "1"
+STUB_RESET_RC=3 run off
+check "exit code is reset's" "$rc" "3"
+check "reset's stderr reaches the caller" "$(grep -c '^stub-err: reset failed$' "$WORK/err")" "1"
 teardown
 
 echo "--- source shape ---"
@@ -141,7 +148,7 @@ check "no eval" "$(grep -cw 'eval' "$SCRIPT")" "0"
 # environment, so a new variable it did not declare is a new input.
 check "only allowlisted variables are expanded" \
   "$(grep -oE '\$\{?[A-Za-z_][A-Za-z0-9_]*' "$SCRIPT" | tr -d '${' | sort -u \
-     | grep -vxE 'TAILSCALE|PATH|LC_ALL|port' | tr '\n' ' ')" ""
+     | grep -vxE 'TAILSCALE|PATH|LC_ALL|port|rc' | tr '\n' ' ')" ""
 check "positional parameters are only \$1 and \$#" \
   "$(grep -oE '\$\{?[0-9@*#]' "$SCRIPT" | tr -d '${' | sort -u | grep -vxE '1|#' | tr '\n' ' ')" ""
 

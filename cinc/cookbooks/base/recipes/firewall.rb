@@ -123,14 +123,16 @@ end
 
 # Allow SSH (port 22)
 #
-# Port guards here and below match the whole `--dport N -j ACCEPT` token of the
-# `-S` rendering (`-A INPUT -p tcp -m tcp --dport 22 -j ACCEPT`). The old
-# `dport 22.*ACCEPT` was satisfied by a rule for 2222 (and `dport 80.*` by
-# 8080), which silently skipped opening the real port. The rules the old
-# guards created render the same way, so a converged VM adds nothing.
+# Port guards here and below are `-C INPUT` with the same arguments as the
+# append: they hold only when that exact rule — TCP, any source, port N — is
+# in INPUT. The old `dport 22.*ACCEPT` was satisfied by a rule for 2222 (and
+# `dport 80.*` by 8080), and a `--dport N -j ACCEPT` substring still by a UDP
+# or source-restricted rule for N; each silently skipped opening the real
+# port (measured with real ip6tables in a network namespace). The rules the
+# old guards created are this exact rule, so a converged VM adds nothing.
 execute 'iptables-allow-ssh' do
   command 'iptables -A INPUT -p tcp --dport 22 -j ACCEPT'
-  not_if "iptables -S INPUT | grep -qF -- '--dport 22 -j ACCEPT'"
+  not_if 'iptables -C INPUT -p tcp --dport 22 -j ACCEPT'
   notifies :run, 'execute[save-iptables]', :delayed
 end
 
@@ -141,7 +143,7 @@ end
 node['base']['firewall']['public_web_ports'].each do |port|
   execute "iptables-allow-tcp-#{port}" do
     command "iptables -A INPUT -p tcp --dport #{port} -j ACCEPT"
-    not_if "iptables -S INPUT | grep -qF -- '--dport #{port} -j ACCEPT'"
+    not_if "iptables -C INPUT -p tcp --dport #{port} -j ACCEPT"
     notifies :run, 'execute[save-iptables]', :delayed
   end
 end
@@ -156,10 +158,12 @@ end
 # The same policy on ip6tables, one resource per v4 resource above. Before
 # this block, ip6tables was never touched: INPUT stayed ACCEPT, so on a VM
 # with an IPv6 address the security group was the only filter in front of
-# every listening port. Each guard is anchored on `ip6tables -S` / `ip6tables-save`
-# output exactly as its v4 twin is. There is no v6 dedupe resource: nothing
-# ever ran the v6 rules with the old broken guard shape, so there is nothing
-# to collapse.
+# every listening port. Every v6 accept guard is `ip6tables -C INPUT` with the
+# same arguments as its own insert, so only that exact rule satisfies it — a
+# look-alike (another interface, a narrower source, UDP instead of TCP) does
+# not; the policy guards match the whole `-P` line. There is no v6 dedupe
+# resource: nothing ever ran the v6 rules with the old broken guard shape, so
+# there is nothing to collapse.
 #
 # Two accepts have no v4 twin, and both are unconditional:
 #
@@ -177,32 +181,30 @@ end
 #   a DHCPv6 server on a link is always link-local, so nothing off-link can
 #   use this hole.
 
-# Guard anchored the same way as iptables-allow-established: `-S` renders the
-# state list as RELATED,ESTABLISHED, chain name first.
 execute 'ip6tables-allow-established' do
   command 'ip6tables -I INPUT 1 -m state --state ESTABLISHED,RELATED -j ACCEPT'
-  not_if "ip6tables -S INPUT | grep -q -- '--state RELATED,ESTABLISHED -j ACCEPT'"
+  not_if 'ip6tables -C INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT'
   notifies :run, 'execute[save-ip6tables]', :delayed
 end
 
 execute 'ip6tables-allow-loopback' do
   command 'ip6tables -I INPUT 2 -i lo -j ACCEPT'
-  not_if "ip6tables -S INPUT | grep -q -- '-i lo -j ACCEPT'"
+  not_if 'ip6tables -C INPUT -i lo -j ACCEPT'
   notifies :run, 'execute[save-ip6tables]', :delayed
 end
 
-# `-S` prints the protocol by its /etc/protocols name, ipv6-icmp; older
-# ip6tables builds printed icmpv6, so the guard accepts either spelling.
+# `-C` compares the rule, not its spelling: a rule added as `-p icmpv6` (what
+# older ip6tables builds printed) satisfies it too.
 execute 'ip6tables-allow-icmpv6' do
   command 'ip6tables -A INPUT -p ipv6-icmp -j ACCEPT'
-  not_if "ip6tables -S INPUT | grep -qE -- '-p (ipv6-icmp|icmpv6) -j ACCEPT'"
+  not_if 'ip6tables -C INPUT -p ipv6-icmp -j ACCEPT'
   notifies :run, 'execute[save-ip6tables]', :delayed
 end
 
 # Rendered as `-A INPUT -s fe80::/10 -p udp -m udp --sport 547 --dport 546 -j ACCEPT`.
 execute 'ip6tables-allow-dhcpv6' do
   command 'ip6tables -A INPUT -p udp -s fe80::/10 --sport 547 --dport 546 -j ACCEPT'
-  not_if "ip6tables -S INPUT | grep -q -- '--sport 547 --dport 546 -j ACCEPT'"
+  not_if 'ip6tables -C INPUT -p udp -s fe80::/10 --sport 547 --dport 546 -j ACCEPT'
   notifies :run, 'execute[save-ip6tables]', :delayed
 end
 
@@ -210,20 +212,20 @@ end
 # survive a netfilter-persistent reload, on v6 either.
 execute 'ip6tables-allow-tailscale' do
   command 'ip6tables -A INPUT -i tailscale0 -j ACCEPT'
-  not_if "ip6tables -S INPUT | grep -q -- '-i tailscale0 -j ACCEPT'"
+  not_if 'ip6tables -C INPUT -i tailscale0 -j ACCEPT'
   notifies :run, 'execute[save-ip6tables]', :delayed
 end
 
 execute 'ip6tables-allow-ssh' do
   command 'ip6tables -A INPUT -p tcp --dport 22 -j ACCEPT'
-  not_if "ip6tables -S INPUT | grep -qF -- '--dport 22 -j ACCEPT'"
+  not_if 'ip6tables -C INPUT -p tcp --dport 22 -j ACCEPT'
   notifies :run, 'execute[save-ip6tables]', :delayed
 end
 
 node['base']['firewall']['public_web_ports'].each do |port|
   execute "ip6tables-allow-tcp-#{port}" do
     command "ip6tables -A INPUT -p tcp --dport #{port} -j ACCEPT"
-    not_if "ip6tables -S INPUT | grep -qF -- '--dport #{port} -j ACCEPT'"
+    not_if "ip6tables -C INPUT -p tcp --dport #{port} -j ACCEPT"
     notifies :run, 'execute[save-ip6tables]', :delayed
   end
 end
@@ -235,13 +237,13 @@ end
 # accepts before the DROP opens nothing new.)
 execute 'ip6tables-default-drop-input' do
   command 'ip6tables -P INPUT DROP'
-  not_if 'ip6tables -S | grep -q "\\-P INPUT DROP"'
+  not_if "ip6tables -S INPUT | grep -qx -- '-P INPUT DROP'"
   notifies :run, 'execute[save-ip6tables]', :delayed
 end
 
 execute 'ip6tables-default-accept-output' do
   command 'ip6tables -P OUTPUT ACCEPT'
-  not_if 'ip6tables -S | grep -q "\\-P OUTPUT ACCEPT"'
+  not_if "ip6tables -S OUTPUT | grep -qx -- '-P OUTPUT ACCEPT'"
   notifies :run, 'execute[save-ip6tables]', :delayed
 end
 
