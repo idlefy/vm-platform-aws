@@ -197,7 +197,7 @@ if [ -n "${PACKER_HOLD:-}" ]; then
   else
     # Its clean-up (terminating the instance) takes a while; the driver must
     # wait for it before it lists leftovers.
-    trap 'echo interrupted >> "$PACKER_LOG"; echo "1697000002,,ui,error,Build was cancelled."; sleep 1; echo "packer cleaned-up" >> "$ORDER_LOG"; exit 1' INT
+    trap 'echo interrupted >> "$PACKER_LOG"; echo "1697000002,,ui,error,Build was cancelled."; sleep "${PACKER_CLEANUP:-1}"; echo "packer cleaned-up" >> "$ORDER_LOG"; exit 1' INT
   fi
   end=$((SECONDS + PACKER_HOLD))
   while [ "$SECONDS" -lt "$end" ]; do sleep 0.1; done
@@ -258,6 +258,9 @@ run_build() {
     local pid=$! n=0
     while ! grep -q "${SIG_WHEN:-^ami_name=}" "$T/${SIG_LOG:-packer.log}" && [ $n -lt 600 ]; do sleep 0.05; n=$((n+1)); done
     kill -"$SIG_EARLY" -- "-$pid" 2>/dev/null
+    # SIG_THEN: a second signal SIG_GAP seconds later, as a runner sends TERM
+    # 7.5 s after its INT.
+    [ -z "${SIG_THEN:-}" ] || { sleep "${SIG_GAP:-0.5}"; kill -"$SIG_THEN" -- "-$pid" 2>/dev/null; }
     wait "$pid"; rc=$?
     SESSION=$pid
   elif [ -z "${TERM_MID_PACKER:-}" ]; then
@@ -334,8 +337,8 @@ L_EXEC=$(ud | grep -nxF 'exec >/dev/console 2>&1' | cut -d: -f1)
 L_LAST=$(ud | wc -l)
 check "output leaves the log file after both files and before the scrub" \
   "$([ -n "$L_EXEC" ] && [ -n "$L_FILES" ] && [ "$L_EXEC" -gt "$L_FILES" ] && [ "$L_EXEC" -lt "$L_LAST" ]; echo $?)"
-check "the last line runs the solo scrub with the archive's sha256" \
-  "$([ "$(ud | tail -1)" = "/usr/local/sbin/dev-vm-image-scrub --profile solo $STORED_SHA" ]; echo $?)"
+check "the last line execs the solo scrub with the archive's sha256 (bash drops its hold on the script)" \
+  "$([ "$(ud | tail -1)" = "exec /usr/local/sbin/dev-vm-image-scrub --profile solo $STORED_SHA" ]; echo $?)"
 check "the record is written" "$([ -f "$RECORD" ]; echo $?)"
 check "the record has exactly the schema" "$(python3 -I - "$RECORD" "$STORED_SHA" "$SHA" "$URL" "$DATE" "${REGIONS[@]}" <<'PY'
 import json, re, sys
@@ -514,6 +517,9 @@ check "--clean-build terminates exactly those instances and deletes only the pac
      && [ "$(grep -c 'terminate-instances\|delete-key-pair' "$T/aws.log")" = 3 ] \
      && grep -qxF '   terminated i-0abc' "$T/lo.out" && grep -qxF '   deleted key pair packer_6740c0de' "$T/lo.out"; echo $?)"
 check "...and never touches an image" "$(! grep -qE '^aws ec2 (deregister|delete-snapshot|disable|modify)' "$T/aws.log"; echo $?)"
+check "...removing them before the image listing (the instance costs money; the step may be near its deadline)" \
+  "$(t=$(grep -n '^aws ec2 delete-key-pair' "$T/aws.log" | tail -1 | cut -d: -f1); i=$(grep -n '^aws ec2 describe-images' "$T/aws.log" | head -1 | cut -d: -f1); \
+     [ -n "$t" ] && [ -n "$i" ] && [ "$t" -lt "$i" ]; echo $?)"
 : > "$T/aws.log"; BUILD_INSTANCES="i-0abc:running" BUILD_KEYS="packer_6740c0de" lo --clean-build
 check "--clean-build without a name (no name file) → images not listed, build resources removed" \
   "$([ $? -eq 0 ] && ! grep -qF 'describe-images' "$T/aws.log" && grep -qF 'terminate-instances' "$T/aws.log" \
@@ -610,9 +616,20 @@ done
 check "every exit-70 message of the scrubs starts 'internal error' or 'refusing'" \
   "$(! grep -hoE 'log "[^"]*"' "$R/image/files/dev-vm-image-scrub" "$R/image/files/dev-vm-image-scrub-solo" \
        | grep -vE '^log "(internal error|refusing)[ :]|^log "note: ' | grep -q .; echo $?)"
-check "the banner the watcher matches is the one bootstrap-solo prints" \
-  "$(grep -qxF '    echo "BOOTSTRAP FAILED: no image will be taken. Log follows."' "$R/image/files/bootstrap-solo" \
-     && grep -qF "'BOOTSTRAP FAILED: no image will be taken. Log follows.'" "$R/scripts/hardened-image-build.sh"; echo $?)"
+check "the banner the watcher matches is the one bootstrap-solo prints, after a newline" \
+  "$(grep -A1 -xF '    echo' "$R/image/files/bootstrap-solo" | grep -qxF '    echo "BOOTSTRAP FAILED: no image will be taken. Log follows."' \
+     && grep -qF '?BOOTSTRAP FAILED: no image will be taken\\. Log follows\\.\$" ' "$R/scripts/hardened-image-build.sh"; echo $?)"
+# An unterminated getty prompt may sit before a marker.
+for c in 'ip-10-0-1-5 login: BOOTSTRAP FAILED: no image will be taken. Log follows.' \
+         'ip-10-0-1-5 login: dev-vm-image-scrub: refusing: x; no image will be taken' \
+         'ip-10-0-1-5 login: \nBOOTSTRAP FAILED: no image will be taken. Log follows.'; do
+  CONSOLE_OUTPUT="boot\n$c" HARDENED_CONSOLE_POLL=0.2 PACKER_HOLD=30 run_build; rc=$?
+  check "a marker after a login prompt ('${c:0:40}…') → interrupted" "$([ $rc -ne 0 ] && grep -qx interrupted "$T/packer.log"; echo $?)"
+done
+CONSOLE_OUTPUT='ip-10-0-1-5 login: root typed dev-vm-image-scrub: refusing: x\nlogin: BOOTSTRAP FAILED: no image will be taken. Log follows.' \
+  HARDENED_CONSOLE_POLL=0.2 PACKER_HOLD=3 run_build; rc=$?
+check "a marker after other prompt text, or after a bare 'login: ' → no interrupt, exit 0" \
+  "$([ $rc -eq 0 ] && ! grep -qx interrupted "$T/packer.log"; echo $?)"
 CONSOLE_OUTPUT='BOOTSTRAP FAILED: no image will be taken. Log follows.' PACKER_INT_OK=1 HARDENED_CONSOLE_POLL=0.2 PACKER_HOLD=30 run_build; rc=$?
 check "Packer takes the interrupt yet exits 0 with a full artifact → the driver still fails, no record" \
   "$([ $rc -ne 0 ] && grep -qx interrupted "$T/packer.log" && [ ! -e "$RECORD" ] \
@@ -644,7 +661,7 @@ for sig in INT TERM; do
   check "...Packer's worker got the interrupt through its wrapper; wrapper and worker ended" \
     "$(grep -qx interrupted "$T/packer.log" && packer_gone; echo $?)"
   check "...Packer was waited for: its clean-up ended before the leftovers were listed" \
-    "$(before 'packer cleaned-up' 'aws ec2 describe-images' "$T/order.log"; echo $?)"
+    "$(before 'packer cleaned-up' 'aws ec2 describe-instances' "$T/order.log"; echo $?)"
   check "...the pipe Packer writes to survived the signal: its cancel line reached the log" \
     "$(grep -qxF 'Build was cancelled.' "$T/stdout"; echo $?)"
   check "...no process of the session is left, checked at once (the watcher's long sleep too)" "$(session_gone; echo $?)"
@@ -656,6 +673,14 @@ for sig in INT TERM; do
   check "...no process of the session is left, checked at once (the hung read too)" "$(session_gone; echo $?)"
   [ -z "$SESSION" ] || pkill -s "$SESSION" 2>/dev/null || true
 done
+
+# A runner's cancel: INT, then TERM while Packer is still cleaning up.
+SESSION=""; HARDENED_CONSOLE_POLL=600 PACKER_HOLD=30 PACKER_CLEANUP=3 SIG_EARLY=INT SIG_THEN=TERM SIG_GAP=1 run_build; rc=$?
+check "INT, then TERM during Packer's 3 s clean-up → exit 130 (the first status), not 143" "$([ $rc -eq 130 ]; echo $?)"
+check "...Packer's clean-up still ended before the leftovers were listed" \
+  "$(before 'packer cleaned-up' 'aws ec2 describe-instances' "$T/order.log" && grep -q '^aws ec2 describe-images' "$T/order.log"; echo $?)"
+check "...wrapper, worker and every process of the session are gone" "$(packer_gone && session_gone; echo $?)"
+[ -z "$SESSION" ] || pkill -s "$SESSION" 2>/dev/null || true
 
 echo "== public=false and an attached org =="
 PUBLIC=false ORG=0b7c3c1e-5f0e-4b8e-9a51-3f0c2d1e4a5b run_build; check "exits 0" "$?"

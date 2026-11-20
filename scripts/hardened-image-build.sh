@@ -295,9 +295,14 @@ PY
     printf 'DEV_VM_IMAGE_SCRUB\n'
   done
   # The scrub deletes /var/log/user-data.log while this shell holds it open;
-  # its blocks would be freed untrimmed into the public snapshot.
+  # its blocks would be freed only at power-off, after the zero-fill.
   printf 'exec >/dev/console 2>&1\n'
-  printf '/usr/local/sbin/dev-vm-image-scrub --profile solo %s\n' "$ARCHIVE_SHA256"
+  # exec: bash holds this script (cloud-init's part-001) open close-on-exec,
+  # and cloud-init clean deletes it; exec drops that hold, so its blocks are
+  # freed before the fill. The bootstrap's ERR trap is already cleared, so
+  # nothing changes on failure: the scrub's exit status is the script's, and
+  # a refusal leaves the instance running as before.
+  printf 'exec /usr/local/sbin/dev-vm-image-scrub --profile solo %s\n' "$ARCHIVE_SHA256"
 } >> "$UD_PLAIN"
 left="$(grep -oE '__[A-Z0-9_]+__' "$UD_PLAIN" | sort -u | tr '\n' ' ')" || true
 [ -z "$left" ] || die "the user data still holds placeholders: $left— render them in this script"
@@ -323,7 +328,7 @@ IMAGES_MAY_EXIST=1
 # started (below). Every way out of this script — a normal end, a failure,
 # INT, TERM — passes through on_exit, which stops and reaps the watcher, then
 # interrupts Packer and waits for it.
-WATCH_PID="" PIPE_PID=""
+WATCH_PID="" PIPE_PID="" PK_STATE=""
 # shellcheck disable=SC2317  # reached through on_exit and after packer build
 stop_watch() {
   [ -n "$WATCH_PID" ] || return 0
@@ -335,32 +340,48 @@ stop_watch() {
 # runner's INT/TERM to this script's group no longer reaches it by itself:
 # forward SIGINT to Packer's whole group (its panicwrap wrapper ignores
 # SIGINT, its worker cancels the build on it and cleans up: terminates the
-# instance, deletes the key pair) and wait for the pipeline to end. No
-# escalation to KILL: Packer's clean-up is what removes the instance; a runner
-# that will not wait kills the job itself, and the workflow's leftovers step
-# then removes what is left.
+# instance, deletes the key pair) and wait for the pipeline to end.
+#   - PK_STATE is "run" from just before the pipeline is started until its
+#     wait returns. Interrupted between the start and the assignment of
+#     PIPE_PID, the pipeline is the one job left once the watcher is reaped.
+#   - It waits, without a cap, until the launcher has recorded Packer's group
+#     or the pipeline has ended (it can only end by Packer exiting).
+#   - The SIGINT is repeated every 10 s while the group lives: Packer's worker
+#     takes the first and drops the rest (its handler reads one signal; the
+#     plugins discard every interrupt), and a repeat covers the instant after
+#     start-up when only the wrapper exists, which drops SIGINT.
+#   - No escalation to KILL: Packer's clean-up is what removes the instance; a
+#     runner that will not wait kills the job itself, and the workflow's
+#     leftovers step then removes what is left.
 # shellcheck disable=SC2317  # reached through on_exit
 stop_packer() {
   local pg="" n=0
-  [ -n "$PIPE_PID" ] || return 0
-  # Interrupted right as the pipeline started: give its launcher up to 5 s to
-  # record Packer's group.
+  [ "$PK_STATE" = run ] || return 0
+  [ -n "$PIPE_PID" ] || PIPE_PID="$(jobs -p | tail -n 1)"
   while :; do
     pg="$(cat "$W/packer.pid" 2>/dev/null)" || pg=""
     [[ ! $pg =~ ^[0-9]+$ ]] || break
-    kill -0 "$PIPE_PID" 2>/dev/null && [ "$n" -lt 50 ] || break
-    n=$((n + 1)); sleep 0.1
+    [ -n "$PIPE_PID" ] && kill -0 "$PIPE_PID" 2>/dev/null || break
+    sleep 0.1
   done
   if [[ $pg =~ ^[0-9]+$ ]] && kill -0 -- "-$pg" 2>/dev/null; then
     echo "Interrupting Packer; waiting for it to terminate the build instance and delete its key pair…" >&2
-    kill -INT -- "-$pg" 2>/dev/null || true
+    while kill -0 -- "-$pg" 2>/dev/null; do
+      [ $((n % 100)) -ne 0 ] || kill -INT -- "-$pg" 2>/dev/null || true
+      n=$((n + 1)); sleep 0.1
+    done
   fi
-  wait "$PIPE_PID" 2>/dev/null || true
-  PIPE_PID=""
+  [ -z "$PIPE_PID" ] || wait "$PIPE_PID" 2>/dev/null || true
+  PIPE_PID="" PK_STATE=done
 }
+# on_exit — first, INT and TERM are ignored from here on and the first exit
+# status kept: a runner's cancel sends INT, then TERM 7.5 s later, and the
+# second must not cut short the wait for Packer, the leftovers listing and
+# the clean-up. What it starts (the leftovers listing) inherits the ignore.
 # shellcheck disable=SC2317  # reached only through the trap
 on_exit() {
   local rc=$?
+  trap '' INT TERM
   stop_watch
   stop_packer
   if [ "$rc" -ne 0 ] && [ "$IMAGES_MAY_EXIST" = 1 ]; then
@@ -384,8 +405,9 @@ printf '%s\n' "$AMI_NAME" > "$HARDENED_OUT/hardened-ami-name"
 # exit-70 message the scrub logs; its "note:" lines are not refusals) — print
 # its tail and interrupt Packer with SIGINT: Packer then terminates the
 # instance and deletes its temporary key pair. Whole lines only, with a
-# trailing carriage return allowed: a console that merely quotes the banner
-# inside another line is not a failure.
+# trailing carriage return allowed, or after an unterminated getty prompt
+# (GETTY, below): a console that merely quotes the banner inside another line
+# is not a failure.
 # The instance is the one Packer itself names ("Instance ID: i-…" in its log),
 # never another run's. A console that cannot be read is noted once and is not
 # a failure of the build. A stopped instance's console reads empty (measured),
@@ -400,6 +422,11 @@ printf '%s\n' "$AMI_NAME" > "$HARDENED_OUT/hardened-ami-name"
 # panicwrap wrapper and a worker, and the wrapper swallows SIGINT (it forwards
 # only SIGTERM), so a SIGINT to the wrapper's pid alone never reaches the
 # worker that holds the build.
+# A marker may also follow a getty prompt left unterminated on the console
+# ("ip-10-0-1-5 login: "): bootstrap-solo and the solo scrub print a newline
+# before theirs, but the shared scrub's own refusals (unchangeable: it rides
+# in every fleet VM) do not.
+GETTY='[A-Za-z0-9][A-Za-z0-9.-]* login: '
 # shellcheck disable=SC2317  # runs in the background
 watch_console() {
   local pidfile=$1 driver=$$ pid="" iid="" noted=0 sp="" cp=""
@@ -427,9 +454,9 @@ watch_console() {
     cp=""
     # Whole lines; a serial console may end them with CR LF.
     tr -d '\r' < "$W/console" > "$W/console.lf" || continue
-    if grep -qxF 'BOOTSTRAP FAILED: no image will be taken. Log follows.' "$W/console.lf"; then
+    if grep -qE "^($GETTY)?BOOTSTRAP FAILED: no image will be taken\\. Log follows\\.\$" "$W/console.lf"; then
       echo "the bootstrap failed on the build instance" > "$W/build-failed"
-    elif grep -qE '^dev-vm-image-scrub: (internal error|refusing)[ :]' "$W/console.lf"; then
+    elif grep -qE "^($GETTY)?dev-vm-image-scrub: (internal error|refusing)[ :]" "$W/console.lf"; then
       echo "the image scrub refused the image on the build instance" > "$W/build-failed"
     fi
     if [ -e "$W/build-failed" ]; then
@@ -455,12 +482,14 @@ watch_console() {
 watch_console "$W/packer.pid" &
 WATCH_PID=$!
 PK_RC=0
+PK_STATE=run
 { trap '' INT TERM; python3 -I -c 'import os, signal, sys
 signal.signal(signal.SIGINT, signal.SIG_DFL)
 signal.signal(signal.SIGTERM, signal.SIG_DFL)
 os.setsid()
-with open(sys.argv[1], "w") as f:
+with open(sys.argv[1] + ".tmp", "w") as f:
     f.write("%d\n" % os.getpid())
+os.rename(sys.argv[1] + ".tmp", sys.argv[1])
 os.execvp(sys.argv[2], sys.argv[2:])' "$W/packer.pid" packer build -machine-readable \
   -var "ami_name=$AMI_NAME" \
   -var "build_region=$BUILD_REGION" \
@@ -481,7 +510,7 @@ os.execvp(sys.argv[2], sys.argv[2:])' "$W/packer.pid" packer build -machine-read
   | awk -F, '$3 == "ui" { m = $5; for (i = 6; i <= NF; i++) m = m "," $i; gsub(/%!\(PACKER_COMMA\)/, ",", m); gsub(/\\n/, "\n", m); print m; fflush() }'; } &
 PIPE_PID=$!
 wait "$PIPE_PID" || PK_RC=$?
-PIPE_PID=""
+PIPE_PID="" PK_STATE=done
 stop_watch
 [ ! -e "$W/build-failed" ] \
   || die "$(cat "$W/build-failed") (its console is above); Packer was interrupted, so it terminates the instance and deletes its key pair — no image, no record"

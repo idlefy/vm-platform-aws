@@ -5,21 +5,23 @@
 #
 #   scripts/hardened-image-leftovers.sh [--clean-build] [<ami-name>]
 #
-# It lists:
-#   - images named exactly <ami-name> in every region of image/hardened/regions
-#     (only when a name is given) — id, state, Public flag and whether
-#     IdlefyPublishedImage=true is set, "none", or why a region could not be
-#     read. Images are only ever listed: removing one is the owner's call;
+# It lists, in this order:
 #   - in the build region (the file's first line), every instance tagged
 #     Name=idlefy-hardened-image-build that is not terminated or shutting
 #     down, and every key pair named packer_* carrying that tag. A runner
 #     killed mid-build (an Actions cancel or timeout) leaves both behind:
-#     Packer never gets to clean up.
+#     Packer never gets to clean up;
+#   - images named exactly <ami-name> in every region of image/hardened/regions
+#     (only when a name is given) — id, state, Public flag and whether
+#     IdlefyPublishedImage=true is set, "none", or why a region could not be
+#     read. Images are only ever listed: removing one is the owner's call.
 # With --clean-build it first checks that the credentials are the publisher
 # account's (the id scripts/hardened-guard-check.sh holds for G1 — read from
 # there, not copied), and refuses before any call but that check if not; then
 # it terminates those instances and deletes those key pairs — exactly those,
-# and nothing else; the publisher role may do no more.
+# and nothing else; the publisher role may do no more — before the image
+# listing: the instance is what costs money, and the workflow's step may be
+# close to the job's deadline.
 # Without it, it calls describe-* only.
 #
 # Called by scripts/hardened-image-build.sh (read-only) when a build fails
@@ -95,38 +97,9 @@ if [ "$CLEAN" = 1 ]; then
     || die "these credentials are for account '$GOT', not the publisher account $WANT — nothing was listed, terminated or deleted"
 fi
 
-# ---- images (read-only) ----------------------------------------------------------
-if [ -n "$NAME" ]; then
-  echo "!! Images named $NAME may exist, and may be PUBLIC; no release record names them."
-  echo "!! Deregister them and delete their snapshots before any retention run or new"
-  echo "!! build — docs/runbook.md, \"A hardened build that failed after its images\"."
-  for r in $REGIONS; do
-    if ! out="$(aws ec2 describe-images --region "$r" --owners self --include-deprecated --include-disabled \
-                  --filters "Name=name,Values=$NAME" --output json 2>"$ERR" < /dev/null)"; then
-      echo "   $r: could not list (check by hand): $(tr '\n' ' ' < "$ERR")"
-      RC=1
-      continue
-    fi
-    python3 -I - "$r" "$out" "$NAME" <<'PY' || { echo "   $r: unreadable answer (check by hand)"; RC=1; }
-import json, sys
-region, answer, name = sys.argv[1], sys.argv[2], sys.argv[3]
-try:
-    images = [i for i in json.loads(answer)["Images"] if i.get("Name") == name]
-    rows = []
-    for i in images:
-        fenced = any(t.get("Key") == "IdlefyPublishedImage" and t.get("Value") == "true" for t in i.get("Tags") or [])
-        rows.append("   %s: %s  state=%s  public=%s  IdlefyPublishedImage=true: %s"
-                    % (region, i["ImageId"], i.get("State", "?"), str(i.get("Public")).lower(), "yes" if fenced else "no"))
-except (ValueError, KeyError, TypeError, AttributeError):
-    sys.exit(1)
-print("\n".join(rows) if rows else "   %s: none" % region)
-PY
-  done
-else
-  echo "No image name given: images are not listed."
-fi
-
 # ---- the build instance and its key pair -------------------------------------------
+# First, before the image listing: the instance is what costs money, and the
+# workflow's step may be close to the job's deadline.
 # Only what carries the build's Name tag, in the build region, and only key
 # pairs Packer names packer_*: the publisher role may terminate and delete
 # exactly these.
@@ -189,4 +162,35 @@ if [ "$CLEAN" = 1 ]; then
 elif [ -n "$INSTANCES$KEYS" ]; then
   echo "   (the publish workflow's leftovers step removes these; by hand: scripts/hardened-image-leftovers.sh --clean-build)"
 fi
+# ---- images (read-only) ----------------------------------------------------------
+if [ -n "$NAME" ]; then
+  echo "!! Images named $NAME may exist, and may be PUBLIC; no release record names them."
+  echo "!! Deregister them and delete their snapshots before any retention run or new"
+  echo "!! build — docs/runbook.md, \"A hardened build that failed after its images\"."
+  for r in $REGIONS; do
+    if ! out="$(aws ec2 describe-images --region "$r" --owners self --include-deprecated --include-disabled \
+                  --filters "Name=name,Values=$NAME" --output json 2>"$ERR" < /dev/null)"; then
+      echo "   $r: could not list (check by hand): $(tr '\n' ' ' < "$ERR")"
+      RC=1
+      continue
+    fi
+    python3 -I - "$r" "$out" "$NAME" <<'PY' || { echo "   $r: unreadable answer (check by hand)"; RC=1; }
+import json, sys
+region, answer, name = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    images = [i for i in json.loads(answer)["Images"] if i.get("Name") == name]
+    rows = []
+    for i in images:
+        fenced = any(t.get("Key") == "IdlefyPublishedImage" and t.get("Value") == "true" for t in i.get("Tags") or [])
+        rows.append("   %s: %s  state=%s  public=%s  IdlefyPublishedImage=true: %s"
+                    % (region, i["ImageId"], i.get("State", "?"), str(i.get("Public")).lower(), "yes" if fenced else "no"))
+except (ValueError, KeyError, TypeError, AttributeError):
+    sys.exit(1)
+print("\n".join(rows) if rows else "   %s: none" % region)
+PY
+  done
+else
+  echo "No image name given: images are not listed."
+fi
+
 exit "$RC"
