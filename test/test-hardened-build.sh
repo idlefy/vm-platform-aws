@@ -9,9 +9,11 @@
 #           next to the policyfile it is given; export --archive writes
 #           <dir>/solo-<lock revision>.tgz from $EXPORT_TREE.
 #   gh      release view fails while ${GH_RELEASE_MISSING} and nothing created
-#           it; download returns $GH_STORED, else what was uploaded, else fails;
+#           it; download returns $GH_STORED, else what was uploaded (other
+#           bytes when ${GH_DOWNLOAD_CORRUPT}), else fails;
 #           api …/git/ref/tags/<tag> fails when ${GH_BASE_TAG_MISSING}.
-#   aws     describe-images … length(Images) prints ${EXISTING_TODAY:-0}.
+#   aws     sts get-caller-identity prints ${AWS_ACCOUNT:-995603458290};
+#           describe-images … Images[].Name prints ${EXISTING_NAMES} tab-separated.
 #   packer  build copies the user data and reports an AMI for each region in
 #           ${ARTIFACT_REGIONS:-every region of ami_regions}; exits ${PACKER_RC:-0}.
 # The last section measures the real solo user data against EC2's 16 KB.
@@ -36,7 +38,9 @@ printf "name 'base'\nversion '2.1.0'\n" > "$R/cinc/cookbooks/base/metadata.rb"
 REV=$(printf 'rev' | sha256sum | cut -d' ' -f1)
 OTHERREV=$(printf 'other' | sha256sum | cut -d' ' -f1)
 SHA=$(printf 'c%.0s' {1..40})
-DATE=$(date -u +%Y%m%d)
+# Fixed, and passed as HARDENED_TODAY: a run that crosses UTC midnight must
+# not change the expected names.
+DATE=20261101
 SG=sg-0f0f0f0f0f0f0f0f0
 URL=https://github.com/idlefy/vm-platform-aws/releases/download/v2.2.0/solo-v2.2.0.tgz
 printf '{"name":"solo","revision_id":"%s","cookbook_locks":{"base":{"version":"2.1.0"}}}' "$REV" \
@@ -73,6 +77,7 @@ a=(); repo=none
 while [ $# -gt 0 ]; do if [ "$1" = -R ]; then repo=$2; shift 2; else a+=("$1"); shift; fi; done
 set -- "${a[@]}"
 echo "gh $*" >> "$GH_LOG"
+echo "gh $1 ${2:-}" >> "$ORDER_LOG"
 case "$1" in api) echo "${2%%/git/*}" ;; *) echo "$repo" ;; esac >> "$GH_LOG.repo"
 case "$1 ${2:-}" in
   "release view")
@@ -84,6 +89,7 @@ case "$1 ${2:-}" in
     pat="" out=""
     while [ $# -gt 0 ]; do case "$1" in --pattern) pat=$2; shift ;; -O) out=$2; shift ;; esac; shift; done
     if [ -n "${GH_STORED:-}" ]; then cp "$GH_STORED" "$out"
+    elif [ -f "$GH_STATE/$pat" ] && [ -n "${GH_DOWNLOAD_CORRUPT:-}" ]; then cp "$OTHER_TGZ" "$out"
     elif [ -f "$GH_STATE/$pat" ]; then cp "$GH_STATE/$pat" "$out"
     else exit 1; fi ;;
   "release edit")
@@ -95,8 +101,12 @@ SH
 cat > "$T/bin/aws" <<'SH'
 #!/usr/bin/env bash
 echo "aws $*" >> "$AWS_LOG"
-[ "$1 $2" = "ec2 describe-images" ] || exit 9
-echo "${EXISTING_TODAY:-0}"
+echo "aws $1 $2" >> "$ORDER_LOG"
+case "$1 $2" in
+  "sts get-caller-identity") echo "${AWS_ACCOUNT:-995603458290}" ;;
+  "ec2 describe-images") printf '%s\n' "$(printf '%s\t' ${EXISTING_NAMES:-} | sed 's/\t$//')" ;;
+  *) exit 9 ;;
+esac
 SH
 cat > "$T/bin/packer" <<'SH'
 #!/usr/bin/env bash
@@ -128,7 +138,8 @@ run_build() {
            PACKER_LOG="$T/packer.log" ORDER_LOG="$T/order.log" UD_COPY="$T/ud.gz" GH_STATE="$T/state"
            EXPORT_TREE="${EXPORT_TREE:-$T/tree-a}" REV="$REV"
            PLATFORM_TAG="${PLATFORM_TAG-v2.2.0}" PLATFORM_SHA="${PLATFORM_SHA-$SHA}"
-           HARDENED_SKIP_TAG_CHECK="${SKIP_TAG-1}" HARDENED_OUT="$T/out")
+           HARDENED_SKIP_TAG_CHECK="${SKIP_TAG-1}" HARDENED_OUT="$T/out" OTHER_TGZ="$T/other.tgz")
+  [ -n "${NO_TODAY:-}" ] || e+=(HARDENED_TODAY="${TODAY:-$DATE}")
   [ -n "${NO_SG:-}" ] || e+=(HARDENED_SECURITY_GROUP_ID="$SG")
   [ -z "${PUBLIC:-}" ] || e+=(HARDENED_PUBLIC="$PUBLIC")
   [ -z "${ORG:-}" ] || e+=(HARDENED_ATTACHED_ORG_ID="$ORG")
@@ -161,7 +172,7 @@ check "the archive was uploaded, then downloaded back" \
      [ -s "$T/n1" ] && [ "$(cat "$T/n1")" -lt "$(cat "$T/n2")" ]; echo $?)"
 check "every gh call names the repository" "$(! grep -vx 'idlefy/vm-platform-aws\|repos/idlefy/vm-platform-aws' "$T/gh.log.repo" | grep -q .; echo $?)"
 check "packer init on image/hardened, then a machine-readable build" \
-  "$(grep -qx "init $R/image/hardened" "$T/packer.log" && grep -qx -- '-machine-readable' "$T/packer.log" && [ "$(tr '\n' ' ' < "$T/order.log")" = "packer init packer build " ]; echo $?)"
+  "$(grep -qx "init $R/image/hardened" "$T/packer.log" && grep -qx -- '-machine-readable' "$T/packer.log" && [ "$(grep '^packer' "$T/order.log" | tr '\n' ' ')" = "packer init packer build " ]; echo $?)"
 check "ami_name is today's first" "$(var "ami_name=idlefy-hardened-agent-ubuntu-24.04-amd64-$DATE-01"; echo $?)"
 check "build_region is the first region" "$(var build_region=us-east-1; echo $?)"
 check "ami_regions is every region, in order" "$(var "ami_regions=$REGIONS_JSON"; echo $?)"
@@ -180,7 +191,7 @@ check "user data is gzip within 16384 bytes" "$(gzip -t "$T/ud.gz" && [ "$(stat 
 check "user data starts #!/bin/bash" "$([ "$(ud | head -1)" = '#!/bin/bash' ]; echo $?)"
 check "the archive's sha256 and URL are rendered in" \
   "$(grep -qxF "ARCHIVE_SHA256='$STORED_SHA'" "$T/ud" && grep -qxF "ARCHIVE_URL='$URL'" "$T/ud"; echo $?)"
-check "no placeholder survives" "$(! grep -qE '__[A-Z_]+__' "$T/ud"; echo $?)"
+check "no placeholder survives" "$(! grep -qE '__[A-Z0-9_]+__' "$T/ud"; echo $?)"
 check "the embedded scrub is image/files/dev-vm-image-scrub, byte for byte" \
   "$(embedded dev-vm-image-scrub | cmp -s - "$ROOT/image/files/dev-vm-image-scrub"; echo $?)"
 check "the embedded solo hooks are image/files/dev-vm-image-scrub-solo, byte for byte" \
@@ -228,6 +239,10 @@ check "the same-day count sees disabled and deprecated images, of this owner, in
   "$(grep -q -- '--region us-east-1 ' "$T/aws.log" && grep -q -- '--owners self ' "$T/aws.log" \
      && grep -q -- '--include-deprecated' "$T/aws.log" && grep -q -- '--include-disabled' "$T/aws.log" \
      && grep -qF "Values=idlefy-hardened-agent-ubuntu-24.04-amd64-$DATE-*" "$T/aws.log"; echo $?)"
+check "the account is checked before anything is created" \
+  "$(grep -qx 'aws sts get-caller-identity --query Account --output text' "$T/aws.log" \
+     && a=$(grep -n '^aws sts' "$T/order.log" | cut -d: -f1) && c=$(grep -n '^gh release create' "$T/order.log" | cut -d: -f1) \
+     && [ -n "$a" ] && [ -n "$c" ] && [ "$a" -lt "$c" ]; echo $?)"
 check "the user data temp file is gone" "$(f=$(grep '^user_data_file=' "$T/packer.log" | cut -d= -f2); [ -n "$f" ] && [ ! -e "$f" ]; echo $?)"
 check "the work directory is gone" "$(d=$(grep '^chef install ' "$T/chef.log" | cut -d' ' -f3); [ -n "$d" ] && [ ! -e "$d" ]; echo $?)"
 check "nothing went to stderr" "$([ ! -s "$T/stderr" ]; echo $?)"
@@ -260,14 +275,40 @@ GH_BASE_TAG_MISSING=1 run_build
 check "exits non-zero, names base-2.1.0" "$([ $? -ne 0 ] && grep -q 'base-2.1.0' "$T/stderr"; echo $?)"
 check "...no export" "$(! grep -q '^chef export' "$T/chef.log"; echo $?)"
 
-echo "== the second build of a day is -02 =="
-EXISTING_TODAY=1 run_build; check "exits 0" "$?"
-check "ami_name ends -02" "$(var "ami_name=idlefy-hardened-agent-ubuntu-24.04-amd64-$DATE-02"; echo $?)"
-check "...and so does the record" "$([ -f "$T/out/hardened-ami-$DATE-02.json" ]; echo $?)"
-EXISTING_TODAY=99 run_build
-check "a hundredth build of a day refuses, packer never runs" "$([ $? -ne 0 ] && [ ! -s "$T/packer.log" ]; echo $?)"
-EXISTING_TODAY=None run_build
-check "a count that is not a number refuses" "$([ $? -ne 0 ] && [ ! -s "$T/packer.log" ]; echo $?)"
+echo "== NN is one past the highest name in use today =="
+P=idlefy-hardened-agent-ubuntu-24.04-amd64-$DATE
+nn_is() {  # nn_is NAMES NN
+  EXISTING_NAMES="$1" run_build; local rc=$?
+  check "{${1:-none}} → -$2" "$([ $rc -eq 0 ] && var "ami_name=$P-$2" && [ -f "$T/out/hardened-ami-$DATE-$2.json" ]; echo $?)"
+}
+nn_is "" 01
+nn_is "$P-02" 03
+nn_is "$P-01 $P-02" 03
+nn_is "$P-02 $P-01" 03
+nn_is "$P-98" 99
+nn_is "$P-09" 10
+check "the query asks for names" "$(grep -qF -- "--query Images[].Name" "$T/aws.log"; echo $?)"
+EXISTING_NAMES="$P-99" run_build
+check "{-99} refuses, packer never runs" "$([ $? -ne 0 ] && grep -q '99' "$T/stderr" && [ ! -s "$T/packer.log" ]; echo $?)"
+EXISTING_NAMES="$P-01 $P-1x" run_build
+check "a malformed name in the answer refuses, naming it" "$([ $? -ne 0 ] && grep -qF "$P-1x" "$T/stderr" && [ ! -s "$T/packer.log" ]; echo $?)"
+EXISTING_NAMES="None" run_build
+check "an answer that is not names refuses" "$([ $? -ne 0 ] && [ ! -s "$T/packer.log" ]; echo $?)"
+NO_TODAY=1 run_build
+check "without HARDENED_TODAY the date is today's UTC date" \
+  "$([ $? -eq 0 ] && grep -qE '^ami_name=idlefy-hardened-agent-ubuntu-24.04-amd64-[0-9]{8}-01$' "$T/packer.log" \
+     && { grep -q "^ami_name=.*-$(date -u +%Y%m%d)-01\$" "$T/packer.log" || grep -q "^ami_name=.*-$(date -u -d '-1 min' +%Y%m%d)-01\$" "$T/packer.log"; }; echo $?)"
+TODAY=2026111 run_build; refuses_early_nochef=$?
+check "a malformed HARDENED_TODAY refuses" "$([ $refuses_early_nochef -ne 0 ] && grep -q HARDENED_TODAY "$T/stderr" && [ ! -s "$T/chef.log" ]; echo $?)"
+
+echo "== the wrong AWS account refuses before anything is created =="
+AWS_ACCOUNT=111122223333 run_build
+check "exits non-zero, names both accounts" "$([ $? -ne 0 ] && grep -q 111122223333 "$T/stderr" && grep -q 995603458290 "$T/stderr"; echo $?)"
+check "...no release create or upload, no packer" "$(! grep -q 'release create\|release upload' "$T/gh.log" && [ ! -s "$T/packer.log" ]; echo $?)"
+
+echo "== an asset that downloads back different refuses =="
+GH_DOWNLOAD_CORRUPT=1 run_build
+check "exits non-zero, packer never runs" "$([ $? -ne 0 ] && grep -q 'solo-v2.2.0.tgz' "$T/stderr" && [ ! -s "$T/packer.log" ]; echo $?)"
 
 echo "== a region missing from the artifact refuses =="
 ARTIFACT_REGIONS="us-east-1" run_build
@@ -313,14 +354,26 @@ git -C "$R" init -q && git -C "$R" add -A && git -C "$R" -c user.name=t -c user.
 HEAD_SHA=$(git -C "$R" rev-parse HEAD)
 SKIP_TAG= PLATFORM_SHA=$HEAD_SHA run_build; check "the tag's commit, checked out → builds" "$?"
 SKIP_TAG= run_build; refuses_early $? "a PLATFORM_SHA the tag does not name refuses" PLATFORM_SHA
+SKIP_TAG=false run_build; refuses_early $? "HARDENED_SKIP_TAG_CHECK=false still checks the tag" PLATFORM_SHA
+SKIP_TAG=yes run_build; refuses_early $? "...and so does any value but 1" PLATFORM_SHA
 SKIP_TAG= PLATFORM_TAG=v2.2.1 PLATFORM_SHA=$HEAD_SHA run_build; refuses_early $? "a tag that does not exist refuses" v2.2.1
 rm -rf "$R/.git"
 
 echo "== the user data is checked before packer runs =="
 cp "$R/image/files/bootstrap-solo" "$T/boot.orig"
 python3 -I -c 'import sys; p=sys.argv[1]; s=open(p).read(); open(p,"w").write(s.replace("__ARCHIVE_URL__", "__ARCHIVE_URLX__"))' "$R/image/files/bootstrap-solo"
-run_build; check "an unrendered placeholder refuses, packer never runs" \
-  "$([ $? -ne 0 ] && grep -q '__ARCHIVE_URLX__' "$T/stderr" && [ ! -s "$T/packer.log" ]; echo $?)"
+run_build; check "a missing __ARCHIVE_URL__ refuses, packer never runs" \
+  "$([ $? -ne 0 ] && grep -q '__ARCHIVE_URL__' "$T/stderr" && [ ! -s "$T/packer.log" ]; echo $?)"
+cp "$T/boot.orig" "$R/image/files/bootstrap-solo"
+python3 -I -c 'import sys; p=sys.argv[1]; s=open(p).read(); open(p,"w").write(s.replace("__ARCHIVE_SHA256__", "__ARCHIVE_SHA256X__"))' "$R/image/files/bootstrap-solo"
+run_build; check "a missing __ARCHIVE_SHA256__ refuses, packer never runs" \
+  "$([ $? -ne 0 ] && grep -q '__ARCHIVE_SHA256__' "$T/stderr" && [ ! -s "$T/packer.log" ]; echo $?)"
+{ cat "$T/boot.orig"; echo "ARCHIVE_URL='__ARCHIVE_URL__'"; } > "$R/image/files/bootstrap-solo"
+run_build; check "a placeholder that occurs twice refuses, packer never runs" \
+  "$([ $? -ne 0 ] && grep -q '__ARCHIVE_URL__' "$T/stderr" && [ ! -s "$T/packer.log" ]; echo $?)"
+{ cat "$T/boot.orig"; echo "X='__OTHER_2__'"; } > "$R/image/files/bootstrap-solo"
+run_build; check "any other placeholder, digits included, refuses, packer never runs" \
+  "$([ $? -ne 0 ] && grep -q '__OTHER_2__' "$T/stderr" && [ ! -s "$T/packer.log" ]; echo $?)"
 { cat "$T/boot.orig"; printf '# %s\n' "$(head -c 15000 /dev/urandom | base64 -w0)"; } > "$R/image/files/bootstrap-solo"
 run_build; check "user data over 16 KB gzipped refuses, says 16384, packer never runs" \
   "$([ $? -ne 0 ] && grep -q '16384' "$T/stderr" && [ ! -s "$T/packer.log" ]; echo $?)"

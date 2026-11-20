@@ -10,7 +10,8 @@
 # Optional: HARDENED_PUBLIC (true|false, default true), HARDENED_ATTACHED_ORG_ID
 # (a UUID), HARDENED_INSTANCE_TYPE (default c7a.xlarge), HARDENED_SUBNET_ID,
 # HARDENED_OUT (default dist), GH_REPO (default idlefy/vm-platform-aws).
-# HARDENED_SKIP_TAG_CHECK=1 is for the tests only.
+# Test hooks, never set in a real build: HARDENED_SKIP_TAG_CHECK=1 (exactly 1)
+# skips the tag check; HARDENED_TODAY=YYYYMMDD replaces today's UTC date.
 #
 # What it does, refusing at the first thing that is not so:
 #   1. the tag names PLATFORM_SHA and the tree is that commit;
@@ -67,9 +68,12 @@ GH_REPO="${GH_REPO:-idlefy/vm-platform-aws}"
 [ -z "$HARDENED_SUBNET_ID" ] || [[ $HARDENED_SUBNET_ID =~ ^subnet-[0-9a-f]+$ ]] \
   || die "HARDENED_SUBNET_ID='$HARDENED_SUBNET_ID' is not a subnet id"
 [[ $GH_REPO =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "GH_REPO='$GH_REPO' is not owner/name"
+# Taken once: a build that crosses UTC midnight keeps the date it started on.
+DATE="${HARDENED_TODAY:-$(date -u +%Y%m%d)}"
+[[ $DATE =~ ^[0-9]{8}$ ]] || die "HARDENED_TODAY='$DATE' is not YYYYMMDD (it is a test hook; unset it)"
 
 # The record says which commit built the image; it must be the one checked out.
-if [ -z "${HARDENED_SKIP_TAG_CHECK:-}" ]; then
+if [ "${HARDENED_SKIP_TAG_CHECK:-}" != 1 ]; then
   tagged="$(git -C "$ROOT" rev-parse -q --verify "refs/tags/$PLATFORM_TAG^{commit}" 2>/dev/null)" \
     || die "no tag $PLATFORM_TAG in this checkout — fetch tags, or check PLATFORM_TAG"
   [ "$tagged" = "$PLATFORM_SHA" ] || die "$PLATFORM_TAG names ${tagged:0:12}, PLATFORM_SHA is ${PLATFORM_SHA:0:12} — pass the tag's commit"
@@ -113,6 +117,13 @@ print("AMI_REGIONS=%s" % shlex.quote(json.dumps(regions, separators=(",", ":")))
 PY
 )" || die "image/hardened/regions: see above — fix the file"
 eval "$REGIONS_VARS"
+
+# The image is published as Idlefy's: refuse any other account before anything
+# is created, here or on GitHub.
+ACCOUNT="$(aws sts get-caller-identity --query Account --output text 2>/dev/null)" \
+  || die "could not read the AWS account (aws sts get-caller-identity) — check the credentials in the environment"
+[ "$ACCOUNT" = "$OWNER_ID" ] \
+  || die "the AWS credentials are for account '$ACCOUNT', the image is published by $OWNER_ID — use the publishing account's credentials"
 
 # ---- 3. the lock is fresh --------------------------------------------------------
 # `chef install` honours an existing lock, so resolve a copy that has none.
@@ -195,14 +206,26 @@ ARCHIVE_SHA256="$(sha256sum "$W/stored.tgz" | cut -d' ' -f1)"
 ARCHIVE_URL="https://github.com/$GH_REPO/releases/download/$PLATFORM_TAG/$ASSET"
 
 # ---- 6. the name -----------------------------------------------------------------
-# Deprecated and disabled images keep their names, so they are counted.
-DATE="$(date -u +%Y%m%d)"
-n="$(aws ec2 describe-images --region "$BUILD_REGION" --owners self --include-deprecated --include-disabled \
-      --filters "Name=name,Values=$NAME_PREFIX-$DATE-*" --query 'length(Images)' --output text)" \
-  || die "could not count today's images in $BUILD_REGION"
-[[ $n =~ ^[0-9]+$ ]] || die "describe-images returned '$n', not a count"
-[ "$n" -lt 99 ] || die "$n images are already named $NAME_PREFIX-$DATE-NN; NN has two digits — build tomorrow"
-NN="$(printf %02d $((10#$n + 1)))"
+# One past the highest NN in use today, not the count: a deregistered -01
+# next to a live -02 must not yield -02 again. Deprecated and disabled images
+# keep their names, so they are read too.
+NAMES="$(aws ec2 describe-images --region "$BUILD_REGION" --owners self --include-deprecated --include-disabled \
+      --filters "Name=name,Values=$NAME_PREFIX-$DATE-*" --query 'Images[].Name' --output text)" \
+  || die "could not list today's images in $BUILD_REGION — check the credentials, and that the AWS CLI is v2 with --include-disabled"
+NN="$(python3 -I - "$NAMES" "$NAME_PREFIX-$DATE" <<'PY'
+import re, sys
+names, prefix = sys.argv[1].split(), sys.argv[2]
+top = 0
+for n in names:
+    m = re.fullmatch(re.escape(prefix) + r"-([0-9]{2})", n)
+    if not m:
+        sys.exit("describe-images returned %r, which is not %s-NN" % (n, prefix))
+    top = max(top, int(m.group(1), 10))
+if top >= 99:
+    sys.exit("%s-99 is taken; NN has two digits — build tomorrow" % prefix)
+print("%02d" % (top + 1))
+PY
+)" || die "could not choose today's NN — see above"
 AMI_NAME="$NAME_PREFIX-$DATE-$NN"
 
 # ---- 7. the user data ------------------------------------------------------------
@@ -220,7 +243,11 @@ src, url, sha, out = sys.argv[1:]
 s = open(src, encoding="utf-8").read()
 if not s.startswith("#!/bin/bash\n"):
     sys.exit("bootstrap-solo does not start with #!/bin/bash")
-s = s.replace("__ARCHIVE_URL__", url).replace("__ARCHIVE_SHA256__", sha)
+for p, v in (("__ARCHIVE_URL__", url), ("__ARCHIVE_SHA256__", sha)):
+    if s.count(p) != 1:
+        sys.exit("bootstrap-solo holds %s %d times; it must hold it exactly once" % (p, s.count(p)))
+for p, v in (("__ARCHIVE_URL__", url), ("__ARCHIVE_SHA256__", sha)):
+    s = s.replace(p, v)
 if not s.endswith("\n"):
     s += "\n"
 open(out, "w", encoding="utf-8").write(s)
@@ -238,7 +265,7 @@ PY
   printf 'exec >/dev/console 2>&1\n'
   printf '/usr/local/sbin/dev-vm-image-scrub --profile solo %s\n' "$ARCHIVE_SHA256"
 } >> "$UD_PLAIN"
-left="$(grep -oE '__[A-Z_]+__' "$UD_PLAIN" | sort -u | tr '\n' ' ')" || true
+left="$(grep -oE '__[A-Z0-9_]+__' "$UD_PLAIN" | sort -u | tr '\n' ' ')" || true
 [ -z "$left" ] || die "the user data still holds placeholders: $left— render them in this script"
 gzip -9 -n < "$UD_PLAIN" > "$UD"
 UD_SIZE="$(stat -c %s "$UD")"
@@ -246,7 +273,8 @@ UD_SIZE="$(stat -c %s "$UD")"
 
 # ---- 8. build --------------------------------------------------------------------
 echo "Building $AMI_NAME ($PLATFORM_TAG, $BASE_TAG, archive ${ARCHIVE_SHA256:0:12}, public=$HARDENED_PUBLIC) in $BUILD_REGION for: $REGIONS"
-packer init "$IMG" >/dev/null || die "packer init failed"
+packer init "$IMG" >/dev/null \
+  || die "packer init failed — it needs network access to the plugin registry; run 'packer init image/hardened' by hand to see why"
 tmp PKLOG
 # -machine-readable: the artifact line is the only reliable source of the AMI
 # ids. The ui lines are echoed as they come, so the operator sees progress.
