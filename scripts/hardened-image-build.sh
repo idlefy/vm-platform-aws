@@ -9,7 +9,9 @@
 #
 # Optional: HARDENED_PUBLIC (true|false, default true), HARDENED_ATTACHED_ORG_ID
 # (a UUID), HARDENED_INSTANCE_TYPE (default c7a.xlarge), HARDENED_SUBNET_ID,
-# HARDENED_OUT (default dist), GH_REPO (default idlefy/vm-platform-aws).
+# HARDENED_OUT (default dist), GH_REPO (default idlefy/vm-platform-aws),
+# HARDENED_CONSOLE_POLL (seconds between reads of the build instance's
+# console, default 30).
 # Test hooks, never set in a real build: HARDENED_SKIP_TAG_CHECK=1 (exactly 1)
 # skips the tag check and the clean-tree check with it; HARDENED_TODAY=YYYYMMDD replaces today's UTC date, and
 # is refused unless HARDENED_SKIP_TAG_CHECK=1 is set too — a forward-dated
@@ -26,14 +28,17 @@
 #      tag's release — a stored asset whose contents differ is never used;
 #   6. the user data pins that asset's sha256 (law A1: the build instance has no
 #      instance profile and fetches nothing else of Idlefy's);
-#   7. Packer builds and copies the AMI to every region;
+#   7. Packer builds and copies the AMI to every region; meanwhile the build
+#      instance's console is read, and a failed bootstrap or scrub
+#      interrupts Packer at once instead of its 2 h wait for a stop;
 #   8. the release record hardened-ami-YYYYMMDD-NN.json, naming every region,
 #      is uploaded to the release and its table appended to the release notes.
 # Before step 7 the chosen name is written to $HARDENED_OUT/hardened-ami-name;
 # a failure, INT or TERM from step 7 until the record is uploaded lists the
 # images of that name in every region (scripts/hardened-image-leftovers.sh).
 #
-# Talks to GitHub (gh) and AWS (EC2 through Packer, plus one DescribeImages).
+# Talks to GitHub (gh) and AWS (EC2 through Packer, DescribeImages, and
+# GetConsoleOutput on the build instance).
 # Credentials come from the environment; nothing here prints one.
 
 set -euo pipefail
@@ -72,6 +77,8 @@ GH_REPO="${GH_REPO:-idlefy/vm-platform-aws}"
   || [[ $HARDENED_ATTACHED_ORG_ID =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
   || die "HARDENED_ATTACHED_ORG_ID='$HARDENED_ATTACHED_ORG_ID' is not a lowercase UUID"
 [[ $HARDENED_INSTANCE_TYPE =~ ^[a-z0-9-]+\.[a-z0-9]+$ ]] || die "HARDENED_INSTANCE_TYPE='$HARDENED_INSTANCE_TYPE' is not an instance type"
+CONSOLE_POLL="${HARDENED_CONSOLE_POLL:-30}"
+[[ $CONSOLE_POLL =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "HARDENED_CONSOLE_POLL='$CONSOLE_POLL' is not a number of seconds"
 [ -z "$HARDENED_SUBNET_ID" ] || [[ $HARDENED_SUBNET_ID =~ ^subnet-[0-9a-f]+$ ]] \
   || die "HARDENED_SUBNET_ID='$HARDENED_SUBNET_ID' is not a subnet id"
 [[ $GH_REPO =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "GH_REPO='$GH_REPO' is not owner/name"
@@ -326,9 +333,60 @@ trap on_exit EXIT
 mkdir -p "$HARDENED_OUT"
 printf '%s\n' "$AMI_NAME" > "$HARDENED_OUT/hardened-ami-name"
 
+# watch_console PIDFILE — while Packer runs, read the build instance's serial
+# console every $CONSOLE_POLL seconds. A failed bootstrap leaves the instance
+# running (its console is the only record of why), so Packer would wait its
+# whole stop budget (2 h) for nothing. When the console shows the bootstrap's
+# "BOOTSTRAP FAILED" banner — or the scrub's refusal, which also leaves the
+# instance running ("dev-vm-image-scrub: … no image will be taken") — print
+# its tail and interrupt Packer with SIGINT: Packer then terminates the
+# instance and deletes its temporary key pair.
+# The instance is the one Packer itself names ("Instance ID: i-…" in its log),
+# never another run's. A console that cannot be read is noted once and is not
+# a failure of the build. A stopped instance's console reads empty (measured),
+# so a good build shows nothing here and the watcher just ends with Packer.
+# shellcheck disable=SC2317  # runs in the background
+watch_console() {
+  local pidfile=$1 pid="" iid="" noted=0 sp=""
+  # Killed when Packer ends: take the pending sleep along, so no orphan holds
+  # the job's output open.
+  trap '[ -z "$sp" ] || kill "$sp" 2>/dev/null; exit 0' TERM
+  while :; do
+    sleep "$CONSOLE_POLL" & sp=$!
+    wait "$sp" || true
+    sp=""
+    [ -n "$pid" ] || pid="$(cat "$pidfile" 2>/dev/null)" || pid=""
+    [ -n "$pid" ] || continue
+    kill -0 "$pid" 2>/dev/null || return 0
+    [ -n "$iid" ] || iid="$(grep -oE 'Instance ID: i-[0-9a-f]+' "$PKLOG" 2>/dev/null | head -n 1 | cut -d' ' -f3)" || iid=""
+    [ -n "$iid" ] || continue
+    if ! aws ec2 get-console-output --region "$BUILD_REGION" --instance-id "$iid" --latest \
+           --query Output --output text > "$W/console" 2> "$W/console.err" < /dev/null; then
+      [ "$noted" = 1 ] || echo "note: cannot read the console of $iid yet ($(head -n 1 "$W/console.err")); Packer keeps waiting" >&2
+      noted=1; continue
+    fi
+    if grep -q 'BOOTSTRAP FAILED' "$W/console"; then
+      echo "the bootstrap failed on the build instance" > "$W/build-failed"
+    elif grep -q '^dev-vm-image-scrub: .*no image will be taken' "$W/console"; then
+      echo "the image scrub refused the image on the build instance" > "$W/build-failed"
+    fi
+    if [ -e "$W/build-failed" ]; then
+      { echo; echo "!! $iid: $(cat "$W/build-failed"). The end of its console:"; tail -n 80 "$W/console"; } >&2
+      kill -INT "$pid" 2>/dev/null || true
+      return 0
+    fi
+  done
+}
+
 # -machine-readable: the artifact line is the only reliable source of the AMI
 # ids. The ui lines are echoed as they come, so the operator sees progress.
-packer build -machine-readable \
+# Packer runs in the foreground pipeline (an async job would start with SIGINT
+# ignored, and a Go program keeps an inherited ignore); its pid goes to a file
+# for the watcher, which runs in the background.
+watch_console "$W/packer.pid" &
+WATCH_PID=$!
+PK_RC=0
+( echo "$BASHPID" > "$W/packer.pid"; exec packer build -machine-readable \
   -var "ami_name=$AMI_NAME" \
   -var "build_region=$BUILD_REGION" \
   -var "ami_regions=$AMI_REGIONS" \
@@ -343,9 +401,15 @@ packer build -machine-readable \
   -var "base_tag=$BASE_TAG" \
   -var "archive_sha256=$ARCHIVE_SHA256" \
   -var "attached_org_id=$HARDENED_ATTACHED_ORG_ID" \
-  "$IMG" \
+  "$IMG" ) \
   | tee "$PKLOG" \
   | awk -F, '$3 == "ui" { m = $5; for (i = 6; i <= NF; i++) m = m "," $i; gsub(/%!\(PACKER_COMMA\)/, ",", m); gsub(/\\n/, "\n", m); print m; fflush() }' \
+  || PK_RC=$?
+kill "$WATCH_PID" 2>/dev/null || true
+wait "$WATCH_PID" 2>/dev/null || true
+[ ! -e "$W/build-failed" ] \
+  || die "$(cat "$W/build-failed") (its console is above); Packer was interrupted, so it terminates the instance and deletes its key pair — no image, no record"
+[ "$PK_RC" = 0 ] \
   || die "packer build failed — no record is written. A failure before the image was taken left its reason on the build instance's serial console; one during the copies may have left images (listed below)"
 
 # ---- 9. the record ---------------------------------------------------------------

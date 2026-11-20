@@ -21,8 +21,16 @@
 #           fails in ${LEFTOVER_FAIL}.
 #   gh      also: the record upload fails when ${GH_RECORD_UPLOAD_FAIL}, the
 #           notes edit when ${GH_NOTES_FAIL}.
+#   aws     ec2 get-console-output prints ${CONSOLE_OUTPUT} (printf %b), or
+#           fails when ${CONSOLE_FAIL}; describe-instances answers
+#           ${BUILD_INSTANCES} ("i-…:state …"), describe-key-pairs ${BUILD_KEYS}
+#           (names); terminate-instances and delete-key-pair succeed unless
+#           ${TERMINATE_FAIL} / ${DELETEKEY_FAIL}; ${INSTANCES_FAIL} and
+#           ${KEYS_FAIL} fail the two reads.
 #   packer  build copies the user data and reports an AMI for each region in
 #           ${ARTIFACT_REGIONS:-every region of ami_regions}; exits ${PACKER_RC:-0}.
+#           With ${PACKER_HOLD} it names its instance, then runs that many
+#           seconds unless SIGINT ends it ("interrupted" in its log).
 # The last section measures the real solo user data against EC2's 16 KB.
 
 # The checks read `[ … ]; echo $?` and `run_build; check … "$?"` on purpose: the
@@ -132,6 +140,24 @@ case "$1 $2" in
         [ -n "$v" ] || v='{"Images": []}'
         printf '%s\n' "$v" ;;
     esac ;;
+  "ec2 describe-instances")
+    [ -z "${INSTANCES_FAIL:-}" ] || { echo "An error occurred (UnauthorizedOperation) when calling the DescribeInstances operation" >&2; exit 254; }
+    python3 -I -c 'import json, sys
+print(json.dumps({"Reservations": [{"Instances": [{"InstanceId": x.split(":")[0], "State": {"Name": x.split(":")[1]}}
+                                                  for x in sys.argv[1].split()]}]}))' "${BUILD_INSTANCES:-}" ;;
+  "ec2 describe-key-pairs")
+    [ -z "${KEYS_FAIL:-}" ] || { echo "An error occurred (UnauthorizedOperation) when calling the DescribeKeyPairs operation" >&2; exit 254; }
+    python3 -I -c 'import json, sys
+print(json.dumps({"KeyPairs": [{"KeyName": k, "KeyPairId": "key-0%d" % n} for n, k in enumerate(sys.argv[1].split())]}))' "${BUILD_KEYS:-}" ;;
+  "ec2 terminate-instances")
+    [ -z "${TERMINATE_FAIL:-}" ] || { echo "An error occurred (UnauthorizedOperation) when calling the TerminateInstances operation" >&2; exit 254; }
+    echo '{}' ;;
+  "ec2 delete-key-pair")
+    [ -z "${DELETEKEY_FAIL:-}" ] || { echo "An error occurred (UnauthorizedOperation) when calling the DeleteKeyPair operation" >&2; exit 254; }
+    echo '{}' ;;
+  "ec2 get-console-output")
+    if [ -n "${CONSOLE_FAIL:-}" ]; then echo "An error occurred (UnauthorizedOperation) when calling the GetConsoleOutput operation" >&2; exit 254; fi
+    printf '%b\n' "${CONSOLE_OUTPUT:-}" ;;
   *) exit 9 ;;
 esac
 SH
@@ -142,6 +168,14 @@ if [ "$1" = init ]; then echo "init $2" >> "$PACKER_LOG"; exit 0; fi
 printf '%s\n' "$@" >> "$PACKER_LOG"
 # A long build, to be signalled: says it started, then sleeps.
 if [ -n "${PACKER_SLEEP:-}" ]; then : > "$PACKER_STARTED"; sleep "$PACKER_SLEEP"; fi
+# PACKER_HOLD=N: names its instance as Packer does, then runs N seconds; an
+# interrupt (SIGINT, as the console watcher sends) ends it as Packer's does.
+if [ -n "${PACKER_HOLD:-}" ]; then
+  echo '1697000000,,ui,message,    amazon-ebs.hardened: Instance ID: i-0123456789abcdef0'
+  trap 'echo interrupted >> "$PACKER_LOG"; echo "1697000002,,ui,error,Build was cancelled." ; exit 1' INT
+  end=$((SECONDS + PACKER_HOLD))
+  while [ "$SECONDS" -lt "$end" ]; do sleep 0.1; done
+fi
 regions=""
 for a in "$@"; do
   case "$a" in
@@ -416,6 +450,44 @@ LEFTOVER_FAIL=eu-west-1 lo "$P-01"
 check "a region it cannot read → exit 1, named" "$([ $? -eq 1 ] && grep -qF 'eu-west-1: could not list' "$T/lo.out"; echo $?)"
 : > "$T/aws.log"; lo "$P-01; rm -rf /"
 check "a name outside the pattern → exit 1, no AWS call" "$([ $? -eq 1 ] && [ ! -s "$T/aws.log" ]; echo $?)"
+
+echo "== build instance and key pair: listed read-only, removed only with --clean-build =="
+B1=$(grep -v '^[[:space:]]*\(#\|$\)' "$R/image/hardened/regions" | head -n 1)
+: > "$T/aws.log"; lo "$P-01"
+check "none left → exit 0, says none for both" \
+  "$([ $? -eq 0 ] && grep -qxF '   instances: none' "$T/lo.out" && grep -qxF '   packer_* key pairs: none' "$T/lo.out"; echo $?)"
+check "...reads the build region by the build's Name tag, never terminated or shutting-down ones" \
+  "$(grep -qF "aws ec2 describe-instances --region $B1 --filters Name=tag:Name,Values=idlefy-hardened-image-build Name=instance-state-name,Values=pending,running,stopping,stopped" "$T/aws.log" \
+     && grep -qF "aws ec2 describe-key-pairs --region $B1 --filters Name=tag:Name,Values=idlefy-hardened-image-build" "$T/aws.log" \
+     && [ "$(grep -c 'describe-instances\|describe-key-pairs' "$T/aws.log")" = 2 ]; echo $?)"
+: > "$T/aws.log"; BUILD_INSTANCES="i-0abc:running i-0def:stopped" BUILD_KEYS="packer_6740c0de other-key" lo "$P-01"
+check "left ones are listed, nothing removed without --clean-build" \
+  "$([ $? -eq 0 ] && grep -qxF '   instance i-0abc  state=running' "$T/lo.out" && grep -qxF '   key pair packer_6740c0de' "$T/lo.out" \
+     && ! grep -qF 'other-key' "$T/lo.out" && ! grep -qE 'terminate-instances|delete-key-pair' "$T/aws.log" \
+     && grep -qF -- '--clean-build' "$T/lo.out"; echo $?)"
+: > "$T/aws.log"; BUILD_INSTANCES="i-0abc:running i-0def:stopped" BUILD_KEYS="packer_6740c0de other-key" lo --clean-build "$P-01"
+check "--clean-build terminates exactly those instances and deletes only the packer_* key pair" \
+  "$([ $? -eq 0 ] && grep -qF "aws ec2 terminate-instances --region $B1 --instance-ids i-0abc " "$T/aws.log" \
+     && grep -qF "aws ec2 terminate-instances --region $B1 --instance-ids i-0def " "$T/aws.log" \
+     && grep -qF "aws ec2 delete-key-pair --region $B1 --key-name packer_6740c0de " "$T/aws.log" \
+     && [ "$(grep -c 'terminate-instances\|delete-key-pair' "$T/aws.log")" = 3 ] \
+     && grep -qxF '   terminated i-0abc' "$T/lo.out" && grep -qxF '   deleted key pair packer_6740c0de' "$T/lo.out"; echo $?)"
+check "...and never touches an image" "$(! grep -qE '^aws ec2 (deregister|delete-snapshot|disable|modify)' "$T/aws.log"; echo $?)"
+: > "$T/aws.log"; BUILD_INSTANCES="i-0abc:running" BUILD_KEYS="packer_6740c0de" lo --clean-build
+check "--clean-build without a name (no name file) → images not listed, build resources removed" \
+  "$([ $? -eq 0 ] && ! grep -qF 'describe-images' "$T/aws.log" && grep -qF 'terminate-instances' "$T/aws.log" \
+     && grep -qF 'delete-key-pair' "$T/aws.log" && grep -qF 'images are not listed' "$T/lo.out"; echo $?)"
+BUILD_INSTANCES="i-0abc:running" BUILD_KEYS="packer_6740c0de" TERMINATE_FAIL=1 lo --clean-build
+check "a refused terminate → exit 1, named; the key pair is still deleted" \
+  "$([ $? -eq 1 ] && grep -qF 'could not terminate i-0abc (do it by hand)' "$T/lo.out" && grep -qxF '   deleted key pair packer_6740c0de' "$T/lo.out"; echo $?)"
+: > "$T/aws.log"; INSTANCES_FAIL=1 BUILD_KEYS="packer_6740c0de" lo --clean-build
+check "instances it cannot list → exit 1, named, nothing terminated" \
+  "$([ $? -eq 1 ] && grep -qF 'instances: could not list' "$T/lo.out" && ! grep -qF 'terminate-instances' "$T/aws.log"; echo $?)"
+: > "$T/aws.log"; lo --terminate-everything
+check "an unknown option → exit 1, no AWS call" "$([ $? -eq 1 ] && [ ! -s "$T/aws.log" ]; echo $?)"
+BUILD_INSTANCES="i-0abc:running" PACKER_RC=1 run_build
+check "the driver's own listing after a failure is read-only and shows the instance" \
+  "$([ $? -ne 0 ] && grep -qF 'instance i-0abc  state=running' "$T/stderr" && ! grep -qE 'terminate-instances|delete-key-pair' "$T/aws.log"; echo $?)"
 LEFTOVER_us_east_1="$LEFT" ARTIFACT_REGIONS="us-east-1" run_build
 check "an artifact short of regions → the images are listed" \
   "$([ $? -ne 0 ] && grep -qF 'us-east-1: ami-0aaa' "$T/stderr"; echo $?)"
@@ -438,6 +510,31 @@ check "-04 only in us-east-2 → -05" "$([ $? -eq 0 ] && var "ami_name=$P-05"; e
 NAMES_FAIL_REGION=ap-south-1 run_build
 check "a failed describe in ap-south-1 refuses, naming it, packer never runs" \
   "$([ $? -ne 0 ] && grep -qF 'ap-south-1' "$T/stderr" && [ ! -s "$T/packer.log" ]; echo $?)"
+
+echo "== the console watcher: a failed bootstrap ends the build, not a 2 h wait =="
+CONSOLE_OUTPUT='[  12.3] cloud-init: booting\nBOOTSTRAP FAILED: no image will be taken. Log follows.\napt_package[ripgrep]: No candidate version' \
+  HARDENED_CONSOLE_POLL=0.2 PACKER_HOLD=30 run_build; rc=$?
+check "the banner → non-zero, says the bootstrap failed" \
+  "$([ $rc -ne 0 ] && grep -qF 'the bootstrap failed on the build instance' "$T/stderr"; echo $?)"
+check "...Packer was interrupted (SIGINT), not left to wait" "$(grep -qx interrupted "$T/packer.log"; echo $?)"
+check "...the console's tail is in the log" \
+  "$(grep -qF 'BOOTSTRAP FAILED: no image will be taken' "$T/stderr" && grep -qF 'apt_package[ripgrep]: No candidate version' "$T/stderr"; echo $?)"
+check "...the tail names the instance" "$(grep -qF '!! i-0123456789abcdef0: the bootstrap failed' "$T/stderr"; echo $?)"
+check "...it read the instance Packer named, latest output" \
+  "$(grep -q '^aws ec2 get-console-output --region us-east-1 --instance-id i-0123456789abcdef0 --latest ' "$T/aws.log"; echo $?)"
+check "...no record" "$([ ! -e "$RECORD" ]; echo $?)"
+CONSOLE_OUTPUT='solo converge complete\ndev-vm-image-scrub: internal error: ubuntu is in group sudo; no image will be taken' \
+  HARDENED_CONSOLE_POLL=0.2 PACKER_HOLD=30 run_build; rc=$?
+check "the scrub's refusal ends the build too, and says so" \
+  "$([ $rc -ne 0 ] && grep -qx interrupted "$T/packer.log" && grep -qF 'the image scrub refused the image on the build instance' "$T/stderr"; echo $?)"
+CONSOLE_OUTPUT='[  12.3] cloud-init: booting\nsolo converge complete' HARDENED_CONSOLE_POLL=0.2 PACKER_HOLD=3 run_build; rc=$?
+check "no banner → Packer runs to the end, exit 0, a record" \
+  "$([ $rc -eq 0 ] && ! grep -qx interrupted "$T/packer.log" && [ -f "$RECORD" ] && grep -q 'get-console-output' "$T/aws.log"; echo $?)"
+CONSOLE_OUTPUT='' HARDENED_CONSOLE_POLL=0.2 PACKER_HOLD=1 run_build
+check "an empty console (a stopped instance) → nothing happens, exit 0" "$([ $? -eq 0 ] && ! grep -qx interrupted "$T/packer.log"; echo $?)"
+CONSOLE_FAIL=1 HARDENED_CONSOLE_POLL=0.2 PACKER_HOLD=3 run_build; rc=$?
+check "console read errors are tolerated: exit 0, a record, one note" \
+  "$([ $rc -eq 0 ] && [ -f "$RECORD" ] && [ "$(grep -c 'cannot read the console of i-0123456789abcdef0' "$T/stderr")" = 1 ]; echo $?)"
 
 echo "== public=false and an attached org =="
 PUBLIC=false ORG=0b7c3c1e-5f0e-4b8e-9a51-3f0c2d1e4a5b run_build; check "exits 0" "$?"
@@ -469,6 +566,7 @@ PLATFORM_TAG=v2.2 run_build; refuses_early $? "a malformed PLATFORM_TAG refuses"
 PLATFORM_SHA=abc run_build; refuses_early $? "a malformed PLATFORM_SHA refuses" PLATFORM_SHA
 PUBLIC=yes run_build; refuses_early $? "HARDENED_PUBLIC other than true/false refuses" HARDENED_PUBLIC
 ORG=not-a-uuid run_build; refuses_early $? "a malformed attached org refuses" HARDENED_ATTACHED_ORG_ID
+HARDENED_CONSOLE_POLL=soon run_build; refuses_early $? "a console poll that is not a number refuses" HARDENED_CONSOLE_POLL
 
 echo "== the tag must name PLATFORM_SHA, and the tree must be it =="
 git -C "$R" init -q && git -C "$R" add -A && git -C "$R" -c user.name=t -c user.email=t@t commit -qm t && git -C "$R" tag v2.2.0
