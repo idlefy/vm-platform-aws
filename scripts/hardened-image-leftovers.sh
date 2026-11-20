@@ -1,20 +1,36 @@
 #!/usr/bin/env bash
-# hardened-image-leftovers.sh — list this account's images named exactly
-# <ami-name> in every region of image/hardened/regions. Read-only: it calls
-# ec2 describe-images and nothing else. Design: docs/design/hardened-image.md
-# ("A build that failed after its images"); clean-up: docs/runbook.md.
+# hardened-image-leftovers.sh — what a failed or cancelled hardened build may
+# have left in this account. Design: docs/design/hardened-image.md ("A build
+# that failed after its images"); clean-up: docs/runbook.md.
 #
-#   scripts/hardened-image-leftovers.sh idlefy-hardened-agent-ubuntu-24.04-amd64-YYYYMMDD-NN
+#   scripts/hardened-image-leftovers.sh [--clean-build] [<ami-name>]
 #
-# Called by scripts/hardened-image-build.sh when a build fails after
-# `packer build` started, and by the publish workflow's step after a failed,
-# cancelled or timed-out build (the runner may kill the driver before it can
-# list anything itself). Prints, on stdout, a heading and one line per region:
-# the images' ids, state, Public flag and whether IdlefyPublishedImage=true
-# is set, "none", or why the region could not be read.
+# It lists, in this order:
+#   - in the build region (the file's first line), every instance tagged
+#     Name=idlefy-hardened-image-build that is not terminated or shutting
+#     down, and every key pair named packer_* carrying that tag. A runner
+#     killed mid-build (an Actions cancel or timeout) leaves both behind:
+#     Packer never gets to clean up;
+#   - images named exactly <ami-name> in every region of image/hardened/regions
+#     (only when a name is given) — id, state, Public flag and whether
+#     IdlefyPublishedImage=true is set, "none", or why a region could not be
+#     read. Images are only ever listed: removing one is the owner's call.
+# With --clean-build it first checks that the credentials are the publisher
+# account's (the id scripts/hardened-guard-check.sh holds for G1 — read from
+# there, not copied), and refuses before any call but that check if not; then
+# it terminates those instances and deletes those key pairs — exactly those,
+# and nothing else; the publisher role may do no more — before the image
+# listing: the instance is what costs money, and the workflow's step may be
+# close to the job's deadline.
+# Without it, it calls describe-* only.
 #
-# Exit 0 when every region was read, 1 when one was not or the name is
-# malformed. Credentials come from the environment; nothing here prints one.
+# Called by scripts/hardened-image-build.sh (read-only) when a build fails
+# after `packer build` started, and with --clean-build by the publish
+# workflow's leftovers step after a failed, cancelled or timed-out build.
+#
+# Exit 0 when every read and every clean-up call succeeded, 1 otherwise (or on
+# a malformed argument). Credentials come from the environment; nothing here
+# prints one.
 
 set -euo pipefail
 export AWS_PAGER=""
@@ -22,13 +38,24 @@ export AWS_PAGER=""
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REGIONS_FILE="$ROOT/image/hardened/regions"
 NAME_PREFIX=idlefy-hardened-agent-ubuntu-24.04-amd64
+BUILD_TAG=idlefy-hardened-image-build
 
 die() { echo "✗ hardened-image-leftovers: $*" >&2; exit 1; }
+usage="usage: scripts/hardened-image-leftovers.sh [--clean-build] [<ami-name>]"
 
-[ $# -eq 1 ] || die "usage: scripts/hardened-image-leftovers.sh <ami-name>"
-NAME=$1
-[[ $NAME =~ ^${NAME_PREFIX//./\\.}-[0-9]{8}-[0-9]{2}$ ]] \
-  || die "'$NAME' is not a name of the form $NAME_PREFIX-YYYYMMDD-NN"
+CLEAN=0 NAME=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --clean-build) CLEAN=1 ;;
+    -*) die "unknown option '$1' — $usage" ;;
+    *) [ -z "$NAME" ] || die "$usage"; NAME=$1 ;;
+  esac
+  shift
+done
+if [ -n "$NAME" ]; then
+  [[ $NAME =~ ^${NAME_PREFIX//./\\.}-[0-9]{8}-[0-9]{2}$ ]] \
+    || die "'$NAME' is not a name of the form $NAME_PREFIX-YYYYMMDD-NN"
+fi
 for c in aws python3; do command -v "$c" >/dev/null || die "$c is not on PATH"; done
 
 # The same parse as scripts/hardened-image-build.sh.
@@ -52,22 +79,125 @@ if not regions:
 print(" ".join(regions))
 PY
 )" || die "image/hardened/regions: see above — fix the file"
+BUILD_REGION=${REGIONS%% *}
 
 ERR="$(mktemp)"
 trap 'rm -f "$ERR"' EXIT
-
-echo "!! Images named $NAME may exist, and may be PUBLIC; no release record names them."
-echo "!! Deregister them and delete their snapshots before any retention run or new"
-echo "!! build — docs/runbook.md, \"A hardened build that failed after its images\"."
 RC=0
-for r in $REGIONS; do
-  if ! out="$(aws ec2 describe-images --region "$r" --owners self --include-deprecated --include-disabled \
-                --filters "Name=name,Values=$NAME" --output json 2>"$ERR" < /dev/null)"; then
-    echo "   $r: could not list (check by hand): $(tr '\n' ' ' < "$ERR")"
-    RC=1
-    continue
+
+# ---- --clean-build: the publisher account, or nothing -------------------------------
+if [ "$CLEAN" = 1 ]; then
+  GUARD="$ROOT/scripts/hardened-guard-check.sh"
+  WANT="$(sed -n 's/^ACCOUNT_ID=\([0-9]\{12\}\)$/\1/p' "$GUARD" 2>/dev/null)" || WANT=""
+  [[ $WANT =~ ^[0-9]{12}$ ]] \
+    || die "cannot read the publisher account id (ACCOUNT_ID=) from $GUARD — nothing was terminated or deleted"
+  GOT="$(aws sts get-caller-identity --region "$BUILD_REGION" --query Account --output text 2>"$ERR" < /dev/null)" \
+    || die "could not read the AWS account (aws sts get-caller-identity): $(tr '\n' ' ' < "$ERR")— nothing was listed, terminated or deleted"
+  [ "$GOT" = "$WANT" ] \
+    || die "these credentials are for account '$GOT', not the publisher account $WANT — nothing was listed, terminated or deleted"
+fi
+
+# ---- the build instance and its key pair -------------------------------------------
+# First, before the image listing: the instance is what costs money, and the
+# workflow's step may be close to the job's deadline.
+# Only what carries the build's Name tag, in the build region, and only key
+# pairs Packer names packer_*: the publisher role may terminate and delete
+# exactly these.
+INSTANCES="" KEYS=""
+# list_instances — INSTANCES ("id:state …") from one describe; 1 on a failed
+# or unreadable answer, with the reason in $ERR.
+list_instances() {
+  local out
+  INSTANCES=""
+  out="$(aws ec2 describe-instances --region "$BUILD_REGION" \
+           --filters "Name=tag:Name,Values=$BUILD_TAG" "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+           --output json 2>"$ERR" < /dev/null)" || return 1
+  INSTANCES="$(python3 -I -c '
+import json, re, sys
+rows = []
+for res in json.loads(sys.argv[1])["Reservations"]:
+    for i in res["Instances"]:
+        if not re.fullmatch(r"i-[0-9a-f]+", i["InstanceId"]):
+            raise ValueError(i["InstanceId"])
+        rows.append("%s:%s" % (i["InstanceId"], i["State"]["Name"]))
+print(" ".join(rows))' "$out" 2>/dev/null)" || { INSTANCES=""; echo "unreadable answer" > "$ERR"; return 1; }
+}
+# With --clean-build, an empty listing is asked again: EC2 may have accepted
+# a launch just before the runner killed Packer, and a new instance can take
+# a moment to be listable. CLEAN_TRIES listings, CLEAN_PAUSE seconds apart
+# (HARDENED_LEFTOVERS_PAUSE, for the tests). Anything listed is acted on at
+# once; a plain listing asks once.
+CLEAN_TRIES=3
+CLEAN_PAUSE="${HARDENED_LEFTOVERS_PAUSE:-10}"
+[[ $CLEAN_PAUSE =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "HARDENED_LEFTOVERS_PAUSE='$CLEAN_PAUSE' is not a number of seconds"
+echo "Build resources in $BUILD_REGION (Name=$BUILD_TAG):"
+try=1 listed=0
+while :; do
+  if list_instances; then listed=1; else listed=0; fi
+  [ "$CLEAN" = 1 ] && [ "$listed" = 1 ] && [ -z "$INSTANCES" ] && [ "$try" -lt "$CLEAN_TRIES" ] || break
+  try=$((try + 1)); sleep "$CLEAN_PAUSE"
+done
+if [ "$listed" = 1 ]; then
+  if [ -n "$INSTANCES" ]; then
+    for x in $INSTANCES; do echo "   instance ${x%%:*}  state=${x#*:}"; done
+  elif [ "$CLEAN" = 1 ]; then
+    echo "   instances: none (listed $CLEAN_TRIES times, ${CLEAN_PAUSE} s apart)"
+  else
+    echo "   instances: none"
   fi
-  python3 -I - "$r" "$out" "$NAME" <<'PY' || { echo "   $r: unreadable answer (check by hand)"; RC=1; }
+else
+  echo "   instances: could not list (check by hand): $(tr '\n' ' ' < "$ERR")"
+  INSTANCES="" RC=1
+fi
+if out="$(aws ec2 describe-key-pairs --region "$BUILD_REGION" --filters "Name=tag:Name,Values=$BUILD_TAG" \
+            --output json 2>"$ERR" < /dev/null)" \
+   && KEYS="$(python3 -I -c '
+import json, re, sys
+names = [k["KeyName"] for k in json.loads(sys.argv[1])["KeyPairs"]]
+print(" ".join(n for n in names if re.fullmatch(r"packer_[0-9a-zA-Z_-]+", n)))' "$out" 2>/dev/null)"; then
+  if [ -n "$KEYS" ]; then
+    for k in $KEYS; do echo "   key pair $k"; done
+  else
+    echo "   packer_* key pairs: none"
+  fi
+else
+  echo "   packer_* key pairs: could not list (check by hand): $(tr '\n' ' ' < "$ERR")"
+  KEYS="" RC=1
+fi
+
+if [ "$CLEAN" = 1 ]; then
+  for x in $INSTANCES; do
+    if aws ec2 terminate-instances --region "$BUILD_REGION" --instance-ids "${x%%:*}" --output json \
+         > /dev/null 2>"$ERR" < /dev/null; then
+      echo "   terminated ${x%%:*}"
+    else
+      echo "   could not terminate ${x%%:*} (do it by hand): $(tr '\n' ' ' < "$ERR")"; RC=1
+    fi
+  done
+  for k in $KEYS; do
+    if aws ec2 delete-key-pair --region "$BUILD_REGION" --key-name "$k" --output json \
+         > /dev/null 2>"$ERR" < /dev/null; then
+      echo "   deleted key pair $k"
+    else
+      echo "   could not delete key pair $k (do it by hand): $(tr '\n' ' ' < "$ERR")"; RC=1
+    fi
+  done
+elif [ -n "$INSTANCES$KEYS" ]; then
+  echo "   (the publish workflow's leftovers step removes these; by hand: scripts/hardened-image-leftovers.sh --clean-build)"
+fi
+# ---- images (read-only) ----------------------------------------------------------
+if [ -n "$NAME" ]; then
+  echo "!! Images named $NAME may exist, and may be PUBLIC; no release record names them."
+  echo "!! Deregister them and delete their snapshots before any retention run or new"
+  echo "!! build — docs/runbook.md, \"A hardened build that failed after its images\"."
+  for r in $REGIONS; do
+    if ! out="$(aws ec2 describe-images --region "$r" --owners self --include-deprecated --include-disabled \
+                  --filters "Name=name,Values=$NAME" --output json 2>"$ERR" < /dev/null)"; then
+      echo "   $r: could not list (check by hand): $(tr '\n' ' ' < "$ERR")"
+      RC=1
+      continue
+    fi
+    python3 -I - "$r" "$out" "$NAME" <<'PY' || { echo "   $r: unreadable answer (check by hand)"; RC=1; }
 import json, sys
 region, answer, name = sys.argv[1], sys.argv[2], sys.argv[3]
 try:
@@ -81,5 +211,9 @@ except (ValueError, KeyError, TypeError, AttributeError):
     sys.exit(1)
 print("\n".join(rows) if rows else "   %s: none" % region)
 PY
-done
+  done
+else
+  echo "No image name given: images are not listed."
+fi
+
 exit "$RC"

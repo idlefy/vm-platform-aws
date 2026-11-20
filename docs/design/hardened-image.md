@@ -4,8 +4,10 @@
 > build has been inspected, before the first public one.
 
 **Date:** 2026-11-20
-**Status:** implemented; first build pending
-**Ships as:** `v2.2.0`, with the cookbook it converges at `base-2.2.0`.
+**Status:** implemented; the first Packer-built private image is pending
+(`v2.2.1` fixes what the first two runs and a hand-built image found)
+**Ships as:** `v2.2.0`, with the cookbook it converges at `base-2.2.0`;
+`v2.2.1` changes the build only (the cookbook stays `base-2.2.0`).
 
 | Need | Where |
 |---|---|
@@ -80,11 +82,15 @@ reaches it only through what the customer's own account does to the instance
    is a separate file because the scrub rides in every fleet VM's user data,
    which EC2 caps at 16 KB gzipped; only the solo build's user data embeds
    it. The driver writes both files side by side, then appends
-   `dev-vm-image-scrub --profile solo <sha256>` as the user data's last line;
-   just before that call the user data switches its output to the console,
-   because the scrub deletes `/var/log/user-data.log` while the shell holds
-   it open, and anything written to it afterwards would land in freed blocks
-   of the public snapshot. A refusal is therefore read on the serial console
+   `exec dev-vm-image-scrub --profile solo <sha256>` as the user data's last
+   line; just before it the user data switches its output to the console,
+   because the scrub deletes `/var/log/user-data.log`, and a file still held
+   open is freed only at power-off, after the zero-fill. `exec` does the same
+   for the script itself: bash holds cloud-init's copy of it (`part-001`,
+   which `cloud-init clean` deletes) open close-on-exec, and exec drops that
+   hold. Nothing else changes: the bootstrap's ERR trap is already cleared
+   before these lines, the scrub's exit status is the script's, and a
+   refusal leaves the instance running as before. A refusal is therefore read on the serial console
    of an instance nobody can log into.
    `test/test-image-scrub.sh` holds each list equal to its fixture.
 
@@ -236,14 +242,37 @@ reaches it only through what the customer's own account does to the instance
 12. **The solo scrub fails closed.** Every invariant the cookbook bakes and
     the first boot relies on is checked on the disk about to be snapshotted;
     a build that lost one exits 70, names the reason on the console, skips
-    `cloud-init clean` and never powers off, so Packer times out and no AMI
-    is registered. As implemented in `dev-vm-image-scrub-solo`:
+    `cloud-init clean` and never powers off, so no AMI is registered; the
+    driver's console watcher sees the refusal and interrupts Packer (see "A
+    build whose bootstrap or scrub failed"). As implemented in
+    `dev-vm-image-scrub-solo`:
     - `solo_dir`, before `image-revision` is written: `/etc/dev-vm` is a
       directory;
     - `solo_prep`, before the removals: `apt-get purge cinc` succeeds, and
-      `/opt/cinc/bin/cinc-client` is gone afterwards (checked here, because
-      the solo list then removes `/opt/cinc` and its absence would prove
-      nothing);
+      `/opt/cinc/bin/cinc-client` is gone afterwards; the `amazon-ssm-agent`
+      snap is neither listed by `snap` nor on disk
+      (`/snap/amazon-ssm-agent`, `/var/lib/snapd/snaps/amazon-ssm-agent_*.snap`)
+      — both checked here, because the solo list then removes `/opt/cinc`,
+      `/snap` and `/var/lib/snapd`, and an absence would prove nothing after
+      it; then snapd's device key files
+      (`/var/lib/snapd/device/private-keys-v1/*`) are overwritten in place
+      and removed (`shred -u` — a second defence for the one identity known
+      to have reached the disk; best effort, a missing directory or a failed
+      shred is a console note, never a refusal), and `apt-get purge snapd` and
+      `apt-get clean` succeed. **snapd
+      leaves the image** (ruling 2026-11-20): the hand-built image carried
+      the build instance's snapd device identity —
+      `/var/lib/snapd/device/private-keys-v1/<key>` and a serial that
+      `snap model --serial` printed — which every box from a public image
+      would share. `ubuntu` has no sudo, so only the admin could use snap at
+      all; purging it is a smaller surface than editing `state.json`. The
+      cost if wrong: the admin runs `apt install snapd` to use a snap.
+      `apt-get clean` drops the package cache (321 MB on that image); the
+      lists stay. The solo list removes what a purge can leave:
+      `/var/lib/snapd`, `/snap`, `/var/snap`, `/var/cache/snapd`,
+      `/root/snap`, `/home/*/snap`, and snap-confine's compiled AppArmor
+      profiles `/var/cache/apparmor/*/snap-confine*` (measured left by the
+      purge on the hand-built image);
     - `solo_check`, immediately before `cloud-init clean`:
       1. `idlefy-hardened-firstboot.service` is enabled **and** its
          `multi-user.target.wants` symlink exists on disk (`enabled-runtime`
@@ -277,17 +306,91 @@ reaches it only through what the customer's own account does to the instance
          puts a filter `OUTPUT` line ahead of the drop: Docker is rootless
          (the system daemon is stopped, and dockerd's own OUTPUT jump is in
          `*nat`), and Tailscale's chains hang off `INPUT` and `FORWARD`;
-      7. the `amazon-ssm-agent` snap is neither listed by `snap` nor on disk
-         (`/snap/amazon-ssm-agent`, `/var/lib/snapd/snaps/amazon-ssm-agent_*.snap`);
-      8. dpkg reports `cinc` as not installed;
-      9. `/etc/dev-vm` — checked by `solo_dir` above.
+      7. dpkg's database shows `dpkg` itself installed — an empty or
+         missing database answers "no packages found" for everything, which
+         would read as absence — then dpkg knows neither `snapd` nor an
+         `amazon-ssm-agent` package, or knows it as `not-installed`; any
+         other answer, including a `dpkg-query` error, refuses.
+         `/var/lib/snapd`, `/snap`, `/usr/bin/snap` and `/usr/lib/snapd/snapd`
+         are gone. **No unit-shaped file or link** named `snap*.service`,
+         `snap*.socket`, `snap*.mount`, `snap*.timer`, `snap*.target`,
+         `snap*.path`, `snap*.slice` (snapd writes `snap.<group>.slice` for
+         quota groups), `snap*.scope` or `amazon-ssm-agent*` is left **anywhere on the root
+         filesystem**: one `find / -xdev` over files and links, not a list
+         of unit directories — three reviews each found another directory
+         systemd reads units from (`/usr/local/lib`, `~/.config`,
+         `~/.local/share`, `/etc/xdg`, `/usr/share/systemd/user`, …), so the
+         scan stopped enumerating them. `-xdev` keeps it on the filesystem the
+         snapshot images: `/proc`, `/sys`, `/dev` and `/run` are other
+         filesystems on the instance (procfs, sysfs, devtmpfs, tmpfs), and
+         `/boot` and `/boot/efi` are other partitions that systemd reads no
+         units from; nothing is excluded by name. Links are matched as links
+         and never followed: a unit behind a linked directory is found at the
+         path it really has on this filesystem, and a link to a directory on
+         another filesystem points at nothing the image keeps. Any hit
+         refuses, and so does a `find` error. Measured on the real image: the
+         exact scan returns nothing (rootless Docker's `docker.service`
+         included). With the snap check in `solo_prep`, no SSM agent can be
+         on the image;
+      8. dpkg reports `cinc` as unknown or not installed, by the same strict
+         rule;
+      9. `/etc/dev-vm` — checked by `solo_dir` above;
+      10. last:
+          - `/var/log/cloud-init.log` and `/var/log/cloud-init-output.log`
+            are truncated: cloud-init holds both open (its log handler, its
+            output `tee`), so deleting them frees nothing until power-off,
+            while truncating frees their blocks now;
+          - `cloud-init clean --logs --machine-id`, so that what it deletes
+            is overwritten by the fill; the shared scrub's own clean after
+            this hook then finds nothing left to delete;
+          - **no process holds a deleted regular file of non-zero size on
+            `/`** (`/proc/[0-9]*/fd/*`, compared by device with `/`): such a
+            file's blocks are freed only at power-off, after the fill. Any
+            hit refuses, naming the file, its size and the holder. Strict on
+            purpose — the build is the place to find a new holder;
+          - a **zero-fill of `/`'s free space**: `sync`; ext4's
+            `reserved_clusters` for the root device (found through
+            `mountpoint -d /` and `/sys/dev/block`) is read, set to 0 and
+            put back afterwards — that reserve (min(2 %, 4096 clusters), up
+            to 16 MiB) is withheld even from root, and a refusal from here on
+            puts it back too; `dd if=/dev/zero oflag=direct` into one file,
+            1 MiB writes and then 4 KiB writes for the last partial MiB, each
+            pass ending on "No space left on device"; while the file exists,
+            at most `ZERO_FILL_MAX_FREE` (1 MiB) of `/` may be free
+            (`stat -f`, free blocks × block size); `sync FILE` (an fsync
+            whose error is reported — a bare `sync` reports none); remove
+            the file; `sync`; the file must be gone. `O_DIRECT` makes ext4
+            allocate the blocks and the file's extent tree at write time, so
+            the full filesystem is reported to `dd` instead of failing a
+            delayed allocation at writeback with the reserve at 0. The 1 MiB
+            bound: after the 4 KiB pass only what ext4 keeps for the file's
+            own extent tree should be free, a few 4 KiB blocks; 256 blocks is
+            generous for that and 16 times below the reserve.
+          A refusal from here on comes after the clean. What the fill covers
+          and what it does not: "Freed blocks" in Security notes.
 
 13. **The publisher role is scoped to the build's own tags and a fixed,
     no-ingress security group.** The account also runs the dev organization's
     live Dev Boxes, so the role may only run, stop and terminate instances and
     volumes tagged `Name=idlefy-hardened-image-build`, and passes the fixed
     group `HARDENED_BUILD_SG_ID` rather than letting Packer create one. The
-    role itself is applied by Terraform outside this repository.
+    role itself is applied by Terraform outside this repository. Measured on
+    the first run: for Canonical's source image the `ec2:Owner` condition key
+    is the owner **alias** `amazon` (DescribeImages `ImageOwnerAlias`), not
+    the account id (`<canonical-account-id>`), so a RunInstances condition on the id
+    alone refuses the launch. Packer's temporary `packer_*` key pair carries
+    the same `Name` tag (it is created with the run tags), so the role may
+    delete exactly those key pairs and terminate exactly those instances —
+    which the workflow's `leftovers` step does after a killed run.
+    Beyond what Packer needs, this repository's scripts use, under that role:
+    `GetConsoleOutput` on the build instance (the console watcher),
+    `DescribeInstances` and `DescribeKeyPairs` (the leftovers listing),
+    `TerminateInstances` and `DeleteKeyPair` (`--clean-build`), and
+    `DescribeImages`. If the role's `ec2:Describe*` is ever narrowed to
+    single actions, keep `DescribeInstances`, `DescribeKeyPairs` and
+    `DescribeImages`: without them a killed run's instance is neither listed
+    nor removed, and the watcher's instance is the one Packer names, so it
+    needs no describe at all.
 
 14. **How the release gets created.** `make release TAG=vX.Y.Z` cuts and the
     owner pushes only the git **tag**; nothing in this repository creates a
@@ -354,12 +457,150 @@ the same script into the job summary: the runner may kill the driver before
 it can list anything itself. The consumer never pins them, but they are
 public until removed, and
 the next build's NN skips their number (NN is one past the highest same-day
-number in **any** listed region). Clean-up is manual and comes before any
-retention run or new build — `docs/runbook.md`, "A hardened build that failed
-after its images". Once the record is uploaded, the driver removes
-`dist/hardened-ami-name`, so a later failure (the notes edit) lists nothing,
-neither in the driver nor in the workflow's step: the record names the
-images.
+number in **any** listed region). Clean-up of images is manual and comes
+before any retention run or new build — `docs/runbook.md`, "A hardened build
+that failed after its images". Once the record is uploaded, the driver
+removes `dist/hardened-ami-name`, so a later failure (the notes edit) lists
+no images, neither in the driver nor in the workflow's step: the record
+names them.
+
+The same script also lists, in the build region, every instance tagged
+`Name=idlefy-hardened-image-build` that is not terminated or shutting down
+and every `packer_*` key pair with that tag; with `--clean-build` it
+terminates those instances and deletes those key pairs, and nothing else.
+With `--clean-build`, an empty instance listing is asked again — 3 listings
+10 s apart (`CLEAN_TRIES`, `CLEAN_PAUSE`; `HARDENED_LEFTOVERS_PAUSE` for
+the tests) — because EC2 may accept a launch just before the runner kills
+Packer and a new instance can take a moment to be listable; anything listed
+is acted on at once, and a plain listing asks once.
+It does this **first**, before the image listing across every region: the
+instance is what costs money, and the workflow's step may run close to the
+job's deadline.
+Measured on the second run: an Actions cancel kills the runner before Packer
+cleans up, so the build instance kept running and the key pair stayed. The
+workflow's `leftovers` step runs `--clean-build`, **whether or not a name
+file exists**: only build resources carry that tag, the publisher role may
+touch nothing else, and the concurrency group lets no other publish run be
+live, so there is nothing else it could remove — while a leftover from an
+earlier killed run would otherwise survive. Images are never removed by it.
+Before any terminate or delete, `--clean-build` checks that
+`sts get-caller-identity` names the publisher account — the id it reads from
+`scripts/hardened-guard-check.sh` (G1's `ACCOUNT_ID`), not a copy of its own;
+a different account or an unreadable identity stops it with nothing listed or
+removed. When the job's credentials step never succeeded, the step only says
+"No AWS credentials were configured: nothing could have been launched." and
+exits 0 (the step reads that step's outcome through `env:`).
+
+### A build whose bootstrap or scrub failed
+
+`bootstrap-solo` fails closed and leaves the instance **running**, so its
+serial console keeps the log; the scrub's refusal does the same. Packer, with
+`communicator = "none"`, only waits for the instance to stop — measured on
+the second run, it would have waited its whole budget (480 × 15 s = 2 h)
+after a bootstrap that failed in 28 s. So while `packer build` runs, the
+driver reads the console of the instance Packer names (`Instance ID: i-…` in
+its own log, never another run's) every 30 s with
+`get-console-output --latest`. Only Nitro instance types serve `--latest`:
+a non-Nitro type loses this fast failure path (Packer's own 2 h stop
+timeout remains); the publisher role allows exactly `c7a.xlarge`, so only a
+hand run with other credentials could pick another type. A poll of zero, in
+any decimal form, is refused (the watcher would spin). The markers are **whole lines** (a trailing
+carriage return allowed), so a console that merely quotes one inside another
+line is not a failure — with one allowance: a marker may follow a getty
+prompt left unterminated on the console (`<host> login: `, seen on the real
+console followed by other text). `bootstrap-solo`'s banner and the solo
+scrub's refusals print a newline first; the shared scrub's own refusals
+(it rides in every fleet VM and is not changed) do not, hence the
+allowance:
+
+- `BOOTSTRAP FAILED: no image will be taken. Log follows.` — the bootstrap's
+  banner, exactly as `bootstrap-solo` prints it (a test pins the two equal);
+- a line starting `dev-vm-image-scrub: internal error` or
+  `dev-vm-image-scrub: refusing` — every exit-70 message either scrub logs,
+  including the three early ones that do not say "no image will be taken"
+  (a test holds every `log` call of both scrubs to those prefixes or
+  `note:`). The fleet scrub's wording is matched, not changed.
+
+On a marker it prints the console's tail into the job log, sends SIGINT to
+Packer's process group — Packer then terminates the instance and deletes its
+key pair — and
+fails with "the bootstrap failed on the build instance" (or "the image scrub
+refused the image …") **whatever Packer's own exit status**: a Packer that
+took the interrupt and still reported an artifact writes no record. A console
+that cannot be read is noted once and is not a failure. A good build shows
+nothing: a stopped instance's console reads empty (measured).
+
+The watcher's lifetime: it runs in the background and is stopped and reaped
+on every way out of the driver — after `packer build` returns, and in the
+EXIT trap on a failure, INT or TERM, before the temporary directory is
+removed; its TERM trap kills every job it has running (`jobs -p`: the
+pending sleep or in-flight console read, with no window where one is not yet
+recorded) and reaps them, so no orphan holds the job's output open. As a
+backstop it returns on its own once that directory or the driver's process
+is gone.
+
+**How Packer is interrupted.** Packer 1.11.2 runs under panicwrap v1.0.0: the
+`packer` process re-executes itself as a worker and only watches it. Packer's
+`main.go` sets `wrapConfig.ForwardSignals = []os.Signal{syscall.SIGTERM}` and
+no `IgnoreSignals`, so panicwrap defaults that to `os.Interrupt` and the
+wrapper catches SIGINT and drops it (`case <-sigCh:` does nothing), on the
+assumption that a terminal's Ctrl-C reaches the worker through the process
+group anyway. A SIGINT to the wrapper's pid alone is therefore lost, and the
+worker — whose `handleTermInterrupt` cancels the build on SIGINT or SIGTERM
+and cleans up — never hears it. So:
+
+- `packer build` starts in a session of its own (`setsid`, through a small
+  launcher that also resets SIGINT and SIGTERM to their defaults, since a
+  background job inherits SIGINT ignored) and writes its pid — its process
+  group — to a file;
+- the watcher sends SIGINT to that **group**, so wrapper and worker both get
+  it; the wrapper drops its copy, the worker cancels;
+- the driver waits for the pipeline in the background (`wait` returns to a
+  trap at once; a foreground pipeline would hold the trap until Packer ended
+  by itself). Its EXIT path — reached on INT, TERM or any failure — stops
+  the watcher, then sends SIGINT to Packer's group and **waits** for Packer
+  to finish its clean-up before listing leftovers. Its first act is to
+  ignore INT and TERM and keep the first exit status: an Actions cancel
+  sends INT, then TERM 7.5 s later, and the second signal used to cut short
+  the wait, the leftovers listing and the clean-up. The wait for Packer's
+  pid file has no cap (it ends when the file holds a pid or the pipeline
+  ends); a signal between starting the pipeline and recording its pid is
+  covered by taking the one job left. The SIGINT is repeated every 10 s
+  while Packer's group lives: the worker takes the first and drops the rest
+  (its handler reads one signal), the plugins discard every interrupt
+  (packer-plugin-sdk v0.5.4, `plugin/server.go`: "Eat the interrupts"), and
+  a repeat covers the instant after start-up when only the wrapper exists.
+  There is no escalation to SIGKILL: Packer's clean-up is what removes the
+  instance and the key pair; a runner that will not wait kills the job
+  itself, and the workflow's `leftovers` step removes what is left. On a
+  local run nothing would end a Packer or plugin stalled in its clean-up,
+  so the wait (for the pid file, then for Packer's group) has a **grace
+  period**: `PACKER_GRACE_DEFAULT=900` s (15 minutes;
+  `HARDENED_PACKER_GRACE` overrides it, validated like the poll). When it
+  runs out the driver stops waiting — still no KILL — prints that Packer's
+  clean-up was **not** confirmed and that the build instance and key pair
+  may still exist, pointing at `hardened-image-leftovers.sh --clean-build`,
+  keeps the first exit status and still lists leftovers and cleans up. A
+  Packer that exits within the grace period sees no change;
+- the rest of the pipeline (its subshell, `tee`, `awk`) stays in the
+  driver's group but ignores INT and TERM and ends when Packer closes its
+  output. A cancel that signals the driver's group must not end the `wait`
+  early, nor break the pipe Packer writes its clean-up to — a write to a
+  broken stdout would kill it with SIGPIPE mid-clean-up (a test caught
+  exactly that under SIGTERM).
+
+The tests stand in for Packer with a wrapper that swallows SIGINT and
+forwards only SIGTERM, plus a worker: a marker, and SIGINT or SIGTERM to the
+driver's session (with the watcher in a long sleep, or in a hung console
+read), each reach the worker; its clean-up ends before the leftovers are
+listed; wrapper, worker and every process of the driver's session are gone
+when the driver returns, checked at once.
+
+**Nothing the bootstrap or the converge prints may be a secret**: a failure's
+console tail — up to 80 lines, the last 56 kB of the bootstrap's log behind
+the banner — lands in the job log, which everyone who can read the
+repository's Actions can read. The build holds no credential (decision 3);
+keep it so, and keep secrets out of the converge's output.
 
 ### Workflows
 
@@ -369,15 +610,31 @@ UTC):
 - `resolve` (no AWS, no environment, `contents: read`): a dispatch must run on
   a `vX.Y.Z` tag ref, else it fails with "run this on a vX.Y.Z tag"; the
   schedule takes the newest `vX.Y.Z` tag on origin, peeled to its commit.
-- `publish` (`environment: hardened-publish`, 240 minutes): checkout of the
+- `publish` (`environment: hardened-publish`, 240 minutes; its `build` step
+  180): checkout of the
   tag with `persist-credentials: false`, Packer 1.11.2, Cinc Workstation,
   OIDC credentials for `HARDENED_PUBLISH_ROLE_ARN` (4 hours), then the guard,
   then the build. One approval covers both. `HARDENED_PUBLIC` is set once,
   in the job's `env:`, so the guard and the build cannot drift. After a
   failed, cancelled or timed-out build the `leftovers` step lists any image
   of the chosen name into the job summary (without a name file it says the
-  build chose no name, or its record was uploaded), and the `record` step
-  prints any record written.
+  build chose no name, or its record was uploaded, and lists no images),
+  terminates the build instance and deletes Packer's key pair if a killed
+  run left them, and the `record` step prints any record written. The build
+  step's own `timeout-minutes: 180` starts counting only after the steps
+  before it, so the job's last 60 minutes are split: up to 45 for checkout,
+  the Packer and Cinc setup, credentials and the guard (a few minutes in
+  practice), and at least 15 for those two steps. Setup and guard would
+  have to take over 45 minutes to eat that reserve; no file bounds them, so
+  that part is not asserted. The role session (`role-duration-seconds:
+  14400`, the job's 240 minutes) outlives every step, so the leftovers step
+  still has credentials after a build timeout. A test pins job ≥ build + 45
+  + 15, the session length, the steps' order and their exact `if:`
+  (`failure() || cancelled()` for leftovers, `always()` for the record).
+  On a cancel or a step timeout the runner signals the driver, which passes
+  SIGINT to Packer, but kills the job's processes seconds later — usually
+  before Packer's clean-up ends; the leftovers step is what removes the
+  instance and key pair then.
 - `permissions: {}` at workflow level; `resolve` gets `contents: read`, and
   only the `publish` job gets `contents: write, id-token: write`. The retire
   workflow is the same: nothing at workflow level, its job `contents: read,
@@ -422,11 +679,59 @@ trailing comment. No input or ref name is interpolated into a `run:` script.
   residuals below are what they leave.
 - **Freed blocks of a public snapshot are readable.** Anyone can copy a public
   snapshot and read every block, including blocks a deleted file used to
-  occupy. The scrub removes files; it does not wipe free space. What the
-  build ever wrote to disk is therefore public: the converge state stays on
-  tmpfs (`/run/dev-vm/solo`), no credential ever reaches the instance, and
-  the scrub list names nothing secret — only per-instance identity (host keys,
-  machine id, engine ids) that must differ between clones.
+  occupy. **The first line of defence stays the law that nothing secret is
+  written to the build disk**: the converge state stays on tmpfs
+  (`/run/dev-vm/solo`), no credential ever reaches the instance, and the
+  scrub list names nothing secret — only per-instance identity (host keys,
+  machine id, engine ids) that must differ between clones. snapd's device
+  key broke that law (the scrub now removes snapd and shreds the key first),
+  so the solo image also **zero-fills its free space** (decision 12, check
+  10). **The fill is defence in depth, not the guarantee**: it removes what
+  it can reach, and what it cannot reach is listed below. The guarantee is
+  still that nothing secret is written to the build disk.
+  - Trimming does not help: EBS root volumes accept no discard (measured on a
+    c7a.xlarge with a gp3 root: "fstrim: /: the discard operation is not
+    supported"). The fleet scrub's `fstrim -av || true` has always been a
+    no-op there, and freed blocks have always reached the fleet's private
+    snapshots; the fleet is unchanged.
+  - The fill covers every data block of `/` that is free when it runs:
+    everything the scrub lists remove, the CINC and snapd purges,
+    `apt-get clean`, the bootstrap's log (closed before its removal: the
+    user data's output goes to the console first), whatever the converge
+    deleted, cloud-init's state, its copy of the user data and its logs (the
+    solo hook truncates the two open logs and runs `cloud-init clean` before
+    the fill), and the ext4 reserve (set to 0 for the fill). Files still
+    held open after deletion would escape it; the scrub refuses if any is
+    left through an open file descriptor (check 10), and `exec` drops bash's
+    hold on its own script. Deleted files held only through a memory mapping
+    are **not** checked — libraries apt replaced during the converge, still
+    mapped by running processes: they hold public package contents.
+  - It does **not** cover:
+    - the slack at the end of a file's last block (a live file's own block,
+      not a free one);
+    - directory entries that still name deleted files, inode tables and
+      other metadata blocks;
+    - the ext4 journal, which may hold recent metadata and, for data written
+      through it, data;
+    - up to `ZERO_FILL_MAX_FREE` (1 MiB) that may stay free after the fill;
+    - the other partitions of the volume, which the snapshot also images:
+      `/boot` (ext4; old kernels and initrds that apt removed) and
+      `/boot/efi` (vfat);
+    - what happens after it: the shared scrub's second `cloud-init clean`
+      (nothing left to delete; it rewrites `/etc/machine-id`), its no-op
+      `fstrim`, and what shutdown and cloud-init's final modules write
+      (written, not freed — for example the instance-id directory below).
+  - The cost, measured by hand on `1d6180e` (a real build instance, not yet
+    a Packer build): the build took about 5.5 minutes, 2.5 of them before
+    the fill — about **3 minutes more**; **taking the snapshot** afterwards
+    took **10–17 minutes instead of under 2**, because the whole disk had
+    been written. A box from that image was healthy, with the fill file gone
+    and 15 of 19 GB free. The snapshot's storage growth (roughly 16 GB more
+    per region for the 20 GB root) is still an estimate.
+- **The build instance's id directory.** `/var/lib/cloud/instances/<id>`
+  (three semaphore files) stays in the image: cloud-init's final modules write
+  it after the scrub returns. It names a terminated instance and nothing
+  else; accepted as a residual.
 - **Packer's temporary key pair.** The template uses `communicator = "none"`,
   so Packer never connects. If the plugin still registers a temporary key
   pair, its public half lands in `authorized_keys` through cloud-init — the
@@ -441,8 +746,8 @@ trailing comment. No input or ref name is interpolated into a `run:` script.
   build instance without an instance profile and register it with SSM. The
   guard refuses to publish while it is set in any region (G2b), and
   `bootstrap-solo` stops the stock SSM agent before anything reaches the
-  network; the scrub removes the agent's registration and refuses an image
-  that still has the snap.
+  network; the scrub removes the agent's registration, refuses an image
+  that still has the snap, and then purges snapd itself.
 - **The workflow's credentials — owner prerequisites.** These live outside
   the repository, and the workflows are only as safe as they are:
   - the publisher role trusts only this repository's `hardened-publish`
@@ -478,8 +783,14 @@ trailing comment. No input or ref name is interpolated into a `run:` script.
 - `test/test-hardened-build.sh` — the driver against shimmed `chef`, `gh`,
   `aws` and `packer`: the account check, the stored-asset comparison, the
   release created when missing, the record, NN across every region, the
-  leftover listing after a failure past `packer build`, and the real solo
-  user data measured against EC2's 16 KB.
+  leftover listing after a failure past `packer build`, the console watcher
+  (a failure marker interrupts Packer and prints the tail, also after a
+  login prompt; no marker, an empty console or a read error changes
+  nothing), Packer's interrupt through a panicwrap-like wrapper on a marker,
+  INT, TERM, and INT then TERM during a slow clean-up, the leftovers
+  script's build-instance and key-pair listing and `--clean-build` (removal
+  before the image listing), the user data's `exec` last line, and the real
+  solo user data measured against EC2's 16 KB.
 - `test/test-hardened-guard.sh` — G1–G4 against a shimmed `aws`, including
   the default-quota fallback, the listed `/aws-reserved/` roles, implicit
   denies passing and allows failing, a "require MFA" deny that must not mask
@@ -488,43 +799,120 @@ trailing comment. No input or ref name is interpolated into a `run:` script.
 - `test/test-hardened-retire.sh` — retention, the safety net, doubts and
   `--disable` against a shimmed `aws` and a fixed clock.
 - The solo section of `test/test-image-scrub.sh` — the solo lists against
-  their fixture, the CINC purge, and the invariants of decision 12 refusing on
-  a fake root.
+  their fixture, the CINC and snapd purges (the device key shredded first),
+  `apt-get clean`, the bootstrap's `apt-get update` before the converge and
+  its banner after an unterminated login prompt, and the invariants of
+  decision 12 refusing on a fake root: the whole-filesystem unit scan (hits
+  in `~/.local/share`, `/etc/xdg`, `/usr/share/systemd/user`, behind a
+  linked directory), an empty dpkg database, a deleted file held open, and
+  every way the zero-fill can fail (each pass, the fsync, the free-space
+  bound, the ext4 reserve). The `dd` shim checks, at the moment the fill
+  begins, that nothing on the removal list is left. Shims stand in for `dd`,
+  `stat -f`, `mountpoint`, `find` and the ext4 sysfs entry.
 - The workflows have no local test, and no automated check validates the
   workflow files today: they were checked by a YAML parse and by reading.
   The first private build is their test.
 
 ## To verify on the first private build
 
-Each item is checked on the restored snapshot of the first `public=false`
-build (or on two instances launched from it) before any public build; a
-finding becomes a scrub or guard change and a new `v` release first.
+Status after the first two runs and one hand-built image (2026-11-20). The
+hand test rendered the same user data (with `apt-get update`), launched it by
+hand in the publisher account, made a private image from the stopped
+instance by hand and inspected a box from it as `ubuntu` and as the admin; it
+proves the converge and the scrub, not what Packer does around them.
 
-- **snapd's device identity.** `/var/lib/snapd/device/private-keys-v1/*` and
-  the serial and session macaroon in `/var/lib/snapd/state.json`; run
-  `snap model --serial` on two instances from the image. If the build's
-  identity is in the snapshot (the same serial on both, or a key on disk),
-  the scrub must remove it before any public build.
-- **Per-user state of the agent CLIs**: `/home/ubuntu/.codex`,
-  `/home/ubuntu/.claude` (any id, session, history or auth file), and
-  `/var/log/audit`.
-- **The saved firewall rules**: the exact `rules.v4` and `rules.v6` lines,
-  against the forms decision 12 checks.
-- **Tags on copied snapshots**: the snapshot of the copy in a region other
-  than the build region carries `IdlefyPublishedImage=true` (the fence and G4
-  depend on it).
+Measured on the hand-built image — clean:
+
+- converge and scrub succeed; the instance powers itself off about 2.5 min
+  after launch;
+- `ubuntu`'s sudo is only `tailscale login` and `idlefy-share *`; IMDS is
+  blocked for `ubuntu` and from a rootless container;
+- `INPUT DROP` on v4 and v6 with only 22 open (plus `lo`, `tailscale0`,
+  ICMPv6, DHCPv6); `rules.v4` and `rules.v6` as decision 12 checks them
+  (uid 0 and Instance Connect's uid allowed to IMDS, then the drop);
+- no CINC, no SSM snap, no user-data or CINC logs, no shell histories, no
+  password hashes; host keys and `machine-id` regenerated at boot;
+  `authorized_keys` holds only the launch key; no `/var/log/audit`;
+- the agent CLI directories (`/home/ubuntu/.codex`, `/home/ubuntu/.claude`)
+  hold no credential; Tailscale holds no node key; rootless Docker works;
+  Claude Code, Codex and Node run; no file outside `/home/ubuntu` is
+  writable by `ubuntu`; `idlefy-share` refuses without a tailnet and
+  validates its argument.
+
+Found and fixed in `v2.2.1`:
+
+- **snapd's device identity** was in the image
+  (`/var/lib/snapd/device/private-keys-v1/<key>`, and `snap model --serial`
+  printed a serial) → the scrub purges snapd (decision 12);
+- 321 MB in `/var/cache/apt` → `apt-get clean`;
+- no apt lists on a stock image, so the converge's first package had no
+  candidate (run 2) → `bootstrap-solo` runs `apt-get update` first;
+- Packer waited 2 h after a failed bootstrap, and a cancel left the build
+  instance and key pair → the console watcher and `--clean-build`.
+
+Harmless, left as is: the scrub scripts stay in `/usr/local/sbin`; the build
+instance's id directory under `/var/lib/cloud/instances` (three semaphore
+files) — cloud-init's final modules write it after the scrub returns, so the
+scrub cannot remove it (Security notes).
+
+Still to verify on the first Packer-built private image, before any public
+build — none of it was exercised by hand:
+
+- **snapd is gone** from the image: no `snapd` package, no
+  `/var/lib/snapd`, no `snap` command, and nothing else the purge removed
+  matters (read the purge's package list on the console);
+- **The zero-fill as changed after the hand test** (`O_DIRECT`, the ext4
+  reserve at 0, the 1 MiB free-space bound, the fsync) passes on a real
+  instance: both passes end on "No space left on device", the free space
+  left is within the bound (note the number), and the reserve is back to
+  its value afterwards; how much the snapshot grows (estimate above,
+  roughly 16 GB per region);
+- **The deleted-but-open check** passes on a real instance: no process
+  holds a deleted file of non-zero size on `/` once the user data's last
+  line has exec'd the scrub and cloud-init's two logs are truncated (a
+  refusal names the file and holder: add the holder to the scrub, never an
+  exception to the check);
+- **CreateImage** under the publisher role, and **CopyImage** to every
+  region under the fence deny;
+- **Tags on the copies and their snapshots**: every copy and its snapshot
+  carries `IdlefyPublishedImage=true` and the rest of the template's
+  `snapshot_tags` — the tag fingerprint the fence and G4 depend on;
 - **The Description on every copy**: the image in every region reads
-  `Idlefy hardened image for AI agents; visibility=private` (the plugin sets
-  it with `ModifyImageAttribute` after the copies, so the publisher role needs
-  that action for a private build too), and a retire dry run plans the
-  region without a doubt.
+  `Idlefy hardened image for AI agents; visibility=private`, set by
+  `ModifyImageAttribute` on the copies (so the publisher role needs that
+  action for a private build too), and a retire dry run plans the region
+  without a doubt;
+- **The console watcher** stays silent through a good build;
 - **The publisher role can make every guard read** (G1–G4): a guard run
-  under the role itself, not the owner's credentials, ends with no "the call
-  failed" line.
+  under the role ends with no "the call failed" line (passed on runs 1 and
+  2).
 
 ## Measured
 
-To be filled in after the first `public=false` build on `v2.2.0`: the
-inspection of its restored snapshot against every line of
-`test/fixtures/image-scrub-paths-solo`, the diff against a stock noble volume,
-and any line added or dropped as a result.
+- EBS root volumes accept no discard: `fstrim: /: the discard operation is
+  not supported` (c7a.xlarge, gp3 root, a real build instance on
+  `f713504`, whose strict trim therefore refused every build; everything
+  before it — the snapd purge and every other check — passed).
+- The zero-fill (hand test of `1d6180e` on a real instance): the build
+  passed in about 5.5 minutes, 2.5 of them before the fill; the snapshot
+  then took 10–17 minutes instead of under 2 (the whole disk was written);
+  a box from the image was healthy, the fill file gone, 15 of 19 GB free.
+  The purge left `/var/cache/apparmor/*/snap-confine*` (now on the list).
+  The whole-filesystem unit scan (`find / -xdev`, the names of check 7)
+  returned nothing on that image, rootless Docker included.
+- The scrub of `a47a083` — the `O_DIRECT` fill with the ext4 reserve at 0,
+  the deleted-but-open check, the whole-filesystem unit scan, the exec'd
+  scrub — passed every check on a real instance on 2026-11-20; it powered
+  off about 5.5 minutes after launch.
+
+- `ec2:Owner` for Canonical's images is the alias `amazon`, not the account
+  id (run 1, a refused RunInstances).
+- A stock noble image has no apt lists (run 2: `apt_package[ripgrep]: No
+  candidate version`, 28 s after launch).
+- An Actions cancel leaves Packer's build instance running and its key pair
+  in place (run 2).
+- A stopped instance's console output reads empty; only a running instance's
+  is readable (hand test).
+- The hand-built image: see the list above. The inspection of the first
+  Packer-built image's restored snapshot against every line of
+  `test/fixtures/image-scrub-paths-solo` is still to be added here.

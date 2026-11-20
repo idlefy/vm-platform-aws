@@ -632,6 +632,52 @@ a tenant image and nothing here builds it from a
 tenant. How it is built, published and retired is in
 [Hardened image for AI agents](design/hardened-image.md).
 
+#### A hardened build whose bootstrap or scrub failed
+
+The build log says "the bootstrap failed on the build instance" (or "the
+image scrub refused the image …") and shows the end of the instance's serial
+console above it. The build ends by itself about a minute after the failure (the console tail
+in the log is the instance's own output — the build prints no secret, and must
+not):
+the driver reads the console while Packer runs, interrupts Packer, and Packer
+terminates the instance and deletes its key pair. No image is taken and
+nothing needs cleaning. Fix the cause the console names (it is the converge
+or the scrub, on the instance), cut a new `v` release and publish again.
+A refusal that names "files deleted but still open" lists each file, its
+size and the process holding it: make that process close or truncate the
+file before the scrub (in the scrub or the cookbook), never add an
+exception to the check.
+
+If the run was **cancelled or timed out** instead (the `build` step stops
+at 180 minutes, the job at 240), Packer was interrupted but usually killed
+before it cleaned up.
+The workflow's `leftovers` step then terminates every instance tagged
+`Name=idlefy-hardened-image-build` that is still alive in the build region
+and deletes every `packer_*` key pair with that tag — first, before it lists
+images across the regions — and lists both in the job summary. Nothing else is removed — never an image. It first checks the
+credentials are the publisher account's and stops, removing nothing, if not.
+If the run never got AWS credentials, the step says "No AWS credentials were
+configured: nothing could have been launched." — nothing to clean. If that
+step could not run or reports "could not terminate" / "could not delete",
+run `scripts/hardened-image-leftovers.sh --clean-build` with the publisher
+account's credentials (the publisher role may do exactly this), or remove
+them in the console.
+
+"instances: could not list" or "packer_* key pairs: could not list" is
+different: the listing itself failed, so **nothing of that kind was
+removed** — not even what may be there. Run
+`scripts/hardened-image-leftovers.sh --clean-build` again with working
+publisher credentials, or look in the build region (the first line of
+`image/hardened/regions`) by hand for instances tagged
+`Name=idlefy-hardened-image-build` and `packer_*` key pairs. "could not
+terminate" / "could not delete" means the resource was found and its
+removal failed.
+
+A local run whose Packer stalls in its clean-up stops waiting after 15
+minutes (`HARDENED_PACKER_GRACE`) and says "Packer's clean-up was NOT
+confirmed": Packer may still be running in its own session, and the
+instance and key pair may still exist — run `--clean-build` as above.
+
 #### A hardened build that failed after its images
 
 When `publish-hardened-image` fails after `packer build` started and before
@@ -641,7 +687,8 @@ one line per region with the image id, its state, `public=` and whether
 `IdlefyPublishedImage=true` is set, or "could not list" for a region to check
 by hand. After a cancelled or timed-out run the same list is in the job
 summary, written by the `leftovers` step (or, by hand,
-`scripts/hardened-image-leftovers.sh <name>`). No consumer pins these
+`scripts/hardened-image-leftovers.sh <name>`, which only lists). That step
+also removes a left build instance and key pair (see above), never an image. No consumer pins these
 images, but a public one is launchable by
 anyone until it is removed, and retention would count it as a real build. So
 clean up **before any retention run or new build**:

@@ -9,7 +9,12 @@
 #
 # Optional: HARDENED_PUBLIC (true|false, default true), HARDENED_ATTACHED_ORG_ID
 # (a UUID), HARDENED_INSTANCE_TYPE (default c7a.xlarge), HARDENED_SUBNET_ID,
-# HARDENED_OUT (default dist), GH_REPO (default idlefy/vm-platform-aws).
+# HARDENED_OUT (default dist), GH_REPO (default idlefy/vm-platform-aws),
+# HARDENED_CONSOLE_POLL (seconds between reads of the build instance's
+# console, default 30), HARDENED_PACKER_GRACE (seconds an interrupted Packer
+# is given to clean up before this script stops waiting, default 900). Both
+# take a positive number, fractions allowed (the tests use them); zero in
+# any form is refused.
 # Test hooks, never set in a real build: HARDENED_SKIP_TAG_CHECK=1 (exactly 1)
 # skips the tag check and the clean-tree check with it; HARDENED_TODAY=YYYYMMDD replaces today's UTC date, and
 # is refused unless HARDENED_SKIP_TAG_CHECK=1 is set too — a forward-dated
@@ -26,14 +31,17 @@
 #      tag's release — a stored asset whose contents differ is never used;
 #   6. the user data pins that asset's sha256 (law A1: the build instance has no
 #      instance profile and fetches nothing else of Idlefy's);
-#   7. Packer builds and copies the AMI to every region;
+#   7. Packer builds and copies the AMI to every region; meanwhile the build
+#      instance's console is read, and a failed bootstrap or scrub
+#      interrupts Packer at once instead of its 2 h wait for a stop;
 #   8. the release record hardened-ami-YYYYMMDD-NN.json, naming every region,
 #      is uploaded to the release and its table appended to the release notes.
 # Before step 7 the chosen name is written to $HARDENED_OUT/hardened-ami-name;
 # a failure, INT or TERM from step 7 until the record is uploaded lists the
 # images of that name in every region (scripts/hardened-image-leftovers.sh).
 #
-# Talks to GitHub (gh) and AWS (EC2 through Packer, plus one DescribeImages).
+# Talks to GitHub (gh) and AWS (EC2 through Packer, DescribeImages, and
+# GetConsoleOutput on the build instance).
 # Credentials come from the environment; nothing here prints one.
 
 set -euo pipefail
@@ -71,7 +79,22 @@ GH_REPO="${GH_REPO:-idlefy/vm-platform-aws}"
 [ -z "$HARDENED_ATTACHED_ORG_ID" ] \
   || [[ $HARDENED_ATTACHED_ORG_ID =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
   || die "HARDENED_ATTACHED_ORG_ID='$HARDENED_ATTACHED_ORG_ID' is not a lowercase UUID"
+# The console watcher reads `get-console-output --latest`, which only Nitro
+# instance types serve: a non-Nitro type loses the fast failure path (Packer's
+# own 2 h stop timeout remains). The publisher role allows exactly c7a.xlarge,
+# so only a hand run with other credentials could choose another type.
 [[ $HARDENED_INSTANCE_TYPE =~ ^[a-z0-9-]+\.[a-z0-9]+$ ]] || die "HARDENED_INSTANCE_TYPE='$HARDENED_INSTANCE_TYPE' is not an instance type"
+# positive_seconds VALUE: a decimal number of seconds above zero.
+positive_seconds() { [[ $1 =~ ^[0-9]+(\.[0-9]+)?$ ]] && [[ $1 =~ [1-9] ]]; }
+CONSOLE_POLL="${HARDENED_CONSOLE_POLL:-30}"
+positive_seconds "$CONSOLE_POLL" || die "HARDENED_CONSOLE_POLL='$CONSOLE_POLL' is not a positive number of seconds"
+# How long an interrupted Packer gets to clean up (terminate the instance,
+# delete the key pair) before this script stops waiting for it: 15 minutes.
+PACKER_GRACE_DEFAULT=900
+PACKER_GRACE="${HARDENED_PACKER_GRACE:-$PACKER_GRACE_DEFAULT}"
+positive_seconds "$PACKER_GRACE" || die "HARDENED_PACKER_GRACE='$PACKER_GRACE' is not a positive number of seconds"
+# In tenths of a second, the unit stop_packer polls in; at least one.
+PACKER_GRACE_TICKS=$(awk -v g="$PACKER_GRACE" 'BEGIN { t = int(g * 10); print (t < 1 ? 1 : t) }')
 [ -z "$HARDENED_SUBNET_ID" ] || [[ $HARDENED_SUBNET_ID =~ ^subnet-[0-9a-f]+$ ]] \
   || die "HARDENED_SUBNET_ID='$HARDENED_SUBNET_ID' is not a subnet id"
 [[ $GH_REPO =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "GH_REPO='$GH_REPO' is not owner/name"
@@ -288,9 +311,14 @@ PY
     printf 'DEV_VM_IMAGE_SCRUB\n'
   done
   # The scrub deletes /var/log/user-data.log while this shell holds it open;
-  # its blocks would be freed untrimmed into the public snapshot.
+  # its blocks would be freed only at power-off, after the zero-fill.
   printf 'exec >/dev/console 2>&1\n'
-  printf '/usr/local/sbin/dev-vm-image-scrub --profile solo %s\n' "$ARCHIVE_SHA256"
+  # exec: bash holds this script (cloud-init's part-001) open close-on-exec,
+  # and cloud-init clean deletes it; exec drops that hold, so its blocks are
+  # freed before the fill. The bootstrap's ERR trap is already cleared, so
+  # nothing changes on failure: the scrub's exit status is the script's, and
+  # a refusal leaves the instance running as before.
+  printf 'exec /usr/local/sbin/dev-vm-image-scrub --profile solo %s\n' "$ARCHIVE_SHA256"
 } >> "$UD_PLAIN"
 left="$(grep -oE '__[A-Z0-9_]+__' "$UD_PLAIN" | sort -u | tr '\n' ' ')" || true
 [ -z "$left" ] || die "the user data still holds placeholders: $left— render them in this script"
@@ -312,9 +340,82 @@ tmp PKLOG
 # to $HARDENED_OUT/hardened-ami-name first: a runner that kills this script
 # outright (an Actions cancel or timeout) leaves the listing to the workflow.
 IMAGES_MAY_EXIST=1
+# The console watcher's pid, and the background pipeline Packer runs in, once
+# started (below). Every way out of this script — a normal end, a failure,
+# INT, TERM — passes through on_exit, which stops and reaps the watcher, then
+# interrupts Packer and waits for it.
+WATCH_PID="" PIPE_PID="" PK_STATE=""
+# shellcheck disable=SC2317  # reached through on_exit and after packer build
+stop_watch() {
+  [ -n "$WATCH_PID" ] || return 0
+  kill "$WATCH_PID" 2>/dev/null || true
+  wait "$WATCH_PID" 2>/dev/null || true
+  WATCH_PID=""
+}
+# stop_packer — Packer runs in its own session (see below), so a Ctrl-C or a
+# runner's INT/TERM to this script's group no longer reaches it by itself:
+# forward SIGINT to Packer's whole group (its panicwrap wrapper ignores
+# SIGINT, its worker cancels the build on it and cleans up: terminates the
+# instance, deletes the key pair) and wait for the pipeline to end.
+#   - PK_STATE is "run" from just before the pipeline is started until its
+#     wait returns. Interrupted between the start and the assignment of
+#     PIPE_PID, the pipeline is the one job left once the watcher is reaped.
+#   - It waits until the launcher has recorded Packer's group or the
+#     pipeline has ended (it can only end by Packer exiting), then for
+#     Packer's group to end — both within one grace period, PACKER_GRACE
+#     (15 minutes). When that runs out — Packer or a plugin stalled in its
+#     clean-up — it stops waiting (no KILL), says the clean-up was not
+#     confirmed and points at `hardened-image-leftovers.sh --clean-build`;
+#     on_exit keeps the first exit status and still lists leftovers and
+#     cleans up. Under Actions the runner's own kill comes much sooner.
+#   - The SIGINT is repeated every 10 s while the group lives: Packer's worker
+#     takes the first and drops the rest (its handler reads one signal; the
+#     plugins discard every interrupt), and a repeat covers the instant after
+#     start-up when only the wrapper exists, which drops SIGINT.
+#   - No escalation to KILL: Packer's clean-up is what removes the instance; a
+#     runner that will not wait kills the job itself, and the workflow's
+#     leftovers step then removes what is left.
+# shellcheck disable=SC2317  # reached through on_exit
+stop_packer() {
+  local pg="" n=0
+  [ "$PK_STATE" = run ] || return 0
+  [ -n "$PIPE_PID" ] || PIPE_PID="$(jobs -p | tail -n 1)"
+  while [ "$n" -lt "$PACKER_GRACE_TICKS" ]; do
+    pg="$(cat "$W/packer.pid" 2>/dev/null)" || pg=""
+    [[ ! $pg =~ ^[0-9]+$ ]] || break
+    [ -n "$PIPE_PID" ] && kill -0 "$PIPE_PID" 2>/dev/null || break
+    n=$((n + 1)); sleep 0.1
+  done
+  if [[ $pg =~ ^[0-9]+$ ]] && kill -0 -- "-$pg" 2>/dev/null; then
+    echo "Interrupting Packer; waiting up to $PACKER_GRACE s for it to terminate the build instance and delete its key pair…" >&2
+    while kill -0 -- "-$pg" 2>/dev/null && [ "$n" -lt "$PACKER_GRACE_TICKS" ]; do
+      [ $((n % 100)) -ne 0 ] || kill -INT -- "-$pg" 2>/dev/null || true
+      n=$((n + 1)); sleep 0.1
+    done
+  fi
+  if [ "$n" -ge "$PACKER_GRACE_TICKS" ]; then
+    # Stop waiting; never KILL. Packer keeps running in its own session.
+    {
+      echo
+      echo "!! Packer's clean-up was NOT confirmed within $PACKER_GRACE s: the build instance"
+      echo "!! (Name=idlefy-hardened-image-build) and its packer_* key pair may still exist."
+      echo "!! Remove them: scripts/hardened-image-leftovers.sh --clean-build (publisher credentials)."
+    } >&2
+  else
+    [ -z "$PIPE_PID" ] || wait "$PIPE_PID" 2>/dev/null || true
+  fi
+  PIPE_PID="" PK_STATE=done
+}
+# on_exit — first, INT and TERM are ignored from here on and the first exit
+# status kept: a runner's cancel sends INT, then TERM 7.5 s later, and the
+# second must not cut short the wait for Packer, the leftovers listing and
+# the clean-up. What it starts (the leftovers listing) inherits the ignore.
 # shellcheck disable=SC2317  # reached only through the trap
 on_exit() {
   local rc=$?
+  trap '' INT TERM
+  stop_watch
+  stop_packer
   if [ "$rc" -ne 0 ] && [ "$IMAGES_MAY_EXIST" = 1 ]; then
     echo >&2
     "$ROOT/scripts/hardened-image-leftovers.sh" "$AMI_NAME" >&2 || true
@@ -326,9 +427,102 @@ trap on_exit EXIT
 mkdir -p "$HARDENED_OUT"
 printf '%s\n' "$AMI_NAME" > "$HARDENED_OUT/hardened-ami-name"
 
+# watch_console PIDFILE — while Packer runs, read the build instance's serial
+# console every $CONSOLE_POLL seconds. A failed bootstrap leaves the instance
+# running (its console is the only record of why), so Packer would wait its
+# whole stop budget (2 h) for nothing. When the console holds, as a whole
+# line, the bootstrap's banner ("BOOTSTRAP FAILED: no image will be taken.
+# Log follows.") or a refusal of the scrub, which also leaves the instance
+# running ("dev-vm-image-scrub: internal error…" / "…: refusing…" — every
+# exit-70 message the scrub logs; its "note:" lines are not refusals) — print
+# its tail and interrupt Packer with SIGINT: Packer then terminates the
+# instance and deletes its temporary key pair. Whole lines only, with a
+# trailing carriage return allowed, or after an unterminated getty prompt
+# (GETTY, below): a console that merely quotes the banner inside another line
+# is not a failure.
+# The instance is the one Packer itself names ("Instance ID: i-…" in its log),
+# never another run's. A console that cannot be read is noted once and is not
+# a failure of the build. A stopped instance's console reads empty (measured),
+# so a good build shows nothing here and the watcher just ends with Packer.
+# Its lifetime: stop_watch (after packer build, and in on_exit on any way
+# out) sends it TERM; its trap kills every job it has running — the pending
+# sleep or console read, found by `jobs -p` rather than a recorded pid, so a
+# TERM between starting one and recording it leaves nothing — and reaps them,
+# so no orphan holds the job's output open. As a backstop it returns on its
+# own once $W is gone (cleanup ran) or this script's process is.
+# The interrupt goes to Packer's whole process group: Packer 1.11 runs as a
+# panicwrap wrapper and a worker, and the wrapper swallows SIGINT (it forwards
+# only SIGTERM), so a SIGINT to the wrapper's pid alone never reaches the
+# worker that holds the build.
+# A marker may also follow a getty prompt left unterminated on the console
+# ("ip-10-0-1-5 login: "): bootstrap-solo and the solo scrub print a newline
+# before theirs, but the shared scrub's own refusals (unchangeable: it rides
+# in every fleet VM) do not.
+GETTY='[A-Za-z0-9][A-Za-z0-9.-]* login: '
+# shellcheck disable=SC2317  # runs in the background
+watch_console() {
+  local pidfile=$1 driver=$$ pid="" iid="" noted=0 sp="" cp=""
+  # shellcheck disable=SC2046  # one pid per word
+  trap 'kill $(jobs -p) 2>/dev/null; wait 2>/dev/null; exit 0' TERM
+  while :; do
+    sleep "$CONSOLE_POLL" & sp=$!
+    wait "$sp" || true
+    sp=""
+    [ -d "$W" ] || return 0
+    kill -0 "$driver" 2>/dev/null || return 0
+    [ -n "$pid" ] || pid="$(cat "$pidfile" 2>/dev/null)" || pid=""
+    [ -n "$pid" ] || continue
+    kill -0 -- "-$pid" 2>/dev/null || return 0
+    [ -n "$iid" ] || iid="$(grep -oE 'Instance ID: i-[0-9a-f]+' "$PKLOG" 2>/dev/null | head -n 1 | cut -d' ' -f3)" || iid=""
+    [ -n "$iid" ] || continue
+    aws ec2 get-console-output --region "$BUILD_REGION" --instance-id "$iid" --latest \
+      --query Output --output text > "$W/console" 2> "$W/console.err" < /dev/null & cp=$!
+    if ! wait "$cp"; then
+      cp=""
+      [ -d "$W" ] || return 0
+      [ "$noted" = 1 ] || echo "note: cannot read the console of $iid yet ($(head -n 1 "$W/console.err")); Packer keeps waiting" >&2
+      noted=1; continue
+    fi
+    cp=""
+    # Whole lines; a serial console may end them with CR LF.
+    tr -d '\r' < "$W/console" > "$W/console.lf" || continue
+    if grep -qE "^($GETTY)?BOOTSTRAP FAILED: no image will be taken\\. Log follows\\.\$" "$W/console.lf"; then
+      echo "the bootstrap failed on the build instance" > "$W/build-failed"
+    elif grep -qE "^($GETTY)?dev-vm-image-scrub: (internal error|refusing)[ :]" "$W/console.lf"; then
+      echo "the image scrub refused the image on the build instance" > "$W/build-failed"
+    fi
+    if [ -e "$W/build-failed" ]; then
+      { echo; echo "!! $iid: $(cat "$W/build-failed"). The end of its console:"; tail -n 80 "$W/console.lf"; } >&2
+      kill -INT -- "-$pid" 2>/dev/null || true
+      return 0
+    fi
+  done
+}
+
 # -machine-readable: the artifact line is the only reliable source of the AMI
 # ids. The ui lines are echoed as they come, so the operator sees progress.
-packer build -machine-readable \
+# Packer starts in a session of its own (setsid, through a small launcher that
+# also resets SIGINT and SIGTERM to their defaults), and records its pid,
+# which is also its process group, for the watcher and for stop_packer.
+# The pipeline runs in the background and this script waits for it: a trapped
+# INT or TERM interrupts `wait` at once, where a foreground pipeline would
+# hold the trap until Packer ended by itself. The rest of the pipeline (its
+# subshell, tee, awk) stays in this script's group but ignores INT and TERM
+# and ends when Packer closes its output: a cancel that signals this group
+# must neither end the `wait` on Packer early nor break the pipe Packer writes
+# its clean-up to (a write to a broken stdout kills it with SIGPIPE).
+watch_console "$W/packer.pid" &
+WATCH_PID=$!
+PK_RC=0
+PK_STATE=run
+{ trap '' INT TERM; python3 -I -c 'import os, signal, sys
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+signal.signal(signal.SIGTERM, signal.SIG_DFL)
+os.setsid()
+with open(sys.argv[1] + ".tmp", "w") as f:
+    f.write("%d\n" % os.getpid())
+os.rename(sys.argv[1] + ".tmp", sys.argv[1])
+os.execvp(sys.argv[2], sys.argv[2:])' "$W/packer.pid" packer build -machine-readable \
   -var "ami_name=$AMI_NAME" \
   -var "build_region=$BUILD_REGION" \
   -var "ami_regions=$AMI_REGIONS" \
@@ -345,7 +539,14 @@ packer build -machine-readable \
   -var "attached_org_id=$HARDENED_ATTACHED_ORG_ID" \
   "$IMG" \
   | tee "$PKLOG" \
-  | awk -F, '$3 == "ui" { m = $5; for (i = 6; i <= NF; i++) m = m "," $i; gsub(/%!\(PACKER_COMMA\)/, ",", m); gsub(/\\n/, "\n", m); print m; fflush() }' \
+  | awk -F, '$3 == "ui" { m = $5; for (i = 6; i <= NF; i++) m = m "," $i; gsub(/%!\(PACKER_COMMA\)/, ",", m); gsub(/\\n/, "\n", m); print m; fflush() }'; } &
+PIPE_PID=$!
+wait "$PIPE_PID" || PK_RC=$?
+PIPE_PID="" PK_STATE=done
+stop_watch
+[ ! -e "$W/build-failed" ] \
+  || die "$(cat "$W/build-failed") (its console is above); Packer was interrupted, so it terminates the instance and deletes its key pair — no image, no record"
+[ "$PK_RC" = 0 ] \
   || die "packer build failed — no record is written. A failure before the image was taken left its reason on the build instance's serial console; one during the copies may have left images (listed below)"
 
 # ---- 9. the record ---------------------------------------------------------------

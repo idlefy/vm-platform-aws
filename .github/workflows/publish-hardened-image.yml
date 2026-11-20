@@ -115,10 +115,13 @@ jobs:
             | sudo bash -s -- -P cinc-workstation -v 26
           chef --version
 
-      - uses: aws-actions/configure-aws-credentials@00943011d9042930efac3dcd3a170e4273319bc8 # v5.1.0
+      - id: aws-creds
+        uses: aws-actions/configure-aws-credentials@00943011d9042930efac3dcd3a170e4273319bc8 # v5.1.0
         with:
           role-to-assume: ${{ vars.HARDENED_PUBLISH_ROLE_ARN }}
           aws-region: us-east-1
+          # 4 h, the job's timeout-minutes: credentials taken here outlive
+          # every later step, the leftovers step after a build timeout too.
           role-duration-seconds: 14400
 
       - name: guard
@@ -126,7 +129,17 @@ jobs:
           HARDENED_CI_ROLE_ARN: ${{ vars.HARDENED_PUBLISH_ROLE_ARN }}
         run: scripts/hardened-guard-check.sh
 
+      # 180 minutes, under the job's 240: Packer may wait 2 h for the instance
+      # to stop, then copies to every region. The step's clock starts only
+      # after the steps above, so the job's last 60 minutes are split: up to
+      # 45 for checkout, Packer and Cinc setup, credentials and the guard
+      # (a few minutes in practice), and at least 15 left for the leftovers
+      # step (it terminates the instance and deletes the key pair Packer may
+      # not have had time to remove) and the record. The role session
+      # (14400 s, above) covers the whole job, so those steps still hold
+      # valid credentials.
       - name: build
+        timeout-minutes: 180
         env:
           PLATFORM_TAG: ${{ needs.resolve.outputs.tag }}
           PLATFORM_SHA: ${{ needs.resolve.outputs.sha }}
@@ -136,23 +149,42 @@ jobs:
         run: scripts/hardened-image-build.sh
 
       # A failed build lists its leftovers itself, but a cancel or a timeout
-      # can kill the driver before it does. The driver writes the name it chose
-      # to dist/hardened-ami-name before `packer build`; this step lists every
-      # image of that name, read-only, into the job summary.
+      # can kill the driver before it does, and before Packer cleans up. The
+      # driver writes the name it chose to dist/hardened-ami-name before
+      # `packer build`; this step lists every image of that name, read-only,
+      # into the job summary. It also terminates the build instance and
+      # deletes Packer's packer_* key pair (both tagged
+      # Name=idlefy-hardened-image-build, in the build region) — whether or
+      # not a name was chosen: only build resources carry that tag, and the
+      # concurrency group lets no other publish run be live. --clean-build
+      # first checks the credentials are the publisher account's. Images are
+      # never removed here; that is the owner's call (docs/runbook.md).
       - name: leftovers
         if: failure() || cancelled()
+        env:
+          # Without credentials nothing was launched, and every read would
+          # only report "could not list".
+          AWS_CREDS: ${{ steps.aws-creds.outcome }}
         run: |
           set +e -uo pipefail
-          if [ ! -s dist/hardened-ami-name ]; then
-            echo "The build chose no image name, or its record was uploaded: nothing to list." >> "$GITHUB_STEP_SUMMARY"
+          if [ "$AWS_CREDS" != success ]; then
+            msg="No AWS credentials were configured: nothing could have been launched."
+            echo "$msg"; echo "$msg" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          name=$(head -n 1 dist/hardened-ami-name)
-          scripts/hardened-image-leftovers.sh "$name" > leftovers.txt 2>&1
+          args=(--clean-build)
+          if [ -s dist/hardened-ami-name ]; then
+            args+=("$(head -n 1 dist/hardened-ami-name)")
+          fi
+          scripts/hardened-image-leftovers.sh "${args[@]}" > leftovers.txt 2>&1
           rc=$?
           {
-            echo "### Images this run may have left behind"
+            echo "### What this run may have left behind"
             echo
+            if [ ${#args[@]} -eq 1 ]; then
+              echo "The build chose no image name, or its record was uploaded: no images to list."
+              echo
+            fi
             echo '```text'
             cat leftovers.txt
             echo '```'

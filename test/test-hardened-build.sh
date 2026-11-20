@@ -21,8 +21,19 @@
 #           fails in ${LEFTOVER_FAIL}.
 #   gh      also: the record upload fails when ${GH_RECORD_UPLOAD_FAIL}, the
 #           notes edit when ${GH_NOTES_FAIL}.
+#   aws     ec2 get-console-output prints ${CONSOLE_OUTPUT} (printf %b), or
+#           fails when ${CONSOLE_FAIL}, hangs when ${CONSOLE_HANG}; describe-instances answers
+#           ${BUILD_INSTANCES} ("i-…:state …"), describe-key-pairs ${BUILD_KEYS}
+#           (names); terminate-instances and delete-key-pair succeed unless
+#           ${TERMINATE_FAIL} / ${DELETEKEY_FAIL}; ${INSTANCES_FAIL} and
+#           ${KEYS_FAIL} fail the two reads.
 #   packer  build copies the user data and reports an AMI for each region in
 #           ${ARTIFACT_REGIONS:-every region of ami_regions}; exits ${PACKER_RC:-0}.
+#           With ${PACKER_HOLD} it names its instance, then runs that many
+#           seconds unless SIGINT ends it ("interrupted" in its log).
+#           `packer build` runs as Packer 1.11 does under panicwrap: a wrapper
+#           that catches and swallows SIGINT and forwards only SIGTERM, and a
+#           child that does the work; both pids go to ${PACKER_PIDS}.
 # The last section measures the real solo user data against EC2's 16 KB.
 
 # The checks read `[ … ]; echo $?` and `run_build; check … "$?"` on purpose: the
@@ -39,7 +50,7 @@ check() { if [ "$2" = "0" ]; then PASS=$((PASS+1)); echo "  ok   $1"; else FAIL=
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 R="$T/r"
 mkdir -p "$T/bin" "$T/state" "$R/scripts" "$R/image" "$R/cinc/policyfiles" "$R/cinc/cookbooks/base"
-cp "$ROOT/scripts/hardened-image-build.sh" "$ROOT/scripts/hardened-image-leftovers.sh" "$R/scripts/" 2>/dev/null
+cp "$ROOT/scripts/hardened-image-build.sh" "$ROOT/scripts/hardened-image-leftovers.sh" "$ROOT/scripts/hardened-guard-check.sh" "$R/scripts/"
 cp -R "$ROOT/image/hardened" "$ROOT/image/files" "$R/image/"
 cp "$ROOT/cinc/policyfiles/solo.rb" "$R/cinc/policyfiles/solo.rb"
 printf "name 'base'\nversion '2.1.0'\n" > "$R/cinc/cookbooks/base/metadata.rb"
@@ -132,16 +143,78 @@ case "$1 $2" in
         [ -n "$v" ] || v='{"Images": []}'
         printf '%s\n' "$v" ;;
     esac ;;
+  "ec2 describe-instances")
+    [ -z "${INSTANCES_FAIL:-}" ] || { echo "An error occurred (UnauthorizedOperation) when calling the DescribeInstances operation" >&2; exit 254; }
+    # INSTANCES_LATE=N: the first N listings come back empty (an instance
+    # just launched, not listable yet); counted in $AWS_LOG.n.
+    if [ -n "${INSTANCES_LATE:-}" ]; then
+      c=$(( $(cat "$AWS_LOG.n" 2>/dev/null || echo 0) + 1 )); echo "$c" > "$AWS_LOG.n"
+      [ "$c" -gt "$INSTANCES_LATE" ] || { echo '{"Reservations": []}'; exit 0; }
+    fi
+    python3 -I -c 'import json, sys
+print(json.dumps({"Reservations": [{"Instances": [{"InstanceId": x.split(":")[0], "State": {"Name": x.split(":")[1]}}
+                                                  for x in sys.argv[1].split()]}]}))' "${BUILD_INSTANCES:-}" ;;
+  "ec2 describe-key-pairs")
+    [ -z "${KEYS_FAIL:-}" ] || { echo "An error occurred (UnauthorizedOperation) when calling the DescribeKeyPairs operation" >&2; exit 254; }
+    python3 -I -c 'import json, sys
+print(json.dumps({"KeyPairs": [{"KeyName": k, "KeyPairId": "key-0%d" % n} for n, k in enumerate(sys.argv[1].split())]}))' "${BUILD_KEYS:-}" ;;
+  "ec2 terminate-instances")
+    [ -z "${TERMINATE_FAIL:-}" ] || { echo "An error occurred (UnauthorizedOperation) when calling the TerminateInstances operation" >&2; exit 254; }
+    echo '{}' ;;
+  "ec2 delete-key-pair")
+    [ -z "${DELETEKEY_FAIL:-}" ] || { echo "An error occurred (UnauthorizedOperation) when calling the DeleteKeyPair operation" >&2; exit 254; }
+    echo '{}' ;;
+  "ec2 get-console-output")
+    if [ -n "${CONSOLE_FAIL:-}" ]; then echo "An error occurred (UnauthorizedOperation) when calling the GetConsoleOutput operation" >&2; exit 254; fi
+    # A read that hangs, as a stalled API call does.
+    [ -z "${CONSOLE_HANG:-}" ] || exec sleep 600
+    printf '%b\n' "${CONSOLE_OUTPUT:-}" ;;
   *) exit 9 ;;
 esac
 SH
+# The panicwrap stand-in (panicwrap v1.0.0 Wrap with Packer's config: SIGINT
+# is caught and dropped in the wrapper, SIGTERM is forwarded to the child).
+cat > "$T/packer-wrap.py" <<'PY'
+import os, signal, subprocess, sys
+signal.signal(signal.SIGINT, lambda *_: None)
+child = subprocess.Popen(sys.argv[1:], env=dict(os.environ, PACKER_CHILD="1"))
+signal.signal(signal.SIGTERM, lambda *_: child.send_signal(signal.SIGTERM))
+with open(os.environ["PACKER_PIDS"], "a") as f:
+    f.write("%d\n%d\n" % (os.getpid(), child.pid))
+rc = child.wait()
+sys.exit(rc if rc >= 0 else 128 - rc)
+PY
 cat > "$T/bin/packer" <<'SH'
 #!/usr/bin/env bash
+if [ "$1" = build ] && [ -z "${PACKER_CHILD:-}" ]; then exec python3 -I "$PACKER_WRAP" "$0" "$@"; fi
 echo "packer $1" >> "$ORDER_LOG"
 if [ "$1" = init ]; then echo "init $2" >> "$PACKER_LOG"; exit 0; fi
 printf '%s\n' "$@" >> "$PACKER_LOG"
 # A long build, to be signalled: says it started, then sleeps.
 if [ -n "${PACKER_SLEEP:-}" ]; then : > "$PACKER_STARTED"; sleep "$PACKER_SLEEP"; fi
+# PACKER_HOLD=N: installs its interrupt handler, writes "packer ready" to
+# its log, names its instance as Packer does, then runs N seconds; an
+# interrupt (SIGINT, as the console watcher sends) ends it as Packer's does.
+# The readiness line comes after the handler, so a test that signals on it
+# never hits the instant before the handler exists.
+if [ -n "${PACKER_HOLD:-}" ]; then
+  # PACKER_INT_OK: a Packer that takes the interrupt, yet reports a complete
+  # artifact and exits 0 — the driver must still fail on what it saw.
+  if [ -n "${PACKER_INT_OK:-}" ]; then
+    trap 'echo interrupted >> "$PACKER_LOG"; end=0' INT
+  else
+    # Its clean-up (terminating the instance) takes a while; the driver must
+    # wait for it before it lists leftovers.
+    trap 'echo interrupted >> "$PACKER_LOG"; echo "1697000002,,ui,error,Build was cancelled."; sleep "${PACKER_CLEANUP:-1}"; echo "packer cleaned-up" >> "$ORDER_LOG"; exit 1' INT
+  fi
+  # PACKER_STUCK: a clean-up that never ends (a stalled plugin): the interrupt
+  # is noted and the worker runs on.
+  [ -z "${PACKER_STUCK:-}" ] || trap 'echo interrupted >> "$PACKER_LOG"' INT
+  echo "packer ready" >> "$PACKER_LOG"
+  echo '1697000000,,ui,message,    amazon-ebs.hardened: Instance ID: i-0123456789abcdef0'
+  end=$((SECONDS + PACKER_HOLD))
+  while [ "$SECONDS" -lt "$end" ]; do sleep 0.1; done
+fi
 regions=""
 for a in "$@"; do
   case "$a" in
@@ -173,10 +246,10 @@ set +e
 # run_build — runs the driver with the shims; returns its status.
 run_build() {
   shimmed "$T/bin" aws gh packer chef
-  rm -rf "$T/state" "$T/out" "$T/ud.gz"; mkdir -p "$T/state"
+  rm -rf "$T/state" "$T/out" "$T/ud.gz" "$T/packer.pids"; mkdir -p "$T/state"
   : > "$T/chef.log"; : > "$T/gh.log"; : > "$T/gh.log.repo"; : > "$T/aws.log"; : > "$T/packer.log"; : > "$T/order.log"
   local e=(PATH="$T/bin:$PATH" CHEF_LOG="$T/chef.log" GH_LOG="$T/gh.log" AWS_LOG="$T/aws.log"
-           PACKER_LOG="$T/packer.log" ORDER_LOG="$T/order.log" UD_COPY="$T/ud.gz" GH_STATE="$T/state"
+           PACKER_LOG="$T/packer.log" ORDER_LOG="$T/order.log" PACKER_WRAP="$T/packer-wrap.py" PACKER_PIDS="$T/packer.pids" UD_COPY="$T/ud.gz" GH_STATE="$T/state"
            EXPORT_TREE="${EXPORT_TREE:-$T/tree-a}" REV="$REV"
            PLATFORM_TAG="${PLATFORM_TAG-v2.2.0}" PLATFORM_SHA="${PLATFORM_SHA-$SHA}"
            HARDENED_SKIP_TAG_CHECK="${SKIP_TAG-1}" HARDENED_OUT="$T/out" OTHER_TGZ="$T/other.tgz")
@@ -185,7 +258,25 @@ run_build() {
   [ -z "${PUBLIC:-}" ] || e+=(HARDENED_PUBLIC="$PUBLIC")
   [ -z "${ORG:-}" ] || e+=(HARDENED_ATTACHED_ORG_ID="$ORG")
   local rc
-  if [ -z "${TERM_MID_PACKER:-}" ]; then
+  if [ -n "${SIG_EARLY:-}" ]; then
+    # SIGINT (a Ctrl-C) or SIGTERM (a runner's cancel) to the driver's whole
+    # session once ${SIG_WHEN:-^packer ready$} shows in ${SIG_LOG:-packer.log} —
+    # by default once Packer's interrupt handler is installed. Packer runs in a session of its
+    # own, so only the driver can pass it on. The wrapper resets SIGINT to its
+    # default: a backgrounded bash would hand the driver an ignored SIGINT.
+    ( cd "$T" && exec python3 -I -c 'import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+        env -u HARDENED_SECURITY_GROUP_ID -u HARDENED_PUBLIC -u HARDENED_ATTACHED_ORG_ID \
+        -u HARDENED_SUBNET_ID -u HARDENED_INSTANCE_TYPE -u GH_REPO "${e[@]}" \
+        "$R/scripts/hardened-image-build.sh" > "$T/stdout" 2> "$T/stderr" ) &
+    local pid=$! n=0
+    while ! grep -q "${SIG_WHEN:-^packer ready\$}" "$T/${SIG_LOG:-packer.log}" && [ $n -lt 600 ]; do sleep 0.05; n=$((n+1)); done
+    kill -"$SIG_EARLY" -- "-$pid" 2>/dev/null
+    # SIG_THEN: a second signal SIG_GAP seconds later, as a runner sends TERM
+    # 7.5 s after its INT.
+    [ -z "${SIG_THEN:-}" ] || { sleep "${SIG_GAP:-0.5}"; kill -"$SIG_THEN" -- "-$pid" 2>/dev/null; }
+    wait "$pid"; rc=$?
+    SESSION=$pid
+  elif [ -z "${TERM_MID_PACKER:-}" ]; then
     ( cd "$T" && env -u HARDENED_SECURITY_GROUP_ID -u HARDENED_PUBLIC -u HARDENED_ATTACHED_ORG_ID \
         -u HARDENED_SUBNET_ID -u HARDENED_INSTANCE_TYPE -u GH_REPO "${e[@]}" \
         "$R/scripts/hardened-image-build.sh" > "$T/stdout" 2> "$T/stderr" )
@@ -259,8 +350,8 @@ L_EXEC=$(ud | grep -nxF 'exec >/dev/console 2>&1' | cut -d: -f1)
 L_LAST=$(ud | wc -l)
 check "output leaves the log file after both files and before the scrub" \
   "$([ -n "$L_EXEC" ] && [ -n "$L_FILES" ] && [ "$L_EXEC" -gt "$L_FILES" ] && [ "$L_EXEC" -lt "$L_LAST" ]; echo $?)"
-check "the last line runs the solo scrub with the archive's sha256" \
-  "$([ "$(ud | tail -1)" = "/usr/local/sbin/dev-vm-image-scrub --profile solo $STORED_SHA" ]; echo $?)"
+check "the last line execs the solo scrub with the archive's sha256 (bash drops its hold on the script)" \
+  "$([ "$(ud | tail -1)" = "exec /usr/local/sbin/dev-vm-image-scrub --profile solo $STORED_SHA" ]; echo $?)"
 check "the record is written" "$([ -f "$RECORD" ]; echo $?)"
 check "the record has exactly the schema" "$(python3 -I - "$RECORD" "$STORED_SHA" "$SHA" "$URL" "$DATE" "${REGIONS[@]}" <<'PY'
 import json, re, sys
@@ -409,13 +500,85 @@ check "...and the leftovers are still listed, with real rows" \
   "$(grep -qF 'may be PUBLIC' "$T/stderr" && grep -qF 'us-east-2: ami-0aaa  state=available  public=true' "$T/stderr" \
      && grep -qxF '   us-east-1: none' "$T/stderr" && ! grep -qF 'could not list' "$T/stderr"; echo $?)"
 echo "== scripts/hardened-image-leftovers.sh on its own (the workflow's step) =="
-lo() { env PATH="$T/bin:$PATH" AWS_LOG="$T/aws.log" ORDER_LOG="$T/order.log" "$R/scripts/hardened-image-leftovers.sh" "$@" > "$T/lo.out" 2> "$T/lo.err"; }
+lo() { rm -f "$T/aws.log.n"; env PATH="$T/bin:$PATH" AWS_LOG="$T/aws.log" ORDER_LOG="$T/order.log" HARDENED_LEFTOVERS_PAUSE="${PAUSE-0}" "$R/scripts/hardened-image-leftovers.sh" "$@" > "$T/lo.out" 2> "$T/lo.err"; }
 LEFTOVER_us_east_2="$LEFT" lo "$P-01"
 check "every region read → exit 0, rows on stdout" "$([ $? -eq 0 ] && grep -qF 'us-east-2: ami-0aaa' "$T/lo.out"; echo $?)"
 LEFTOVER_FAIL=eu-west-1 lo "$P-01"
 check "a region it cannot read → exit 1, named" "$([ $? -eq 1 ] && grep -qF 'eu-west-1: could not list' "$T/lo.out"; echo $?)"
 : > "$T/aws.log"; lo "$P-01; rm -rf /"
 check "a name outside the pattern → exit 1, no AWS call" "$([ $? -eq 1 ] && [ ! -s "$T/aws.log" ]; echo $?)"
+
+echo "== build instance and key pair: listed read-only, removed only with --clean-build =="
+B1=$(grep -v '^[[:space:]]*\(#\|$\)' "$R/image/hardened/regions" | head -n 1)
+: > "$T/aws.log"; lo "$P-01"
+check "none left → exit 0, says none for both" \
+  "$([ $? -eq 0 ] && grep -qxF '   instances: none' "$T/lo.out" && grep -qxF '   packer_* key pairs: none' "$T/lo.out"; echo $?)"
+check "...reads the build region by the build's Name tag, never terminated or shutting-down ones" \
+  "$(grep -qF "aws ec2 describe-instances --region $B1 --filters Name=tag:Name,Values=idlefy-hardened-image-build Name=instance-state-name,Values=pending,running,stopping,stopped" "$T/aws.log" \
+     && grep -qF "aws ec2 describe-key-pairs --region $B1 --filters Name=tag:Name,Values=idlefy-hardened-image-build" "$T/aws.log" \
+     && [ "$(grep -c 'describe-instances\|describe-key-pairs' "$T/aws.log")" = 2 ]; echo $?)"
+: > "$T/aws.log"; BUILD_INSTANCES="i-0abc:running i-0def:stopped" BUILD_KEYS="packer_6740c0de other-key" lo "$P-01"
+check "left ones are listed, nothing removed without --clean-build" \
+  "$([ $? -eq 0 ] && grep -qxF '   instance i-0abc  state=running' "$T/lo.out" && grep -qxF '   key pair packer_6740c0de' "$T/lo.out" \
+     && ! grep -qF 'other-key' "$T/lo.out" && ! grep -qE 'terminate-instances|delete-key-pair' "$T/aws.log" \
+     && grep -qF -- '--clean-build' "$T/lo.out"; echo $?)"
+: > "$T/aws.log"; BUILD_INSTANCES="i-0abc:running i-0def:stopped" BUILD_KEYS="packer_6740c0de other-key" lo --clean-build "$P-01"
+check "--clean-build terminates exactly those instances and deletes only the packer_* key pair" \
+  "$([ $? -eq 0 ] && grep -qF "aws ec2 terminate-instances --region $B1 --instance-ids i-0abc " "$T/aws.log" \
+     && grep -qF "aws ec2 terminate-instances --region $B1 --instance-ids i-0def " "$T/aws.log" \
+     && grep -qF "aws ec2 delete-key-pair --region $B1 --key-name packer_6740c0de " "$T/aws.log" \
+     && [ "$(grep -c 'terminate-instances\|delete-key-pair' "$T/aws.log")" = 3 ] \
+     && grep -qxF '   terminated i-0abc' "$T/lo.out" && grep -qxF '   deleted key pair packer_6740c0de' "$T/lo.out"; echo $?)"
+check "...and never touches an image" "$(! grep -qE '^aws ec2 (deregister|delete-snapshot|disable|modify)' "$T/aws.log"; echo $?)"
+check "...listing instances once when it found some" "$([ "$(grep -c '^aws ec2 describe-instances' "$T/aws.log")" = 1 ]; echo $?)"
+check "...removing them before the image listing (the instance costs money; the step may be near its deadline)" \
+  "$(t=$(grep -n '^aws ec2 delete-key-pair' "$T/aws.log" | tail -1 | cut -d: -f1); i=$(grep -n '^aws ec2 describe-images' "$T/aws.log" | head -1 | cut -d: -f1); \
+     [ -n "$t" ] && [ -n "$i" ] && [ "$t" -lt "$i" ]; echo $?)"
+: > "$T/aws.log"; BUILD_INSTANCES="i-0abc:running" BUILD_KEYS="packer_6740c0de" lo --clean-build
+check "--clean-build without a name (no name file) → images not listed, build resources removed" \
+  "$([ $? -eq 0 ] && ! grep -qF 'describe-images' "$T/aws.log" && grep -qF 'terminate-instances' "$T/aws.log" \
+     && grep -qF 'delete-key-pair' "$T/aws.log" && grep -qF 'images are not listed' "$T/lo.out"; echo $?)"
+# An instance EC2 accepted just before the runner killed Packer may not be
+# listable yet: --clean-build asks again (3 listings), a plain listing once.
+: > "$T/aws.log"; BUILD_INSTANCES="i-0abc:running" INSTANCES_LATE=2 lo --clean-build
+check "--clean-build: an instance listable only on the third try is terminated" \
+  "$([ $? -eq 0 ] && [ "$(grep -c '^aws ec2 describe-instances' "$T/aws.log")" = 3 ] \
+     && grep -qF "aws ec2 terminate-instances --region $B1 --instance-ids i-0abc " "$T/aws.log"; echo $?)"
+: > "$T/aws.log"; BUILD_INSTANCES="" lo --clean-build
+check "--clean-build: still none after 3 listings → says so" \
+  "$([ $? -eq 0 ] && [ "$(grep -c '^aws ec2 describe-instances' "$T/aws.log")" = 3 ] && grep -qF 'instances: none (listed 3 times' "$T/lo.out"; echo $?)"
+: > "$T/aws.log"; BUILD_INSTANCES="i-0abc:running" INSTANCES_LATE=2 lo
+check "a plain listing asks once and reports none" \
+  "$([ "$(grep -c '^aws ec2 describe-instances' "$T/aws.log")" = 1 ] && grep -qxF '   instances: none' "$T/lo.out" && ! grep -q terminate "$T/aws.log"; echo $?)"
+check "the pause between listings is 10 s unless the test hook sets it" \
+  "$(grep -qF 'CLEAN_PAUSE="${HARDENED_LEFTOVERS_PAUSE:-10}"' "$R/scripts/hardened-image-leftovers.sh" && grep -qx 'CLEAN_TRIES=3' "$R/scripts/hardened-image-leftovers.sh"; echo $?)"
+BUILD_INSTANCES="i-0abc:running" BUILD_KEYS="packer_6740c0de" TERMINATE_FAIL=1 lo --clean-build
+check "a refused terminate → exit 1, named; the key pair is still deleted" \
+  "$([ $? -eq 1 ] && grep -qF 'could not terminate i-0abc (do it by hand)' "$T/lo.out" && grep -qxF '   deleted key pair packer_6740c0de' "$T/lo.out"; echo $?)"
+: > "$T/aws.log"; INSTANCES_FAIL=1 BUILD_KEYS="packer_6740c0de" lo --clean-build
+check "instances it cannot list → exit 1, named, nothing terminated" \
+  "$([ $? -eq 1 ] && grep -qF 'instances: could not list' "$T/lo.out" && ! grep -qF 'terminate-instances' "$T/aws.log"; echo $?)"
+: > "$T/aws.log"; BUILD_INSTANCES="i-0abc:running" BUILD_KEYS="packer_6740c0de" AWS_ACCOUNT=111122223333 lo --clean-build
+check "--clean-build with another account's credentials → exit 1, says so, nothing listed or removed" \
+  "$([ $? -eq 1 ] && grep -qF "these credentials are for account '111122223333', not the publisher account 995603458290" "$T/lo.err" \
+     && [ "$(grep -c . "$T/aws.log")" = 1 ] && grep -q '^aws sts get-caller-identity' "$T/aws.log"; echo $?)"
+: > "$T/aws.log"; BUILD_INSTANCES="i-0abc:running" BUILD_KEYS="packer_6740c0de" STS_FAIL=1 lo --clean-build
+check "--clean-build with an unreadable identity → exit 1, says so, nothing removed" \
+  "$([ $? -eq 1 ] && grep -qF 'could not read the AWS account' "$T/lo.err" && ! grep -qE 'terminate-instances|delete-key-pair' "$T/aws.log"; echo $?)"
+cp "$R/scripts/hardened-guard-check.sh" "$T/guard.orig"
+python3 -I -c 'import sys; p=sys.argv[1]; s=open(p).read(); open(p,"w").write(s.replace("\nACCOUNT_ID=", "\nACCOUNTID=", 1))' "$R/scripts/hardened-guard-check.sh"
+: > "$T/aws.log"; BUILD_INSTANCES="i-0abc:running" lo --clean-build
+check "--clean-build when the guard's ACCOUNT_ID cannot be read → exit 1, no AWS call" \
+  "$([ $? -eq 1 ] && grep -qF 'cannot read the publisher account id' "$T/lo.err" && [ ! -s "$T/aws.log" ]; echo $?)"
+cp "$T/guard.orig" "$R/scripts/hardened-guard-check.sh"
+check "the leftovers script holds no copy of the account id" "$(! grep -qE '[0-9]{12}' "$R/scripts/hardened-image-leftovers.sh"; echo $?)"
+: > "$T/aws.log"; BUILD_INSTANCES="i-0abc:running" lo "$P-01"
+check "listing alone reads no identity (read-only, as before)" "$([ $? -eq 0 ] && ! grep -q 'get-caller-identity' "$T/aws.log"; echo $?)"
+: > "$T/aws.log"; lo --terminate-everything
+check "an unknown option → exit 1, no AWS call" "$([ $? -eq 1 ] && [ ! -s "$T/aws.log" ]; echo $?)"
+BUILD_INSTANCES="i-0abc:running" PACKER_RC=1 run_build
+check "the driver's own listing after a failure is read-only and shows the instance" \
+  "$([ $? -ne 0 ] && grep -qF 'instance i-0abc  state=running' "$T/stderr" && ! grep -qE 'terminate-instances|delete-key-pair' "$T/aws.log"; echo $?)"
 LEFTOVER_us_east_1="$LEFT" ARTIFACT_REGIONS="us-east-1" run_build
 check "an artifact short of regions → the images are listed" \
   "$([ $? -ne 0 ] && grep -qF 'us-east-1: ami-0aaa' "$T/stderr"; echo $?)"
@@ -438,6 +601,131 @@ check "-04 only in us-east-2 → -05" "$([ $? -eq 0 ] && var "ami_name=$P-05"; e
 NAMES_FAIL_REGION=ap-south-1 run_build
 check "a failed describe in ap-south-1 refuses, naming it, packer never runs" \
   "$([ $? -ne 0 ] && grep -qF 'ap-south-1' "$T/stderr" && [ ! -s "$T/packer.log" ]; echo $?)"
+
+echo "== the console watcher: a failed bootstrap ends the build, not a 2 h wait =="
+CONSOLE_OUTPUT='[  12.3] cloud-init: booting\nBOOTSTRAP FAILED: no image will be taken. Log follows.\napt_package[ripgrep]: No candidate version' \
+  HARDENED_CONSOLE_POLL=0.2 PACKER_HOLD=30 run_build; rc=$?
+check "the banner → non-zero, says the bootstrap failed" \
+  "$([ $rc -ne 0 ] && grep -qF 'the bootstrap failed on the build instance' "$T/stderr"; echo $?)"
+check "...Packer was interrupted (SIGINT), not left to wait" "$(grep -qx interrupted "$T/packer.log"; echo $?)"
+check "...the console's tail is in the log" \
+  "$(grep -qF 'BOOTSTRAP FAILED: no image will be taken' "$T/stderr" && grep -qF 'apt_package[ripgrep]: No candidate version' "$T/stderr"; echo $?)"
+check "...the tail names the instance" "$(grep -qF '!! i-0123456789abcdef0: the bootstrap failed' "$T/stderr"; echo $?)"
+check "...it read the instance Packer named, latest output" \
+  "$(grep -q '^aws ec2 get-console-output --region us-east-1 --instance-id i-0123456789abcdef0 --latest ' "$T/aws.log"; echo $?)"
+check "...no record" "$([ ! -e "$RECORD" ]; echo $?)"
+CONSOLE_OUTPUT='solo converge complete\ndev-vm-image-scrub: internal error: ubuntu is in group sudo; no image will be taken' \
+  HARDENED_CONSOLE_POLL=0.2 PACKER_HOLD=30 run_build; rc=$?
+check "the scrub's refusal ends the build too, and says so" \
+  "$([ $rc -ne 0 ] && grep -qx interrupted "$T/packer.log" && grep -qF 'the image scrub refused the image on the build instance' "$T/stderr"; echo $?)"
+CONSOLE_OUTPUT='[  12.3] cloud-init: booting\nsolo converge complete' HARDENED_CONSOLE_POLL=0.2 PACKER_HOLD=3 run_build; rc=$?
+check "no banner → Packer runs to the end, exit 0, a record" \
+  "$([ $rc -eq 0 ] && ! grep -qx interrupted "$T/packer.log" && [ -f "$RECORD" ] && grep -q 'get-console-output' "$T/aws.log"; echo $?)"
+CONSOLE_OUTPUT='' HARDENED_CONSOLE_POLL=0.2 PACKER_HOLD=1 run_build
+check "an empty console (a stopped instance) → nothing happens, exit 0" "$([ $? -eq 0 ] && ! grep -qx interrupted "$T/packer.log"; echo $?)"
+CONSOLE_FAIL=1 HARDENED_CONSOLE_POLL=0.2 PACKER_HOLD=3 run_build; rc=$?
+check "console read errors are tolerated: exit 0, a record, one note" \
+  "$([ $rc -eq 0 ] && [ -f "$RECORD" ] && [ "$(grep -c 'cannot read the console of i-0123456789abcdef0' "$T/stderr")" = 1 ]; echo $?)"
+
+CONSOLE_OUTPUT='[  12.3] cloud-init[812]: + echo "BOOTSTRAP FAILED: no image will be taken. Log follows."\nsee BOOTSTRAP FAILED: no image will be taken. Log follows. in the docs\n  dev-vm-image-scrub: refusing: quoted\ndev-vm-image-scrub: note: rsyslog not stopped' \
+  HARDENED_CONSOLE_POLL=0.2 PACKER_HOLD=3 run_build; rc=$?
+check "a healthy console that only quotes the markers inside other lines → no interrupt, exit 0" \
+  "$([ $rc -eq 0 ] && ! grep -qx interrupted "$T/packer.log" && [ -f "$RECORD" ] && grep -q 'get-console-output' "$T/aws.log"; echo $?)"
+CONSOLE_OUTPUT='boot\r\nBOOTSTRAP FAILED: no image will be taken. Log follows.\r\nE: oops\r' HARDENED_CONSOLE_POLL=0.2 PACKER_HOLD=30 run_build; rc=$?
+check "the banner as a whole line ending in CR LF → interrupted" "$([ $rc -ne 0 ] && grep -qx interrupted "$T/packer.log"; echo $?)"
+for msg in "internal error: unknown profile 'solo'" "internal error: expected a revision id, got 'x'" \
+           "internal error: not root and DEV_VM_IMAGE_ROOT unset; this runs only on a build instance" \
+           "internal error at line 77; no image will be taken" \
+           "refusing: status is 'converge-failed x', expected 'ok y'; no image will be taken"; do
+  CONSOLE_OUTPUT="solo converge complete\ndev-vm-image-scrub: $msg" HARDENED_CONSOLE_POLL=0.2 PACKER_HOLD=30 run_build; rc=$?
+  check "the scrub's '$msg' → interrupted, named" \
+    "$([ $rc -ne 0 ] && grep -qx interrupted "$T/packer.log" && grep -qF 'the image scrub refused the image' "$T/stderr"; echo $?)"
+done
+check "every exit-70 message of the scrubs starts 'internal error' or 'refusing'" \
+  "$(! grep -hoE 'log "[^"]*"' "$R/image/files/dev-vm-image-scrub" "$R/image/files/dev-vm-image-scrub-solo" \
+       | grep -vE '^log "(internal error|refusing)[ :]|^log "note: ' | grep -q .; echo $?)"
+check "the banner the watcher matches is the one bootstrap-solo prints, after a newline" \
+  "$(grep -A1 -xF '    echo' "$R/image/files/bootstrap-solo" | grep -qxF '    echo "BOOTSTRAP FAILED: no image will be taken. Log follows."' \
+     && grep -qF '?BOOTSTRAP FAILED: no image will be taken\\. Log follows\\.\$" ' "$R/scripts/hardened-image-build.sh"; echo $?)"
+# An unterminated getty prompt may sit before a marker.
+for c in 'ip-10-0-1-5 login: BOOTSTRAP FAILED: no image will be taken. Log follows.' \
+         'ip-10-0-1-5 login: dev-vm-image-scrub: refusing: x; no image will be taken' \
+         'ip-10-0-1-5 login: \nBOOTSTRAP FAILED: no image will be taken. Log follows.'; do
+  CONSOLE_OUTPUT="boot\n$c" HARDENED_CONSOLE_POLL=0.2 PACKER_HOLD=30 run_build; rc=$?
+  check "a marker after a login prompt ('${c:0:40}…') → interrupted" "$([ $rc -ne 0 ] && grep -qx interrupted "$T/packer.log"; echo $?)"
+done
+CONSOLE_OUTPUT='ip-10-0-1-5 login: root typed dev-vm-image-scrub: refusing: x\nlogin: BOOTSTRAP FAILED: no image will be taken. Log follows.' \
+  HARDENED_CONSOLE_POLL=0.2 PACKER_HOLD=3 run_build; rc=$?
+check "a marker after other prompt text, or after a bare 'login: ' → no interrupt, exit 0" \
+  "$([ $rc -eq 0 ] && ! grep -qx interrupted "$T/packer.log"; echo $?)"
+CONSOLE_OUTPUT='BOOTSTRAP FAILED: no image will be taken. Log follows.' PACKER_INT_OK=1 HARDENED_CONSOLE_POLL=0.2 PACKER_HOLD=30 run_build; rc=$?
+check "Packer takes the interrupt yet exits 0 with a full artifact → the driver still fails, no record" \
+  "$([ $rc -ne 0 ] && grep -qx interrupted "$T/packer.log" && [ ! -e "$RECORD" ] \
+     && ! grep -q 'release upload .*\.json' "$T/gh.log" && grep -qF 'the bootstrap failed on the build instance' "$T/stderr"; echo $?)"
+
+# packer_gone — every process of the Packer stand-in (wrapper and child) has
+# ended.
+packer_gone() {
+  local p
+  [ -s "$T/packer.pids" ] || return 1
+  while read -r p; do ! kill -0 "$p" 2>/dev/null || return 1; done < "$T/packer.pids"
+}
+# before A B FILE — a line equal to A comes before the last line starting B.
+before() {
+  awk -v a="$1" -v b="$2" '$0 == a && !s { s = NR } index($0, b) == 1 { l = NR } END { exit !(s && l && s < l) }' "$3"
+}
+# session_gone — no process of the driver's session is left, checked at once.
+session_gone() { [ -n "$SESSION" ] && [ -z "$(ps -s "$SESSION" -o pid= 2>/dev/null)" ]; }
+CONSOLE_OUTPUT='BOOTSTRAP FAILED: no image will be taken. Log follows.' HARDENED_CONSOLE_POLL=0.2 PACKER_HOLD=30 run_build; rc=$?
+check "a marker reaches Packer's worker through its SIGINT-swallowing wrapper; both end" \
+  "$([ $rc -ne 0 ] && grep -qx interrupted "$T/packer.log" && [ "$(wc -l < "$T/packer.pids")" = 2 ] && packer_gone; echo $?)"
+
+echo "== the console watcher and Packer never outlive the driver =="
+for sig in INT TERM; do
+  want=$([ $sig = INT ] && echo 130 || echo 143)
+  # A watcher asleep in a long poll.
+  SESSION=""; HARDENED_CONSOLE_POLL=600 PACKER_HOLD=30 SIG_EARLY=$sig run_build; rc=$?
+  check "SIG$sig to the driver's session while Packer runs → exit $want" "$([ $rc -eq $want ]; echo $?)"
+  check "...Packer's worker got the interrupt through its wrapper; wrapper and worker ended" \
+    "$(grep -qx interrupted "$T/packer.log" && packer_gone; echo $?)"
+  check "...Packer was waited for: its clean-up ended before the leftovers were listed" \
+    "$(before 'packer cleaned-up' 'aws ec2 describe-instances' "$T/order.log"; echo $?)"
+  check "...the pipe Packer writes to survived the signal: its cancel line reached the log" \
+    "$(grep -qxF 'Build was cancelled.' "$T/stdout"; echo $?)"
+  check "...no process of the session is left, checked at once (the watcher's long sleep too)" "$(session_gone; echo $?)"
+  [ -z "$SESSION" ] || pkill -s "$SESSION" 2>/dev/null || true
+  # A watcher waiting on a console read that hangs.
+  SESSION=""; CONSOLE_HANG=1 HARDENED_CONSOLE_POLL=0.2 PACKER_HOLD=30 SIG_EARLY=$sig SIG_LOG=aws.log SIG_WHEN=get-console-output run_build; rc=$?
+  check "SIG$sig while the watcher waits on a hung console read → exit $want, Packer interrupted and gone" \
+    "$([ $rc -eq $want ] && grep -qx interrupted "$T/packer.log" && packer_gone; echo $?)"
+  check "...no process of the session is left, checked at once (the hung read too)" "$(session_gone; echo $?)"
+  [ -z "$SESSION" ] || pkill -s "$SESSION" 2>/dev/null || true
+done
+
+# A runner's cancel: INT, then TERM while Packer is still cleaning up.
+SESSION=""; HARDENED_CONSOLE_POLL=600 PACKER_HOLD=30 PACKER_CLEANUP=3 SIG_EARLY=INT SIG_THEN=TERM SIG_GAP=1 run_build; rc=$?
+check "INT, then TERM during Packer's 3 s clean-up → exit 130 (the first status), not 143" "$([ $rc -eq 130 ]; echo $?)"
+check "...Packer's clean-up still ended before the leftovers were listed" \
+  "$(before 'packer cleaned-up' 'aws ec2 describe-instances' "$T/order.log" && grep -q '^aws ec2 describe-images' "$T/order.log"; echo $?)"
+check "...wrapper, worker and every process of the session are gone" "$(packer_gone && session_gone; echo $?)"
+[ -z "$SESSION" ] || pkill -s "$SESSION" 2>/dev/null || true
+
+# A clean-up that never ends: the driver stops waiting after the grace
+# period, says so, keeps its status and still lists leftovers; no KILL.
+SESSION=""; rm -f "$T/packer.pids"
+start=$SECONDS
+HARDENED_PACKER_GRACE=2 HARDENED_CONSOLE_POLL=600 PACKER_HOLD=120 PACKER_STUCK=1 SIG_EARLY=INT run_build; rc=$?
+took=$((SECONDS - start))
+check "a Packer whose clean-up never ends → exit 130 after the 2 s grace (took ${took} s), not a hang" \
+  "$([ $rc -eq 130 ] && [ "$took" -lt 30 ] && grep -qx interrupted "$T/packer.log"; echo $?)"
+check "...says the clean-up was NOT confirmed and points at --clean-build" \
+  "$(grep -qF "Packer's clean-up was NOT confirmed within 2 s" "$T/stderr" && grep -qF 'hardened-image-leftovers.sh --clean-build' "$T/stderr"; echo $?)"
+check "...still lists leftovers" \
+  "$(grep -q '^aws ec2 describe-instances' "$T/order.log" && grep -qF 'Build resources in' "$T/stderr"; echo $?)"
+check "...and never killed Packer: its worker still runs" \
+  "$(p=$(sed -n 2p "$T/packer.pids"); [ -n "$p" ] && kill -0 "$p" 2>/dev/null; echo $?)"
+while read -r p; do kill -KILL "$p" 2>/dev/null; done < "$T/packer.pids"
+[ -z "$SESSION" ] || pkill -s "$SESSION" 2>/dev/null || true
 
 echo "== public=false and an attached org =="
 PUBLIC=false ORG=0b7c3c1e-5f0e-4b8e-9a51-3f0c2d1e4a5b run_build; check "exits 0" "$?"
@@ -469,6 +757,14 @@ PLATFORM_TAG=v2.2 run_build; refuses_early $? "a malformed PLATFORM_TAG refuses"
 PLATFORM_SHA=abc run_build; refuses_early $? "a malformed PLATFORM_SHA refuses" PLATFORM_SHA
 PUBLIC=yes run_build; refuses_early $? "HARDENED_PUBLIC other than true/false refuses" HARDENED_PUBLIC
 ORG=not-a-uuid run_build; refuses_early $? "a malformed attached org refuses" HARDENED_ATTACHED_ORG_ID
+HARDENED_CONSOLE_POLL=soon run_build; refuses_early $? "a console poll that is not a number refuses" HARDENED_CONSOLE_POLL
+for z in 0 0.0 00.000; do
+  HARDENED_CONSOLE_POLL=$z run_build; refuses_early $? "a console poll of '$z' (zero: the watcher would spin) refuses" HARDENED_CONSOLE_POLL
+  HARDENED_PACKER_GRACE=$z run_build; refuses_early $? "a Packer grace of '$z' refuses" HARDENED_PACKER_GRACE
+done
+HARDENED_PACKER_GRACE=soon run_build; refuses_early $? "a Packer grace that is not a number refuses" HARDENED_PACKER_GRACE
+check "the driver says why a non-Nitro type loses the fast failure path, and that the role pins the type" \
+  "$(grep -qF 'only Nitro' "$R/scripts/hardened-image-build.sh" && grep -qF 'allows exactly c7a.xlarge' "$R/scripts/hardened-image-build.sh"; echo $?)"
 
 echo "== the tag must name PLATFORM_SHA, and the tree must be it =="
 git -C "$R" init -q && git -C "$R" add -A && git -C "$R" -c user.name=t -c user.email=t@t commit -qm t && git -C "$R" tag v2.2.0
@@ -531,6 +827,28 @@ run_build; check "builds" "$?"
 size=$(stat -c %s "$T/ud.gz")
 echo "       bootstrap-solo + both scrub files, gzip -9: $size bytes (EC2 takes 16384)"
 check "it fits" "$([ "$size" -le 16384 ]; echo $?)"
+
+echo "== the publish workflow leaves time and credentials for the leftovers =="
+# What can be asserted statically: the build step's own clock starts after
+# the setup steps, whose length no file bounds, so the job keeps at least
+# 45 minutes for those plus 15 for the leftovers and record steps (60 in all)
+# beyond the build step's timeout; the role session lasts the whole job; the
+# leftovers step runs exactly on a failure or a cancel, the record always.
+check "job timeout ≥ build step timeout + 45 (setup, guard) + 15 (leftovers, record); role session ≥ job; the steps' if:" \
+  "$(python3 -I - "$ROOT/.github/workflows/publish-hardened-image.yml" <<'PY'; echo $?
+import sys, yaml
+job = yaml.safe_load(open(sys.argv[1]))["jobs"]["publish"]
+steps = {s.get("name") or s.get("id"): s for s in job["steps"]}
+build, creds = steps["build"], steps["aws-creds"]
+names = [s.get("name") or s.get("id") for s in job["steps"]]
+ok = (int(build["timeout-minutes"]) + 45 + 15 <= int(job["timeout-minutes"])
+      and int(creds["with"]["role-duration-seconds"]) >= 60 * int(job["timeout-minutes"])
+      and names.index("leftovers") > names.index("build") and names.index("record") > names.index("build")
+      and str(steps["leftovers"].get("if", "")).strip() == "failure() || cancelled()"
+      and str(steps["record"].get("if", "")).strip() == "always()")
+sys.exit(0 if ok else 1)
+PY
+)"
 
 echo
 echo "passed: $PASS  failed: $FAIL"

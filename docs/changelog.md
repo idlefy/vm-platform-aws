@@ -1,5 +1,88 @@
 # Changelog
 
+## 2.2.1
+
+Fixes from the first builds of Idlefy's hardened image: two Actions runs and
+one image built by hand from the same user data. The image's build changes;
+the cookbook does not. No base release: the image still converges
+`base-2.2.0`. Nothing here touches a tenant fleet or its image. Design record:
+[Hardened image for AI agents](design/hardened-image.md).
+
+**`v2.2.1`**
+
+- `bootstrap-solo` runs `apt-get update --error-on=any` before the converge.
+  A stock image ships no apt lists, so the first package had no candidate
+  version and the bootstrap failed. A list that fails to download fails the
+  bootstrap there, with the banner, instead of a warning. The banner now
+  starts on a new line even after an unterminated login prompt on the
+  serial console.
+- The solo scrub purges snapd. The hand-built image carried the build
+  instance's snapd device key and serial, which every box from a public
+  image would have shared. The device key files are shredded before the
+  purge (best effort). The amazon-ssm-agent snap is now checked before the
+  purge. A purge's leftovers (`/var/lib/snapd`, `/snap`, `/var/snap`,
+  `/var/cache/snapd`, `/root/snap`, `/home/*/snap`,
+  `/var/cache/apparmor/*/snap-confine*`) are removed. The image is refused
+  unless snapd, any SSM agent package, `/usr/bin/snap` and
+  `/usr/lib/snapd/snapd` are gone, and no file or link named like a snap or
+  SSM unit is left anywhere on the root filesystem (one `find / -xdev`,
+  not a list of unit directories). A `dpkg-query` that cannot answer
+  refuses, and so does a dpkg database that does not show `dpkg` itself
+  installed. `apt-get clean` drops the
+  package cache (321 MB); the apt lists stay. To use a snap, the admin
+  installs snapd.
+- The solo scrub zero-fills the free space of `/` as its last step, after
+  every removal and after `cloud-init clean`: freed blocks of a public
+  snapshot are readable, and EBS root volumes accept no discard, so a trim
+  frees nothing (measured). This is defence in depth: the guarantee stays
+  that nothing secret is written to the build disk, and the design record
+  lists what the fill cannot reach (block slack, directory entries,
+  metadata, the ext4 journal, `/boot`). The fill writes with `O_DIRECT`
+  with ext4's reserved clusters set to 0 (and put back), then 4 KiB writes
+  for the last partial MiB. The image is refused unless both passes end on
+  a full filesystem, at most 1 MiB stays free, the fill file's fsync
+  succeeds and the file is gone. Before it, cloud-init's two open logs are
+  truncated, the user data's last line `exec`s the scrub, and the image is
+  refused while any process holds a deleted file of non-zero size on `/`.
+  Measured by hand: about 3 minutes more build time, and taking the
+  snapshot took 10–17 minutes instead of under 2; the snapshot storage
+  growth (roughly 16 GB per region) is an estimate. The fleet scrub is
+  unchanged; its `fstrim` has always been a no-op on EBS.
+- The build driver reads the build instance's serial console while Packer
+  runs. On the bootstrap's `BOOTSTRAP FAILED` banner or a scrub refusal, as a
+  whole line, it prints the console's tail and interrupts Packer, so the
+  instance and its key pair are removed. The build then fails with the
+  reason, whatever Packer reports. Before this, a build that failed in 28 s
+  waited out Packer's 2-hour budget. A console read error is noted, never
+  fatal. The watcher never outlives the driver. Packer runs in a process
+  group of its own and is interrupted as a group: Packer 1.11.2's panicwrap
+  wrapper drops a SIGINT sent to it alone. On INT, TERM or a failure the
+  driver passes SIGINT to that group (again every 10 s while it lives) and
+  waits for Packer's clean-up before it lists leftovers; a second signal
+  during that wait (Actions sends TERM 7.5 s after INT) is ignored and the
+  first exit status kept. A cancel no longer breaks the pipe Packer logs
+  to. A marker after an unterminated login prompt still counts.
+- The publish workflow's `build` step times out at 180 minutes, so the
+  job's last 60 of 240 cover setup and the guard (up to 45) and leave the
+  `leftovers` and `record` steps at least 15.
+- An interrupted Packer gets 15 minutes to clean up
+  (`HARDENED_PACKER_GRACE`); after that the driver stops waiting without
+  killing it, says the clean-up was not confirmed, and still lists
+  leftovers. A console poll or grace of zero is refused.
+- `--clean-build` lists instances up to 3 times, 10 s apart, before it
+  reports none: a just-launched instance may not be listable yet.
+- `scripts/hardened-image-leftovers.sh` also lists the build instance and
+  Packer's `packer_*` key pair, and `--clean-build` removes exactly those,
+  before it lists images across the regions.
+  It refuses unless the credentials are the publisher account's. The
+  publish workflow's `leftovers` step runs it after a failed, cancelled or
+  timed-out build, with or without an image name, and says so instead when
+  the run never got AWS credentials. An Actions cancel had left both
+  running. Images are still only listed.
+- Measured: for Canonical's source image the IAM condition key `ec2:Owner` is
+  the alias `amazon`, not the account id. The publisher role's condition
+  (outside this repository) was fixed to match.
+
 ## 2.2.0
 
 A second published policy, `solo`: one developer's box with an AI agent

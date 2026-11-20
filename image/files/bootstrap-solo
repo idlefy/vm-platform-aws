@@ -18,9 +18,12 @@ install -m 0600 /dev/null /var/log/user-data.log
 exec > /var/log/user-data.log 2>&1
 
 # A failed build is terminated by Packer with its disk; the serial console is
-# the only place its operator can read why.
+# the only place its operator can read why. The banner starts with a newline:
+# the console may sit at an unterminated getty prompt ("host login: "), and
+# the build driver matches the banner at a line's start.
 bootstrap_failed() {
   {
+    echo
     echo "BOOTSTRAP FAILED: no image will be taken. Log follows."
     tail -c 56000 /var/log/user-data.log
   } > /dev/console 2>/dev/null || true
@@ -85,6 +88,13 @@ if json.load(open(sys.argv[1])).get("name") != "solo":
     print("refusing: Policyfile.lock.json does not name the solo policy", file=sys.stderr)
     sys.exit(1)
 EOF
+
+# A stock image ships no apt lists: without this the first package the converge
+# asks for has no candidate version (measured on the first build). The fleet's
+# bootstrap does the same before its converge. --error-on=any: a list that
+# fails to download (a mirror error, a bad signature) fails the bootstrap here,
+# where plain apt-get update would only warn and exit 0.
+apt-get update --error-on=any -qq
 
 # The scrub writes image-revision here; no solo recipe is guaranteed to create it.
 install -d -m 0755 -o root -g root /etc/dev-vm
