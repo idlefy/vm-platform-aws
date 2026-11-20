@@ -1,5 +1,5 @@
 {
-  "revision_id": "faba056fe2c1bff2b37a3977a3e589288892ec9c4fb50274d1600e60440b8fa3",
+  "revision_id": "67232657db0ef6a7f2e2baafb33998003ed636ff79e6bf916006899cd825b179",
   "name": "solo",
   "run_list": [
     "recipe[base::solo]"
@@ -10,15 +10,15 @@
   "cookbook_locks": {
     "base": {
       "version": "2.2.0",
-      "identifier": "82a75c9d7059ab268382b08c9ac694bdc3edd77a",
-      "dotted_decimal_identifier": "36775763192601003.10840646445996742.163542756874106",
+      "identifier": "1c288305aa133ce30773860a43cd23b5f9522187",
+      "dotted_decimal_identifier": "7925842548757308.63903012464772045.39264478962055",
       "source": "../cookbooks/base",
       "cache_key": null,
       "scm_info": {
         "scm": "git",
         "remote": "https://github.com/idlefy/vm-platform-aws.git",
-        "revision": "ac176049f32e95940cf1263121588f0b9f9407e5",
-        "working_tree_clean": false,
+        "revision": "780de35e559cc1ceb767489f9b4ef1ca8410d382",
+        "working_tree_clean": true,
         "published": false,
         "synchronized_remote_branches": [
 
