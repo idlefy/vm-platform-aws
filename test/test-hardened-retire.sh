@@ -107,7 +107,7 @@ for spec in sys.argv[3:]:
     im = {"ImageId": iid, "Name": name, "Public": public, "State": state,
           "OwnerId": "995603458290", "CreationDate": iso(created),
           "BlockDeviceMappings": [{"DeviceName": "/dev/sda1",
-                                   "Ebs": {"SnapshotId": "snap-" + iid.split("-", 1)[1], "VolumeSize": 20}}]}
+                                   "Ebs": {"SnapshotId": "snap-" + iid.split("-", 1)[1], "VolumeSize": 9}}]}
     if desc != "none":
         im["Description"] = desc or built
     if dep == "" and public:

@@ -50,6 +50,9 @@ check "the description carries the visibility, on every copy; the record writes 
 check "only # comments (the strip above knows no other kind)" "$(! grep -q '//\|/[*]' "$S"; echo $?)"
 check "ami_name is validated against the published pattern" "$(block 'validation' | grep -qF 'can(regex("^idlefy-hardened-agent-ubuntu-24\\.04-amd64-[0-9]{8}-[0-9]{2}$", var.ami_name))'; echo $?)"
 check "a fixed security group, never a temporary one" "$(grep -q 'security_group_ids *= *\[var.security_group_id\]' "$S" && ! grep -q temporary_security_group "$S"; echo $?)"
+check "the volume default is the driver's VOLUME_GIB (9 GiB; the role fences ec2:VolumeSize to it)" \
+  "$(v=$(sed -n 's/^VOLUME_GIB=\([0-9]*\)$/\1/p' "$ROOT/scripts/hardened-image-build.sh"); \
+     [ "$v" = 9 ] && awk '/^variable "volume_size_gb"/,/^}/' "$T" | grep -qE "^ *default *= *$v\$"; echo $?)"
 check "its own directory" "$([ ! -e "$ROOT/image/hardened.pkr.hcl" ] && [ "$(ls "$DIR"/*.pkr.hcl 2>/dev/null | wc -l)" = 1 ] && [ "$(ls "$ROOT"/image/*.pkr.hcl | wc -l)" = 1 ] && echo 0 || echo 1)"
 check "regions file: build region first, one region per line, no duplicates" "$(R="$(grep -v '^[[:space:]]*\(#\|$\)' "$DIR/regions" 2>/dev/null)" \
   && [ "$(printf '%s\n' "$R" | head -1)" = us-east-1 ] \

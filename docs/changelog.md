@@ -1,5 +1,31 @@
 # Changelog
 
+## 2.2.2
+
+Idlefy's hardened image is built on a 9 GiB root volume instead of 20. The
+image's build changes; the cookbook does not. No base release: the image
+still converges `base-2.2.0`. Nothing here touches a tenant fleet or its
+image. Design record: [Hardened image for AI agents](design/hardened-image.md).
+
+**`v2.2.2`**
+
+- The root volume is 9 GiB (`VOLUME_GIB`; the template's default and the
+  record's `root_volume_gib` follow). A snapshot of the zero-filled volume
+  stores every block (measured), so the volume size is what each of the 17
+  regions stores. Measured by hand on 8 GiB: the build fits with 3.9 GB
+  used, takes about 3.5 minutes instead of 5.5, and the snapshot about 6.5
+  minutes instead of 10–17; a box on a 40 GiB disk grows its root
+  filesystem at first boot. 9 rather than 8 because the publisher role's
+  fence for tagging copied snapshots discriminates on `ec2:VolumeSize`, and
+  8 GiB is the default root of stock Ubuntu images. The role's fence
+  (`hardened_volume_gib`, outside this repository) is 9.
+- The design record records the first run through the workflow: guard,
+  bootstrap, scrub and CreateImage passed; CopyImage was refused by the
+  role's tag rule, which the owner changed on 2026-11-20 to allow a copy
+  tagged exactly `Name=idlefy-hardened-image-build` (what that gives up is
+  in decision 13). Packer removed everything it had made after each
+  failure.
+
 ## 2.2.1
 
 Fixes from the first builds of Idlefy's hardened image: two Actions runs and

@@ -48,9 +48,11 @@ variable "subnet_id" {
   default = ""
 }
 variable "security_group_id" { type = string }
+# The driver always passes VOLUME_GIB (scripts/hardened-image-build.sh); the
+# default matches it, and the publisher role fences ec2:VolumeSize to it.
 variable "volume_size_gb" {
   type    = number
-  default = 20
+  default = 9
 }
 variable "public" {
   type    = bool
