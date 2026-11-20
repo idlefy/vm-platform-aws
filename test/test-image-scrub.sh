@@ -17,7 +17,7 @@ T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 REV=$(printf 'a%.0s' {1..64})
 mkdir -p "$T/bin"
 # shellcheck disable=SC2016 # $* and $SHIM_LOG expand in the shim, not here
-for c in systemctl journalctl cloud-init fstrim poweroff sync dd; do
+for c in systemctl journalctl cloud-init fstrim poweroff sync dd truncate shred; do
   printf '#!/usr/bin/env bash\necho "%s $*" >> "$SHIM_LOG"\n' "$c" > "$T/bin/$c"; chmod +x "$T/bin/$c"
 done
 # `systemctl is-enabled` answers "nothing enabled" unless SHIM_ENABLED=0. A
@@ -44,12 +44,33 @@ SHIM
 # shellcheck disable=SC2016
 printf '[ -n "${SHIM_FAIL_CLOUDINIT:-}" ] && exit 1\nexit 0\n' >> "$T/bin/cloud-init"
 # dd: never a real fill here. It writes a few bytes to of= and reports what
-# SHIM_DD says: enospc (default, as a full filesystem ends the fill), other
-# (another write error), ok (exit 0, no error), empty (ENOSPC after zero
-# bytes), stuck (leaves a directory rm -f cannot remove).
+# SHIM_DD says for the 1 MiB pass: enospc (default, as a full filesystem ends
+# the fill), other (another write error), ok (exit 0, no error), empty
+# (ENOSPC after zero bytes), stuck (leaves a directory rm -f cannot remove);
+# the 4 KiB pass (oflag=…append) answers SHIM_DD_TAIL: enospc (default),
+# other, ok. Each call records the ext4 reserve as it stands into
+# $SHIM_LOG.knob. When the 1 MiB pass begins, it checks every `remove` path
+# of $SHIM_REMOVE_LIST under the root and writes the first one still there
+# into $SHIM_LOG.fill-left ($SHIM_LOG.fill-checked says it looked).
 # shellcheck disable=SC2016
 cat >> "$T/bin/dd" <<'SHIM'
-of=""; for a in "$@"; do case "$a" in of=*) of=${a#of=} ;; esac; done
+of=""; tail=0
+for a in "$@"; do case "$a" in of=*) of=${a#of=} ;; oflag=*append*) tail=1 ;; esac; done
+echo "$(cat "$DEV_VM_IMAGE_ROOT/sys/fs/ext4/nvme0n1p1/reserved_clusters" 2>/dev/null)" >> "$SHIM_LOG.knob"
+if [ "$tail" = 1 ]; then
+  case "${SHIM_DD_TAIL:-enospc}" in
+    enospc) echo "dd: error writing '$of': No space left on device" >&2; exit 1 ;;
+    other)  echo "dd: error writing '$of': Input/output error" >&2; exit 1 ;;
+    ok)     exit 0 ;;
+  esac
+fi
+if [ -n "${SHIM_REMOVE_LIST:-}" ]; then
+  : > "$SHIM_LOG.fill-checked"
+  while read -r verb path _; do
+    [ "$verb" = remove ] || continue
+    if compgen -G "$DEV_VM_IMAGE_ROOT$path" > /dev/null; then echo "$path" > "$SHIM_LOG.fill-left"; break; fi
+  done < <(grep -v '^\s*#' "$SHIM_REMOVE_LIST")
+fi
 case "${SHIM_DD:-enospc}" in
   enospc) printf 'zeros' > "$of"; echo "dd: error writing '$of': No space left on device" >&2; exit 1 ;;
   other)  printf 'zeros' > "$of"; echo "dd: error writing '$of': Input/output error" >&2; exit 1 ;;
@@ -58,16 +79,29 @@ case "${SHIM_DD:-enospc}" in
   stuck)  mkdir -p "$of/x"; echo "dd: error writing '$of': No space left on device" >&2; exit 1 ;;
 esac
 SHIM
-# find: the real one, unless SHIM_FIND_FAIL names the directory it is asked
-# to scan (relative to the fake root) — then it fails as on an unreadable
-# directory. A shim, not chmod 000: root reads through any mode.
+# sync FILE (an fsync) fails when SHIM_FSYNC_RC is set; a bare sync never does.
+# shellcheck disable=SC2016
+printf '[ $# -gt 0 ] && [ -n "${SHIM_FSYNC_RC:-}" ] && { echo "sync: error syncing ${*: -1}: Input/output error" >&2; exit "$SHIM_FSYNC_RC"; }\nexit 0\n' >> "$T/bin/sync"
+# truncate is the real one after it logs; shred too, unless SHIM_SHRED_RC.
+printf 'exec %q "$@"\n' "$(command -v truncate)" >> "$T/bin/truncate"
+# shellcheck disable=SC2016
+printf '[ -n "${SHIM_SHRED_RC:-}" ] && exit "$SHIM_SHRED_RC"\nexec %q "$@"\n' "$(command -v shred)" >> "$T/bin/shred"
+# The fake root's / is block device 259:1 (nvme0n1p1; seed_solo builds its
+# sysfs), unless SHIM_NO_MOUNTPOINT.
+# shellcheck disable=SC2016
+printf '#!/usr/bin/env bash\n[ -n "${SHIM_NO_MOUNTPOINT:-}" ] && exit 1\necho 259:1\n' > "$T/bin/mountpoint"
+# stat -f answers SHIM_STATFS ("BSIZE BFREE", default 4096 3 — a full
+# filesystem; "fail" fails); any other stat is the real one.
+# shellcheck disable=SC2016
+printf '#!/usr/bin/env bash\nif [ "$1" = -f ]; then [ "${SHIM_STATFS:-}" = fail ] && exit 1; echo "${SHIM_STATFS:-4096 3}"; exit 0; fi\nexec %q "$@"\n' "$(command -v stat)" > "$T/bin/stat"
+# tee into the ext4 reserve fails when SHIM_KNOB_RO; otherwise the real tee.
+# shellcheck disable=SC2016
+printf '#!/usr/bin/env bash\nfor a; do case "$a" in *reserved_clusters) [ -n "${SHIM_KNOB_RO:-}" ] && { cat >/dev/null; echo "tee: $a: Permission denied" >&2; exit 1; } ;; esac; done\nexec %q "$@"\n' "$(command -v tee)" > "$T/bin/tee"
+chmod +x "$T/bin/"*
+# find: the real one, unless SHIM_FIND_FAIL — then it fails as on an
+# unreadable directory. A shim, not chmod 000: root reads through any mode.
 REAL_FIND=$(command -v find)
-printf '#!/usr/bin/env bash
-if [ -n "${SHIM_FIND_FAIL:-}" ] && [ "$1" = "$DEV_VM_IMAGE_ROOT/$SHIM_FIND_FAIL" ]; then
-  echo "find: '"'"'$1'"'"': Permission denied" >&2; exit 1
-fi
-exec %q "$@"
-' "$REAL_FIND" > "$T/bin/find"
+printf '#!/usr/bin/env bash\nif [ -n "${SHIM_FIND_FAIL:-}" ]; then\n  echo "find: '"'"'$1x'"'"': Permission denied" >&2; exit 1\nfi\nexec %q "$@"\n' "$REAL_FIND" > "$T/bin/find"
 chmod +x "$T/bin/find"
 # The solo profile's shims. Each logs like the others, then answers from the
 # environment: by default a clean solo build (cinc purged and gone, sudoers
@@ -91,6 +125,8 @@ chmod +x "$T/bin/find"
   # SHIM_DPKGQ_ERR=<package>: dpkg-query cannot answer for it (exit 2).
   printf '[ "${*: -1}" = "${SHIM_DPKGQ_ERR:-}" ] && { echo "dpkg-query: error: cannot access archive: Permission denied" >&2; exit 2; }\n' >> "$T/bin/dpkg-query"
   printf '[ "${*: -1}" = snapd ] && { printf not-installed; exit 0; }\n' >> "$T/bin/dpkg-query"
+  # dpkg knows itself as installed, unless its database is empty.
+  printf '[ "${*: -1}" = dpkg ] && [ -z "${SHIM_DPKG_DB_EMPTY:-}" ] && { printf installed; exit 0; }\n' >> "$T/bin/dpkg-query"
   # Any other package is unknown to dpkg, as on a real image.
   printf 'echo "dpkg-query: no packages found matching ${*: -1}" >&2\nexit 1\n' >> "$T/bin/dpkg-query"
   printf '[ "$1" = -c ] && exit "${SHIM_VISUDO_RC:-0}"\nexit 0\n' >> "$T/bin/visudo"
@@ -113,8 +149,10 @@ build_root() {  # build_root DIR STATUS_LINE [FIXTURE]
 }
 
 run_scrub() {  # run_scrub DIR [PROFILE] → exit status
-  : > "$T/console"
+  printf '%s' "${CONSOLE_PREFILL:-}" > "$T/console"
+  rm -f "$T/log.knob" "$T/log.fill-left" "$T/log.fill-checked"
   SHIM_LOG="$T/log" PATH="$T/bin:$PATH" DEV_VM_IMAGE_ROOT="$1" DEV_VM_IMAGE_CONSOLE="$T/console" \
+    SHIM_REMOVE_LIST="${SHIM_REMOVE_LIST-$ROOT/test/fixtures/image-scrub-paths-solo}" \
     "$SCRUB" ${2:+--profile "$2"} "$REV" >"$T/out" 2>&1
 }
 
@@ -155,7 +193,7 @@ check "checks the timers are off before powering off" "$(grep -q 'systemctl is-e
 check "cleans cloud-init with the machine id" "$(grep -q 'cloud-init clean --logs --machine-id' "$T/log"; echo $?)"
 check "powers off last" "$(tail -1 "$T/log" | grep -q '^poweroff'; echo $?)"
 echo "== fleet mode never purges cinc or runs the solo checks =="
-check "no dpkg/visudo/snap/id, no zero-fill in fleet mode" "$(! grep -qE '^(apt-get|dpkg|dpkg-query|visudo|snap|id|dd|sync)( |$)' "$T/log"; echo $?)"
+check "no dpkg/visudo/snap/id, no zero-fill, truncate or shred in fleet mode" "$(! grep -qE '^(apt-get|dpkg|dpkg-query|visudo|snap|id|dd|sync|truncate|shred)( |$)' "$T/log"; echo $?)"
 
 echo "== a unit still enabled at the end means no image =="
 : > "$T/log"; build_root "$R" "2026-10-16T00:00:00Z ok $REV"
@@ -228,6 +266,13 @@ LIST_SOLO="$ROOT/test/fixtures/image-scrub-paths-solo"
 # policy is a `:INPUT DROP` chain header, never a `-P` line).
 seed_solo() {  # seed_solo DIR
   chmod 0755 "$1/usr/local/sbin/idlefy-share"
+  # / is nvme0n1p1 (259:1), with the ext4 reserve at its default; a /proc
+  # with no process holding anything.
+  mkdir -p "$1/sys/block/nvme0n1/nvme0n1p1" "$1/sys/dev/block" "$1/sys/fs/ext4/nvme0n1p1" "$1/proc/1/fd"
+  ln -s ../../block/nvme0n1/nvme0n1p1 "$1/sys/dev/block/259:1"
+  echo 4096 > "$1/sys/fs/ext4/nvme0n1p1/reserved_clusters"
+  # cloud-init's two logs, which it holds open.
+  echo "cloud-init log" > "$1/var/log/cloud-init.log"; echo "output" > "$1/var/log/cloud-init-output.log"
   # `systemctl enable` makes the wants entry a symlink (relative here, so -s
   # can follow it inside the fake root).
   ln -sfn ../idlefy-hardened-firstboot.service \
@@ -286,14 +331,24 @@ SNAPD_PURGE='apt-get purge -y -o DPkg::Lock::Timeout=300 snapd'
 check "purges snapd, waiting for the dpkg lock" "$(grep -qx "$SNAPD_PURGE" "$T/log"; echo $?)"
 check "  …after the SSM snap check and the cinc purge" \
   "$([ "$(lineno '^snap list amazon-ssm-agent')" -lt "$(lineno "^$SNAPD_PURGE\$")" ] && [ "$(lineno "^$PURGE\$")" -lt "$(lineno "^$SNAPD_PURGE\$")" ]; echo $?)"
+FILL1="dd if=/dev/zero of=$R/.idlefy-zero-fill bs=1M oflag=direct status=none"
+FILL2="dd if=/dev/zero of=$R/.idlefy-zero-fill bs=4K oflag=direct,append conv=notrunc status=none"
 check "cloud-init clean, then the zero-fill of /, after every check and before poweroff" \
-  "$(c=$(lineno '^cloud-init clean'); d=$(lineno "^dd if=/dev/zero of=$R/.idlefy-zero-fill bs=1M status=none\$"); \
+  "$(c=$(lineno '^cloud-init clean'); d=$(lineno "^$FILL1\$"); \
      [ -n "$c" ] && [ -n "$d" ] && [ "$(lineno '^visudo -c')" -lt "$c" ] && [ "$(lineno '^id -nG ubuntu')" -lt "$c" ] \
      && [ "$(lineno '^dpkg-query .*cinc$')" -lt "$c" ] && [ "$c" -lt "$d" ] && [ "$d" -lt "$(lineno '^poweroff')" ]; echo $?)"
-check "  …synced, the file removed, synced again" \
-  "$([ "$(grep -c '^sync' "$T/log")" = 2 ] && [ "$(lineno '^dd ')" -lt "$(lineno '^sync')" ] && [ ! -e "$R/.idlefy-zero-fill" ]; echo $?)"
-check "  …and the removals all came before it (nothing on the lists is left)" \
-  "$(! grep -v '^\s*#' "$LIST_SOLO" | awk '$1 == "remove" { print $2 }' | while read -r g; do compgen -G "$R$g" >/dev/null && echo left; done | grep -q left; echo $?)"
+check "  …synced first; 1 MiB pass, 4 KiB pass, the file fsynced, removed, synced again" \
+  "$(a=$(lineno '^sync *$'); d=$(lineno "^$FILL1\$"); e=$(lineno "^$FILL2\$"); f=$(lineno "^sync -- $R/.idlefy-zero-fill\$"); \
+     g=$(grep -n '^sync *$' "$T/log" | tail -1 | cut -d: -f1); \
+     [ -n "$a" ] && [ -n "$e" ] && [ -n "$f" ] && [ "$a" -lt "$d" ] && [ "$d" -lt "$e" ] && [ "$e" -lt "$f" ] && [ "$f" -lt "$g" ] \
+     && [ "$(grep -c '^sync' "$T/log")" = 3 ] && [ ! -e "$R/.idlefy-zero-fill" ]; echo $?)"
+check "  …with the ext4 reserve at 0 during both passes, and 4096 again after" \
+  "$([ "$(tr '\n' ' ' < "$T/log.knob")" = "0 0 " ] && [ "$(cat "$R/sys/fs/ext4/nvme0n1p1/reserved_clusters")" = 4096 ]; echo $?)"
+check "  …and when the fill began nothing on the removal list was left" \
+  "$([ -e "$T/log.fill-checked" ] && [ ! -e "$T/log.fill-left" ]; echo $?)"
+check "  …cloud-init's two open logs truncated before its clean" \
+  "$(c=$(lineno '^cloud-init clean'); for l in cloud-init.log cloud-init-output.log; do \
+       between "$(lineno "^truncate -s 0 -- $R/var/log/$l\$")" 0 "$c" && [ -e "$R/var/log/$l" ] && [ ! -s "$R/var/log/$l" ] || exit 1; done; echo 0)"
 check "  …then cleans apt's cache" "$([ "$(lineno "^$SNAPD_PURGE\$")" -lt "$(lineno '^apt-get clean$')" ]; echo $?)"
 check "checks snapd and an SSM package are gone after the purge" \
   "$(between "$(lineno '^dpkg-query .*snapd$')" "$(lineno "^$SNAPD_PURGE\$")" "$(lineno 'cloud-init clean')" \
@@ -352,11 +407,13 @@ solo_refuses "rules.v4 truncated before COMMIT" "rules.v4" "printf '%s\n' '*filt
 # drop sits; owner-matched accepts (base::imds: root, Instance Connect) do not,
 # and an accept after the drop never fires for that address.
 # solo_passes "LABEL" "MUTATION" — the scrub exits 0 and powers off.
-solo_passes() {
-  local label=$1 mutate=$2 got
+solo_passes() {  # solo_passes LABEL MUTATION [VAR=VALUE…]
+  local label=$1 mutate=$2 got; shift 2
   build_root "$R" "2026-11-01T00:00:00Z ok $REV" "$LIST_SOLO"; seed_solo "$R"; : > "$T/log"
   ( cd "$R" && eval "$mutate" )
-  ( export DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$FIRSTBOOT"; run_scrub "$R" solo ); got=$?
+  ( export DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$FIRSTBOOT"
+    for kv in "$@"; do export "${kv?}"; done
+    run_scrub "$R" solo ); got=$?
   check "$label → exit 0, powers off" "$([ "$got" = 0 ] && tail -1 "$T/log" | grep -q '^poweroff'; echo $?)"
 }
 # Before the drop only an allowlist may stand: root's and Instance Connect's
@@ -409,6 +466,31 @@ solo_refuses "SSM snap file though snap list fails"    "amazon-ssm-agent" \
   "rm var/lib/snapd && mkdir -p var/lib/snapd/snaps && echo x > var/lib/snapd/snaps/amazon-ssm-agent_1234.snap"
 check "  …and snapd was not purged first" "$(! grep -q '^apt-get purge .* snapd$' "$T/log"; echo $?)"
 solo_refuses "snapd purge fails"            "snapd purge failed" ":" SHIM_SNAPD_PURGE_RC=1
+solo_refuses "an empty dpkg database (dpkg itself unknown)" "does not show dpkg itself installed" ":" SHIM_DPKG_DB_EMPTY=1
+KEYDIR=var/lib/snapd/device/private-keys-v1
+solo_passes "snapd's device key is shredded, then snapd purged" \
+  "rm var/lib/snapd && mkdir -p $KEYDIR && echo key > $KEYDIR/k1"
+check "  …shred -u on the key, before the snapd purge" \
+  "$([ -n "$(lineno "^shred -u -- $R/$KEYDIR/k1\$")" ] && [ "$(lineno "^shred -u")" -lt "$(lineno '^apt-get purge .* snapd$')" ]; echo $?)"
+solo_passes "a failed shred is only a note" "rm var/lib/snapd && mkdir -p $KEYDIR && echo key > $KEYDIR/k1" SHIM_SHRED_RC=1
+check "  …named on the console" "$(grep -qF 'note: shred of the snapd device key failed' "$T/console"; echo $?)"
+solo_passes "no snapd key directory: no shred, no refusal" ":"
+check "  …shred never ran" "$(! grep -q '^shred' "$T/log"; echo $?)"
+# The serial console may sit at an unterminated getty prompt; a refusal
+# starts its own line all the same.
+# The test's console file is truncated by every write; a real console is a
+# device. A FIFO with one reader stands in for it here.
+build_root "$R" "2026-11-01T00:00:00Z ok $REV" "$LIST_SOLO"; seed_solo "$R"; : > "$T/log"
+rm -f "$T/cons.fifo"; mkfifo "$T/cons.fifo"; printf 'ip-10-0-1-5 login: ' > "$T/cons.seen"
+cat "$T/cons.fifo" >> "$T/cons.seen" & catpid=$!
+exec 9>"$T/cons.fifo"   # held open: the reader sees one stream, not one per write
+SHIM_LOG="$T/log" PATH="$T/bin:$PATH" DEV_VM_IMAGE_ROOT="$R" DEV_VM_IMAGE_CONSOLE="$T/cons.fifo" \
+  DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$FIRSTBOOT" SHIM_UBUNTU_GROUPS="ubuntu sudo" \
+  "$SCRUB" --profile solo "$REV" > /dev/null 2>&1; got=$?
+exec 9>&-; wait "$catpid"
+check "a solo refusal right after an unterminated login prompt → exit 70, on a line of its own" \
+  "$([ "$got" = 70 ] && [ "$(head -n 1 "$T/cons.seen")" = "ip-10-0-1-5 login: " ] \
+     && grep -qx 'dev-vm-image-scrub: internal error: ubuntu is in group sudo; no image will be taken' "$T/cons.seen"; echo $?)"
 solo_refuses "apt-get clean fails"          "apt-get clean failed" ":" SHIM_CLEAN_RC=1
 solo_refuses "snapd still installed"        "snapd still installed" ":" SHIM_SNAPD_STILL_INSTALLED=1
 solo_refuses "an SSM agent package"         "amazon-ssm-agent still installed" ":" SHIM_SSM_DEB_INSTALLED=1
@@ -422,33 +504,69 @@ solo_refuses "a user unit left: snapd.session-agent.socket" "snap or SSM units a
   "mkdir -p usr/lib/systemd/user && touch usr/lib/systemd/user/snapd.session-agent.socket"
 solo_refuses "a user enablement link left" "snap or SSM units are left" \
   "mkdir -p etc/systemd/user/sockets.target.wants && ln -s /usr/lib/systemd/user/snapd.session-agent.socket etc/systemd/user/sockets.target.wants/snapd.session-agent.socket"
-solo_refuses "a unit directory find cannot read" "cannot scan /etc/systemd/user" \
-  "mkdir -p etc/systemd/user/x" SHIM_FIND_FAIL=etc/systemd/user
-solo_refuses "an account's unit directory find cannot read" "cannot scan /home/ubuntu/.config/systemd/user" \
-  "mkdir -p home/ubuntu/.config/systemd/user" SHIM_FIND_FAIL=home/ubuntu/.config/systemd/user
+solo_refuses "find cannot scan /" "cannot scan / for snap or SSM units" ":" SHIM_FIND_FAIL=1
 for u in usr/local/lib/systemd/system/snapd.service \
          usr/local/lib/systemd/user/snapd.session-agent.socket \
          root/.config/systemd/user/snap.foo.bar.service \
          home/ubuntu/.config/systemd/user/amazon-ssm-agent.service \
-         home/someone-else/.config/systemd/user/default.target.wants/snap.lxd.daemon.service; do
+         home/someone-else/.config/systemd/user/default.target.wants/snap.lxd.daemon.service \
+         home/ubuntu/.local/share/systemd/user/snap.x.y.service \
+         etc/xdg/systemd/user/snapd.session-agent.socket \
+         usr/share/systemd/user/snap.z.timer \
+         var/lib/somewhere/snap-core22-1.target \
+         etc/systemd/system/snapd.apparmor.path; do
   solo_refuses "a unit left: /$u" "snap or SSM units are left" "mkdir -p \"\$(dirname $u)\" && touch $u"
 done
 solo_passes "rootless Docker's user unit (~ubuntu/.config/systemd/user/docker.service) is not a snap unit" \
   "mkdir -p home/ubuntu/.config/systemd/user/default.target.wants && touch home/ubuntu/.config/systemd/user/docker.service && ln -s ../docker.service home/ubuntu/.config/systemd/user/default.target.wants/docker.service"
 solo_passes "a directory named like a unit is not a unit" "mkdir -p etc/systemd/system/snap.d-not-a-unit"
+# Links are matched as links and never followed: a unit behind a linked
+# directory is found where it really lies.
+solo_refuses "a unit behind a linked directory is found at its real path" "opt/units/snap.q.service" \
+  "mkdir -p opt/units etc/systemd && touch opt/units/snap.q.service && ln -s ../../opt/units etc/systemd/linked"
+mkdir -p "$T/elsewhere"; touch "$T/elsewhere/snap.r.service"
+solo_passes "a link to a directory off the root filesystem is not followed" \
+  "mkdir -p etc/systemd && ln -s \"$T/elsewhere\" etc/systemd/elsewhere"
+check "the unit scan is one find over / with -xdev, excluding nothing by name" \
+  "$(b=$(sed -n '/^no_units_left() {/,/^}/p' "$SOLO"); grep -qF 'find "$R/" -xdev' <<< "$b" && ! grep -qE -- '-prune|-path|-wholename|-regex|-not' <<< "$b"; echo $?)"
 # A failed fill refuses after cloud-init clean has run (it must free its
 # files before the fill), so these check the rest by hand.
-fill_refuses() {  # fill_refuses LABEL CONSOLE MODE
-  local got
+fill_refuses() {  # fill_refuses LABEL CONSOLE MUTATION [VAR=VALUE…]
+  local label=$1 want=$2 mutate=$3 got; shift 3
   build_root "$R" "2026-11-01T00:00:00Z ok $REV" "$LIST_SOLO"; seed_solo "$R"; : > "$T/log"
-  ( export DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$FIRSTBOOT" SHIM_DD="$3"; run_scrub "$R" solo ); got=$?
-  check "$1 → exit 70, console names it, no poweroff" \
-    "$([ "$got" = 70 ] && grep -qF -- "$2" "$T/console" && ! grep -q '^poweroff' "$T/log"; echo $?)"
+  ( cd "$R" && eval "$mutate" )
+  ( export DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$FIRSTBOOT"
+    for kv in "$@"; do export "${kv?}"; done
+    run_scrub "$R" solo ); got=$?
+  check "$label → exit 70, console names it, no poweroff" \
+    "$([ "$got" = 70 ] && grep -qF -- "$want" "$T/console" && ! grep -q '^poweroff' "$T/log"; echo $?)"
 }
-fill_refuses "the fill ends on another write error" "did not end on a full filesystem" other
-fill_refuses "the fill ends without an error"       "did not end on a full filesystem" ok
-fill_refuses "the fill writes nothing"              "wrote nothing" empty
-fill_refuses "the fill file cannot be removed"      "zero-fill file /.idlefy-zero-fill is still on disk" stuck
+fill_refuses "the fill ends on another write error" "did not end on a full filesystem" : SHIM_DD=other
+check "  …and the ext4 reserve is put back" "$([ "$(cat "$R/sys/fs/ext4/nvme0n1p1/reserved_clusters")" = 4096 ]; echo $?)"
+fill_refuses "the fill ends without an error"       "did not end on a full filesystem" : SHIM_DD=ok
+fill_refuses "the fill writes nothing"              "wrote nothing" : SHIM_DD=empty
+fill_refuses "the fill file cannot be removed"      "zero-fill file /.idlefy-zero-fill is still on disk" : SHIM_DD=stuck
+fill_refuses "the 4 KiB pass ends on another error" "(4 KiB pass) did not end on a full filesystem" : SHIM_DD_TAIL=other
+fill_refuses "the 4 KiB pass ends without an error" "(4 KiB pass) did not end on a full filesystem" : SHIM_DD_TAIL=ok
+fill_refuses "the fsync of the fill file fails"     "fsync of the zero-fill file failed" : SHIM_FSYNC_RC=1
+check "  …and the file is not left on disk" "$([ ! -e "$R/.idlefy-zero-fill" ]; echo $?)"
+fill_refuses "more than 1 MiB of / left free while the fill file exists" "the zero-fill left 1052672 bytes of / free" : SHIM_STATFS="4096 257"
+fill_refuses "the free space of / cannot be read"   "cannot read the free space of /" : SHIM_STATFS=fail
+fill_refuses "no device for /"                      "cannot find the ext4 reserved_clusters" : SHIM_NO_MOUNTPOINT=1
+fill_refuses "/ is not ext4 (no ext4 sysfs entry)"  "cannot find the ext4 reserved_clusters" "rm -r sys/fs/ext4/nvme0n1p1"
+fill_refuses "an unreadable ext4 reserve"           "cannot read $R/sys/fs/ext4/nvme0n1p1/reserved_clusters" "echo none > sys/fs/ext4/nvme0n1p1/reserved_clusters"
+fill_refuses "the ext4 reserve cannot be set to 0"  "cannot write 0 to" : SHIM_KNOB_RO=1
+check "  …and no fill ran" "$(! grep -q '^dd ' "$T/log"; echo $?)"
+fill_refuses "a deleted file still held open by a process" "files deleted but still open would be freed only at power-off" \
+  "mkdir -p proc/4242/fd && echo secret > 'var/log/held (deleted)' && ln -s \"\$PWD/var/log/held (deleted)\" proc/4242/fd/3 && echo bash > proc/4242/comm"
+check "  …naming the file and its holder, before any fill" \
+  "$(grep -qF '/var/log/held (7 bytes, pid 4242 bash)' "$T/console" && ! grep -q '^dd ' "$T/log"; echo $?)"
+fill_refuses "no /proc to read"                     "cannot read /proc" "rm -r proc"
+solo_passes "a deleted, open, empty file (truncated) does not refuse" \
+  "mkdir -p proc/4242/fd && : > 'var/log/held (deleted)' && ln -s \"\$PWD/var/log/held (deleted)\" proc/4242/fd/3"
+solo_passes "an open file that is not deleted does not refuse" \
+  "mkdir -p proc/4242/fd && echo x > var/log/open && ln -s \"\$PWD/var/log/open\" proc/4242/fd/3"
+solo_passes "exactly 1 MiB left free passes" ":" SHIM_STATFS="4096 256"
 chmod -R u+rwx "$R" 2>/dev/null || true
 for u in etc/systemd/system/snap-core22-1380.mount etc/systemd/system/multi-user.target.wants/snap-lxd-1.mount \
          usr/lib/systemd/system/snapd.service etc/systemd/system/snap.amazon-ssm-agent.amazon-ssm-agent.service \
@@ -467,6 +585,17 @@ for gone in /var/lib/snapd /snap; do
   check "a list without $gone → exit 70, named, no poweroff" \
     "$([ "$got" = 70 ] && grep -qF "$gone is still on disk after the snapd purge" "$T/console" && ! grep -q '^poweroff' "$T/log"; echo $?)"
 done
+# The removal check inside the dd shim catches a list that lost a line the
+# solo checks do not look at (here /var/log/apt/*, in the shared scrub's list
+# too, so the test copy drops it from both).
+mkdir -p "$T/nolist"
+grep -vF '"/var/log/apt/*"' "$SCRUB" > "$T/nolist/dev-vm-image-scrub"; chmod +x "$T/nolist/dev-vm-image-scrub"
+grep -vF '"/var/log/apt/*"' "$SOLO" > "$T/nolist/dev-vm-image-scrub-solo"
+build_root "$R" "2026-11-01T00:00:00Z ok $REV" "$LIST_SOLO"; seed_solo "$R"; : > "$T/log"
+( SCRUB="$T/nolist/dev-vm-image-scrub"; export DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$FIRSTBOOT"
+  run_scrub "$R" solo )
+check "a list without /var/log/apt/* → the fill-time check names it (the check can fail)" \
+  "$([ "$(cat "$T/log.fill-left" 2>/dev/null)" = '/var/log/apt/*' ]; echo $?)"
 solo_refuses "no /etc/dev-vm"               "/etc/dev-vm"        "rm -r etc/dev-vm"
 check "  …and no image-revision written" "$(rc [ ! -e "$R/etc/dev-vm/image-revision" ])"
 
@@ -512,6 +641,19 @@ check "solo file: no DEV_VM_IMAGE_SCRUB line" "$(! grep -qx 'DEV_VM_IMAGE_SCRUB'
 check "solo file: ends in a newline" "$([ -s "$SOLO" ] && [ "$(tail -c1 "$SOLO" | od -An -c | tr -d ' ')" = '\n' ]; echo $?)"
 # ---- bootstrap-solo: the build's user data ----------------------------------------
 BOOT="$ROOT/image/files/bootstrap-solo"
+# The banner after an unterminated getty prompt: bootstrap_failed as written,
+# its console and log paths pointed at the test (a FIFO stands in for the
+# console device, which a write never truncates).
+rm -f "$T/cons.fifo"; mkfifo "$T/cons.fifo"; printf 'ip-10-0-1-5 login: ' > "$T/cons.seen"; echo "E: oops" > "$T/ud.log"
+cat "$T/cons.fifo" >> "$T/cons.seen" & catpid=$!
+exec 9>"$T/cons.fifo"
+( fn=$(sed -n '/^bootstrap_failed() {$/,/^}$/p' "$BOOT")
+  fn=${fn//\/dev\/console/$T/cons.fifo}; fn=${fn//\/var\/log\/user-data.log/$T/ud.log}
+  eval "$fn"; bootstrap_failed )
+exec 9>&-; wait "$catpid"
+check "bootstrap-solo's banner after an unterminated login prompt is a line of its own" \
+  "$([ "$(head -n 1 "$T/cons.seen")" = "ip-10-0-1-5 login: " ] && grep -qx 'BOOTSTRAP FAILED: no image will be taken. Log follows.' "$T/cons.seen" \
+     && grep -qx 'E: oops' "$T/cons.seen"; echo $?)"
 UD="$ROOT/vms/modules/ec2/user_data.tf"
 echo "== bootstrap-solo: the contracts Packer and the scrub depend on =="
 check "parses (bash -n)" "$(bash -n "$BOOT" 2>/dev/null; echo $?)"

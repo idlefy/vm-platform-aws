@@ -88,6 +88,7 @@ remove /var/snap                                             # per-snap data
 remove /var/cache/snapd                                      # snapd's cache
 remove /root/snap                                            # per-user snap data
 remove /home/*/snap                                          # per-user snap data
+remove /var/cache/apparmor/*/snap-confine*                   # snap-confine's compiled AppArmor profiles, left by the purge (measured)
 
 # --- what the image is for ---------------------------------------------------------
 keep   /usr/share/dev-vm/home/.zshrc                         # base's staged home files

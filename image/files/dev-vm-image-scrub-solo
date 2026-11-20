@@ -67,6 +67,7 @@ REMOVE_SOLO=(
   "/var/cache/snapd" # snapd's cache
   "/root/snap" # per-user snap data
   "/home/*/snap" # per-user snap data
+  "/var/cache/apparmor/*/snap-confine*" # snap-confine's compiled AppArmor profiles, left by the purge (measured)
 )
 EMPTY_SOLO=(
   "/etc/machine-id" # systemd/journald identity; /var/lib/dbus/machine-id links here
@@ -81,8 +82,15 @@ EMPTY_SOLO=(
   "/var/log/dmesg" # the build's boot messages
 )
 
-# refuse WHAT: the same shape as the scrub's timer check before poweroff.
+# refuse WHAT: the same shape as the scrub's timer check before poweroff. A
+# newline first: the serial console may sit at an unterminated getty prompt
+# ("host login: "), and the build driver matches refusals at a line's start.
+# A refusal during the zero-fill puts the ext4 reserve back first (best
+# effort: the instance is terminated with its disk anyway).
+RESV_KNOB="" RESV_SAVED=""
 refuse() {
+  [ -z "$RESV_KNOB" ] || printf '%s\n' "$RESV_SAVED" > "$RESV_KNOB" 2>/dev/null || true
+  { echo > "$CONSOLE"; } 2>/dev/null || true
   log "internal error: $*; no image will be taken"
   exit 70
 }
@@ -115,6 +123,12 @@ solo_prep() {
   # snapd leaves: its state holds a device key and serial made on the build
   # instance, which every box would share; ubuntu has no sudo, so only the
   # admin could use snap at all (ruling 2026-11-20). solo_check proves it gone.
+  # A second defence for that key, beside the zero-fill: overwrite it in
+  # place before the purge unlinks it (ext4 rewrites a file's own blocks).
+  # Best effort, never a refusal; no key directory is fine.
+  if compgen -G "$R/var/lib/snapd/device/private-keys-v1/*" >/dev/null; then
+    shred -u -- "$R"/var/lib/snapd/device/private-keys-v1/* || log "note: shred of the snapd device key failed; the purge and the zero-fill still run"
+  fi
   DEBIAN_FRONTEND=noninteractive apt-get purge -y -o DPkg::Lock::Timeout=300 snapd \
     || refuse "snapd purge failed"
   # The package cache (321 MB on the first build); the lists stay.
@@ -156,6 +170,17 @@ meta_preamble_ok() {
     END         { exit bad }' "$R$1" 2>/dev/null
 }
 
+# dpkg_sane: dpkg's database knows dpkg itself as installed. An empty or
+# missing database answers "no packages found" for everything, which
+# pkg_absent would read as absence.
+dpkg_sane() {
+  local said
+  # shellcheck disable=SC2016 # dpkg-query's format, not a shell expansion
+  said=$(LC_ALL=C dpkg-query -W -f='${db:Status-Status}' dpkg 2>&1) \
+    && [ "$said" = installed ] \
+    || refuse "dpkg's database does not show dpkg itself installed (dpkg-query: '$(printf '%s' "$said" | head -n 1)'), so its answers prove nothing"
+}
+
 # pkg_absent NAME: dpkg knows no such package (dpkg-query exits 1 saying "no
 # packages found matching"), or knows it as not-installed (what a purge
 # leaves). Any other answer — installed, half-installed, config-files, an
@@ -174,54 +199,113 @@ pkg_absent() {
   esac
 }
 
-# no_units_left: no unit file or enablement link of snapd, a snap or the SSM
-# agent in any system or user unit directory: the distribution's, the local
-# administrator's (/usr/local/lib), /etc's, and each account's own
-# (~/.config/systemd/user, for /root and every directory under /home — read
-# from the disk, not from a list of names). A directory that is absent is
-# skipped by name; one find cannot read refuses.
+# no_units_left: no unit-shaped file or link of snapd, a snap or the SSM agent
+# anywhere on the root filesystem — not a list of unit directories (every
+# review found another search path; systemd reads units from many, and a
+# user's own). One find over / with -xdev: it stays on the filesystem the
+# snapshot images (/proc, /sys, /dev and /run are other filesystems on the
+# instance, so -xdev, not a name, leaves them out; nothing is excluded by
+# name). Links are matched as links and never followed: a unit behind a
+# linked directory is found where it really lies, on this filesystem. A
+# find error refuses.
 no_units_left() {
-  local d hits dirs=(/etc/systemd/system /lib/systemd/system /usr/lib/systemd/system
-                     /usr/local/lib/systemd/system /etc/systemd/user /lib/systemd/user
-                     /usr/lib/systemd/user /usr/local/lib/systemd/user)
-  for d in "$R/root" "$R"/home/*; do
-    [ -d "$d" ] || continue
-    dirs+=("${d#"$R"}/.config/systemd/user")
-  done
-  for d in "${dirs[@]}"; do
-    [ -e "$R$d" ] || [ -L "$R$d" ] || continue
-    hits=$(find "$R$d" \( -type f -o -type l \) \
-             \( -name 'snap-*.mount' -o -name 'snapd.*' -o -name 'snap.*' -o -name 'amazon-ssm-agent*' \) -print) \
-      || refuse "cannot scan $d for snap or SSM units"
-    [ -z "$hits" ] || refuse "snap or SSM units are left: $(printf '%s' "$hits" | head -n 3 | tr '\n' ' ')"
-  done
+  local hits
+  hits=$(find "$R/" -xdev \( -type f -o -type l \) \
+           \( -name 'snap*.service' -o -name 'snap*.socket' -o -name 'snap*.mount' -o -name 'snap*.timer' \
+              -o -name 'snap*.target' -o -name 'snap*.path' -o -name 'amazon-ssm-agent*' \) -print) \
+    || refuse "cannot scan / for snap or SSM units"
+  [ -z "$hits" ] || refuse "snap or SSM units are left: $(printf '%s' "$hits" | head -n 3 | tr '\n' ' ')"
 }
 
-# zero_fill: overwrite the free space of / with zeros, so no block a removal
-# freed (the snapd device key, the build's logs, cloud-init's state) reaches
-# the public snapshot with its old contents. EBS root volumes accept no
-# discard (measured: "fstrim: /: the discard operation is not supported"),
-# so trimming frees nothing in a snapshot. One file is written until the
-# filesystem is full — root writes into the reserved blocks too — then
-# synced and removed. Fails closed: the fill must end with "No space left on
-# device" after writing something, and the file must be gone afterwards.
+# no_deleted_open: no process holds a deleted regular file of non-zero size on
+# the root filesystem. Its blocks are freed only when the last holder closes
+# it — at power-off, after the zero-fill — so they reach the snapshot as they
+# were. Strict on purpose: the build is the place to find a new holder.
+no_deleted_open() {
+  local fd tgt info typ size dev rootdev pid hits=""
+  rootdev=$(stat -c %d "$R/") || refuse "cannot stat /"
+  [ -d "$R/proc/1/fd" ] || refuse "cannot read /proc"
+  for fd in "$R"/proc/[0-9]*/fd/*; do
+    tgt=$(readlink "$fd" 2>/dev/null) || continue   # the process or fd is gone
+    [[ $tgt == *" (deleted)" ]] || continue
+    info=$(stat -L -c '%F|%s|%d' "$fd" 2>/dev/null) || continue
+    IFS='|' read -r typ size dev <<< "$info"
+    [ "$typ" = "regular file" ] && [ "$size" -gt 0 ] && [ "$dev" = "$rootdev" ] || continue
+    pid=${fd#"$R"/proc/}; pid=${pid%%/*}
+    hits+="${tgt% (deleted)} ($size bytes, pid $pid $(cat "$R/proc/$pid/comm" 2>/dev/null || true)); "
+  done
+  [ -z "$hits" ] || refuse "files deleted but still open would be freed only at power-off, after the zero-fill: $hits"
+}
+
+# resv_knob: the ext4 reserved_clusters file of the filesystem holding /.
+resv_knob() {
+  local majmin dev
+  majmin=$(mountpoint -d "$R/") || return 1
+  dev=$(readlink -f "$R/sys/dev/block/$majmin") || return 1
+  dev=${dev##*/}
+  [ -n "$dev" ] && [ -f "$R/sys/fs/ext4/$dev/reserved_clusters" ] || return 1
+  printf '%s\n' "$R/sys/fs/ext4/$dev/reserved_clusters"
+}
+
+# zero_fill: overwrite the free space of / with zeros, so blocks a removal
+# freed (the snapd device key, the build's logs, cloud-init's state) reach
+# the public snapshot as zeros. Defence in depth, not the guarantee: the
+# guarantee is that nothing secret is written to the build disk. What the
+# fill cannot reach — the unused tail of a file's last block, directory
+# entries, inode and other metadata blocks, the ext4 journal, and the other
+# partitions (/boot, /boot/efi) — is listed in docs/design/hardened-image.md.
+# EBS root volumes accept no discard (measured), so a trim frees nothing.
+#   - ext4 keeps up to 16 MiB (reserved_clusters) even from root; it is set to
+#     0 for the fill and put back after;
+#   - the fill writes with O_DIRECT, so ext4 allocates blocks (and the file's
+#     extent tree) at write time and ENOSPC comes back to dd, never later at
+#     writeback; 1 MiB writes, then 4 KiB writes for the last partial MiB;
+#   - while the file exists, at most ZERO_FILL_MAX_FREE may be left free;
+#   - the file is fsynced with its error checked (`sync FILE`; a bare sync
+#     reports none), then removed and the removal synced.
+# Fails closed: each pass must end with "No space left on device", the first
+# after writing something, and the file must be gone afterwards.
 # Nothing else writes to / at this point: journald is on /run, the scrub
 # logs to the console, and the services that write were stopped earlier.
 ZERO_FILL=/.idlefy-zero-fill
+# 1 MiB: after the 4 KiB pass, free space is only what ext4 keeps for the
+# fill file's own extent tree — a few 4 KiB blocks. 256 blocks is generous
+# for that, and 16 times below the reserve the fill no longer leaves.
+ZERO_FILL_MAX_FREE=1048576
 zero_fill() {
-  local f="$R$ZERO_FILL" out rc=0 size
-  rm -f -- "$f"
-  out=$(LC_ALL=C dd if=/dev/zero of="$f" bs=1M status=none 2>&1) || rc=$?
+  local f="$R$ZERO_FILL" out rc=0 size knob saved bsize bfree
+  knob=$(resv_knob) || refuse "cannot find the ext4 reserved_clusters of / under /sys/fs/ext4"
+  saved=$(cat "$knob" 2>/dev/null) && [[ $saved =~ ^[0-9]+$ ]] || refuse "cannot read $knob"
+  sync || refuse "sync before the zero-fill failed"
+  rm -f -- "$f" || true
+  printf '0\n' | tee "$knob" >/dev/null || refuse "cannot write 0 to $knob"
+  RESV_KNOB=$knob RESV_SAVED=$saved
+  out=$(LC_ALL=C dd if=/dev/zero of="$f" bs=1M oflag=direct status=none 2>&1) || rc=$?
   if [ "$rc" -eq 0 ] || [[ $out != *"No space left on device"* ]]; then
-    rm -f -- "$f"
+    rm -f -- "$f" || true
     refuse "zero-fill of / did not end on a full filesystem (dd exit $rc: ${out:-no message})"
   fi
   size=$(stat -c %s "$f" 2>/dev/null) || size=0
-  if [ "$size" -le 0 ]; then rm -f -- "$f"; refuse "zero-fill of / wrote nothing"; fi
-  sync || { rm -f -- "$f"; refuse "sync after the zero-fill failed"; }
+  if [ "$size" -le 0 ]; then rm -f -- "$f" || true; refuse "zero-fill of / wrote nothing"; fi
+  rc=0
+  out=$(LC_ALL=C dd if=/dev/zero of="$f" bs=4K oflag=direct,append conv=notrunc status=none 2>&1) || rc=$?
+  if [ "$rc" -eq 0 ] || [[ $out != *"No space left on device"* ]]; then
+    rm -f -- "$f" || true
+    refuse "zero-fill of / (4 KiB pass) did not end on a full filesystem (dd exit $rc: ${out:-no message})"
+  fi
+  out=$(sync -- "$f" 2>&1) || { rm -f -- "$f" || true; refuse "fsync of the zero-fill file failed: ${out:-no message}"; }
+  read -r bsize bfree < <(stat -f -c '%S %f' "$R/" 2>/dev/null) || true
+  if [[ ! $bsize =~ ^[0-9]+$ ]] || [[ ! $bfree =~ ^[0-9]+$ ]]; then
+    rm -f -- "$f" || true; refuse "cannot read the free space of / after the zero-fill"
+  fi
+  if [ $((bsize * bfree)) -gt "$ZERO_FILL_MAX_FREE" ]; then
+    rm -f -- "$f" || true; refuse "the zero-fill left $((bsize * bfree)) bytes of / free (at most $ZERO_FILL_MAX_FREE expected)"
+  fi
   rm -f -- "$f" || true   # checked below
   sync || refuse "sync after removing the zero-fill failed"
   [ ! -e "$f" ] && [ ! -L "$f" ] || refuse "the zero-fill file $ZERO_FILL is still on disk"
+  printf '%s\n' "$saved" | tee "$knob" >/dev/null || refuse "cannot restore $knob to $saved"
+  RESV_KNOB=""
 }
 
 # Hook 3, immediately before the shared scrub's cloud-init clean, on the disk
@@ -283,6 +367,7 @@ solo_check() {
   # 7. snapd is gone, and with it every snap and the SSM agent (its snap was
   #    checked gone in solo_prep): the package, its state, and every unit a
   #    snap or snapd installs. No SSM agent as a package either.
+  dpkg_sane
   for f in snapd amazon-ssm-agent; do
     pkg_absent "$f" || refuse "$f still installed, or dpkg cannot say (dpkg-query: '${PKG_SAID:-?}')"
   done
@@ -300,6 +385,14 @@ solo_check() {
   #     state, its copy of the user data, its logs) is freed before the fill
   #     and overwritten by it; the shared scrub's own clean then finds
   #     nothing left to delete. A refusal from here on comes after the clean.
+  #     cloud-init holds its two logs open (its log handler, its output tee):
+  #     deleting them frees nothing until power-off, but truncating does.
+  #     The user data's own script is not held: its last line execs this
+  #     scrub, which drops bash's close-on-exec hold on it.
+  for f in /var/log/cloud-init.log /var/log/cloud-init-output.log; do
+    [ ! -f "$R$f" ] || truncate -s 0 -- "$R$f" || refuse "cannot truncate $f"
+  done
   cloud-init clean --logs --machine-id || refuse "cloud-init clean failed"
+  no_deleted_open
   zero_fill
 }
