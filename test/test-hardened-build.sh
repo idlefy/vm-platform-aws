@@ -29,7 +29,9 @@
 # status of that condition, or of that run, is the thing being checked.
 # shellcheck disable=SC2181,SC2319
 
-set -uo pipefail
+# -e for the setup only: a failed copy or shim must stop the run before
+# any script runs. The checks below run without it.
+set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PASS=0; FAIL=0
 check() { if [ "$2" = "0" ]; then PASS=$((PASS+1)); echo "  ok   $1"; else FAIL=$((FAIL+1)); echo "  FAIL $1"; fi; }
@@ -156,9 +158,21 @@ echo "1697000001,amazon-ebs.hardened,artifact,0,id,$ids"
 exit "${PACKER_RC:-0}"
 SH
 chmod +x "$T/bin/"*
+# No test may reach a real cloud CLI: each name below must resolve to its
+# shim, or the run stops here.
+shimmed() {
+  local dir=$1 c; shift
+  for c in "$@"; do
+    [ "$(PATH="$dir:$PATH" command -v "$c")" = "$dir/$c" ] \
+      || { echo "setup: $c does not resolve to the shim in $dir — stopping" >&2; exit 1; }
+  done
+}
+shimmed "$T/bin" aws gh packer chef
+set +e
 
 # run_build — runs the driver with the shims; returns its status.
 run_build() {
+  shimmed "$T/bin" aws gh packer chef
   rm -rf "$T/state" "$T/out" "$T/ud.gz"; mkdir -p "$T/state"
   : > "$T/chef.log"; : > "$T/gh.log"; : > "$T/gh.log.repo"; : > "$T/aws.log"; : > "$T/packer.log"; : > "$T/order.log"
   local e=(PATH="$T/bin:$PATH" CHEF_LOG="$T/chef.log" GH_LOG="$T/gh.log" AWS_LOG="$T/aws.log"
@@ -253,15 +267,16 @@ import json, re, sys
 p, sha, psha, url, date, *regions = sys.argv[1:]
 raw = open(p, encoding="utf-8").read()
 d = json.loads(raw)
-want = {"format", "image", "name", "owner_id", "architecture", "public", "root_volume_gib", "login_user",
-        "platform_tag", "platform_sha", "base_tag", "archive_sha256", "archive_url", "built_at", "amis"}
-assert set(d) == want and len(want) == 15, sorted(d)
+want = {"format", "image", "name", "owner_id", "architecture", "public", "description", "root_volume_gib",
+        "login_user", "platform_tag", "platform_sha", "base_tag", "archive_sha256", "archive_url", "built_at", "amis"}
+assert set(d) == want and len(want) == 16, sorted(d)
 assert list(d) == sorted(d) and list(d["amis"]) == sorted(d["amis"]), "keys not sorted"
 assert raw.endswith("\n")
 assert d["format"] == 1 and d["image"] == "ubuntu-24.04-hardened"
 assert d["name"] == "idlefy-hardened-agent-ubuntu-24.04-amd64-%s-01" % date
 assert d["owner_id"] == "995603458290" and d["architecture"] == "x86_64"
 assert d["public"] is True and d["root_volume_gib"] == 20 and d["login_user"] == "ubuntu"
+assert d["description"] == "Idlefy hardened image for AI agents; visibility=public", d["description"]
 assert d["platform_tag"] == "v2.2.0" and d["platform_sha"] == psha and d["base_tag"] == "base-2.1.0"
 assert d["archive_sha256"] == sha and d["archive_url"] == url
 assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", d["built_at"])
@@ -428,6 +443,8 @@ echo "== public=false and an attached org =="
 PUBLIC=false ORG=0b7c3c1e-5f0e-4b8e-9a51-3f0c2d1e4a5b run_build; check "exits 0" "$?"
 check "packer var public=false" "$(var public=false; echo $?)"
 check "record public: false" "$(python3 -I -c 'import json,sys; sys.exit(json.load(open(sys.argv[1]))["public"] is not False)' "$RECORD"; echo $?)"
+check "record description says visibility=private" \
+  "$(python3 -I -c 'import json,sys; sys.exit(json.load(open(sys.argv[1]))["description"] != "Idlefy hardened image for AI agents; visibility=private")' "$RECORD"; echo $?)"
 check "attached_org_id is passed" "$(var attached_org_id=0b7c3c1e-5f0e-4b8e-9a51-3f0c2d1e4a5b; echo $?)"
 
 echo "== malformed input refuses before chef =="
@@ -462,6 +479,26 @@ NO_TODAY=1 SKIP_TAG= run_build; refuses_early $? "a PLATFORM_SHA the tag does no
 NO_TODAY=1 SKIP_TAG=false run_build; refuses_early $? "HARDENED_SKIP_TAG_CHECK=false still checks the tag" PLATFORM_SHA
 NO_TODAY=1 SKIP_TAG=yes run_build; refuses_early $? "...and so does any value but 1" PLATFORM_SHA
 NO_TODAY=1 SKIP_TAG= PLATFORM_TAG=v2.2.1 PLATFORM_SHA=$HEAD_SHA run_build; refuses_early $? "a tag that does not exist refuses" v2.2.1
+cp "$R/image/hardened/regions" "$T/regions.clean"
+printf '# edited\n' >> "$R/image/hardened/regions"
+NO_TODAY=1 SKIP_TAG= PLATFORM_SHA=$HEAD_SHA run_build
+refuses_early $? "a modified tracked file refuses, names it" image/hardened/regions
+git -C "$R" add image/hardened/regions
+NO_TODAY=1 SKIP_TAG= PLATFORM_SHA=$HEAD_SHA run_build
+refuses_early $? "a staged change refuses, names it" image/hardened/regions
+NO_TODAY=1 PLATFORM_SHA=$HEAD_SHA run_build
+check "HARDENED_SKIP_TAG_CHECK=1 skips the clean-tree check too" "$?"
+cp "$T/regions.clean" "$R/image/hardened/regions"; git -C "$R" add image/hardened/regions
+for f in image/stray.sh scripts/stray.sh cinc/stray.rb; do
+  mkdir -p "$R/${f%/*}"; : > "$R/$f"
+  NO_TODAY=1 SKIP_TAG= PLATFORM_SHA=$HEAD_SHA run_build
+  refuses_early $? "an untracked $f refuses, names it" "$f"
+  rm -f "$R/$f"
+done
+mkdir -p "$R/dist"; : > "$R/dist/hardened-ami-name"; : > "$R/stray-at-root"
+NO_TODAY=1 SKIP_TAG= PLATFORM_SHA=$HEAD_SHA run_build
+check "untracked files in dist/ (and outside the build's inputs) are allowed" "$?"
+rm -rf "$R/dist" "$R/stray-at-root"
 rm -rf "$R/.git"
 
 echo "== the user data is checked before packer runs =="

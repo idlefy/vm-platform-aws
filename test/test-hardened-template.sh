@@ -43,6 +43,10 @@ block() { awk -v n="$1" '$0 ~ "^[[:space:]]*" n "[[:space:]]*(=[[:space:]]*)?[{]
 check "the build instance is tagged for the IAM fence" "$(block run_tags | grep -q 'Name *= *"idlefy-hardened-image-build"'; echo $?)"
 check "...and so is its volume" "$(block run_volume_tags | grep -q 'Name *= *"idlefy-hardened-image-build"'; echo $?)"
 check "the AMI and its snapshots carry the provenance tags" "$(grep -q '^[[:space:]]*tags *= *local.tags$' "$S" && grep -q '^[[:space:]]*snapshot_tags *= *local.tags$' "$S"; echo $?)"
+check "the description carries the visibility, on every copy; the record writes the same string" \
+  "$(grep -qF 'ami_description    = "Idlefy hardened image for AI agents; visibility=${var.public ? "public" : "private"}"' "$S" \
+     && grep -qF '"description": "Idlefy hardened image for AI agents; visibility=%s"' "$ROOT/scripts/hardened-image-build.sh" \
+     && grep -qF '"Idlefy hardened image for AI agents; visibility=(public|private)"' "$ROOT/scripts/hardened-image-retire.sh"; echo $?)"
 check "only # comments (the strip above knows no other kind)" "$(! grep -q '//\|/[*]' "$S"; echo $?)"
 check "ami_name is validated against the published pattern" "$(block 'validation' | grep -qF 'can(regex("^idlefy-hardened-agent-ubuntu-24\\.04-amd64-[0-9]{8}-[0-9]{2}$", var.ami_name))'; echo $?)"
 check "a fixed security group, never a temporary one" "$(grep -q 'security_group_ids *= *\[var.security_group_id\]' "$S" && ! grep -q temporary_security_group "$S"; echo $?)"

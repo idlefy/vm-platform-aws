@@ -37,8 +37,16 @@ of this account tagged $FENCE_KEY=true and named $NAME_PREFIX-YYYYMMDD-NN:
              the next 11 minutes — AWS rounds it up to the minute — is a
              pending deprecation and is left be);
   deregister a build deprecated 7 days ago or more, or disabled and created 7
-             days ago or more and not one of the two newest builds — then
-             delete its snapshots.
+             days ago or more and not one of the two newest published builds
+             — then delete its snapshots (a snapshot still in use is retried
+             for a minute).
+             "Published" is read from the Description the build set
+             (visibility=public|private): a yanked public build still counts,
+             a private build never does and is retired by its own age. A
+             Description that does not say, an unreadable block-device
+             mapping, or an image in another state (pending, failed,
+             deregistered) that is newer than a kept build leaves the region
+             alone.
   safety net one of the two newest public builds whose DeprecationTime has
              passed (the two-year default, if publishing stopped) is never
              deregistered: the region is reported, nothing is done in it, and
@@ -117,8 +125,15 @@ acct="$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["Acc
   || die "sts get-caller-identity returned no Account"
 [ "$acct" = "$ACCOUNT_ID" ] || die "these credentials are for account $acct, not $ACCOUNT_ID — nothing was listed or changed"
 
-DEPRECATE_AT="$(python3 -I -c 'import datetime, sys
-print(datetime.datetime.fromtimestamp(int(sys.argv[1]) + 600, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))' "$NOW")"
+# deprecate_at — now + 10 minutes, read right before each enable-image-
+# deprecation: AWS refuses a time in the past, and a run that waited on
+# snapshots or other regions may be minutes past its start. HARDENED_NOW, the
+# test clock, stays fixed.
+deprecate_at() {
+  python3 -I -c 'import datetime, sys
+print(datetime.datetime.fromtimestamp(int(sys.argv[1]) + 600, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))' \
+    "${HARDENED_NOW:-$(date -u +%s)}"
+}
 
 # plan REGION FILE — the plan for one region's describe-images answer, one
 # tab-separated action per line:
@@ -137,6 +152,8 @@ GRACE = 7 * DAY
 # to the next minute, so an earlier run's date can lie up to 659 s ahead.
 PENDING = 660
 NAME = re.compile(re.escape(prefix) + r"-[0-9]{8}-[0-9]{2}")
+# The build's ami_description (image/hardened/hardened.pkr.hcl), exactly.
+VISIBILITY = re.compile(r"Idlefy hardened image for AI agents; visibility=(public|private)")
 STAMP = re.compile(r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(\.[0-9]+)?Z")
 
 def out(*f):
@@ -183,16 +200,33 @@ if not images:
     out("none")
     sys.exit(0)
 
-builds, names = [], set()
+builds, odd, names = [], [], set()
 for i in images:
     iid, name = i.get("ImageId"), i.get("Name")
     if not isinstance(iid, str) or not re.fullmatch(r"ami-[0-9a-f]+", iid):
         doubt("an image has an unreadable id %r" % (iid,))
     if not isinstance(name, str) or not NAME.fullmatch(name):
         doubt("%s is named %r, outside %s-YYYYMMDD-NN — names decide which builds are newest" % (iid, name, prefix))
+    # available and disabled are the two states retention acts on. Any other
+    # (pending, failed, deregistered — a deregistered image stays listed for a
+    # while) is left be, unless it is one of the two newest builds; see below.
+    state = i.get("State")
+    if not isinstance(state, str) or not state:
+        doubt("%s has no readable State" % iid)
+    if state not in ("available", "disabled"):
+        odd.append(dict(id=iid, name=name, state=state))
+        continue
     if name in names:
         doubt("two images are named %s" % name)
     names.add(name)
+    # "Ever published" comes from the description the build set (visibility=
+    # public|private): a disabled image is private whether it was yanked or
+    # never public, so Public cannot tell. The fence deny keeps it unchanged.
+    m = VISIBILITY.fullmatch(i.get("Description")) if isinstance(i.get("Description"), str) else None
+    if not m:
+        doubt("%s has a Description retention cannot read (%r) — it says whether the build was ever public"
+              % (iid, i.get("Description")))
+    published = m.group(1) == "public"
     if not isinstance(i.get("Public"), bool):
         doubt("%s has no readable Public" % iid)
     created = epoch(i.get("CreationDate"))
@@ -203,18 +237,29 @@ for i in images:
         deprecated = epoch(i["DeprecationTime"])
         if deprecated is None:
             doubt("%s has an unreadable DeprecationTime %r" % (iid, i["DeprecationTime"]))
+    if i["Public"] and not published:
+        doubt("%s is public, but its Description says it was built private" % iid)
+    if published and not i["Public"] and state == "available":
+        doubt("%s was built public but is private and not disabled — a build that stopped before "
+              "sharing it? Check it by hand" % iid)
+    # Every mapping must be readable: a snapshot hidden in a null entry would
+    # be left behind by a deregistration. An instance-store (VirtualName) or
+    # NoDevice mapping has no snapshot and is fine.
+    mappings = i.get("BlockDeviceMappings", [])
+    if not isinstance(mappings, list):
+        doubt("%s has unreadable BlockDeviceMappings" % iid)
     snaps = []
-    for m in i.get("BlockDeviceMappings") or []:
-        if not isinstance(m, dict) or "Ebs" not in m:
-            continue
-        s = m["Ebs"].get("SnapshotId") if isinstance(m["Ebs"], dict) else None
-        if not isinstance(s, str) or not re.fullmatch(r"snap-[0-9a-f]+", s):
-            doubt("%s has an EBS mapping without a readable snapshot id" % iid)
-        snaps.append(s)
-    state = i.get("State", "available")
-    if not isinstance(state, str):
-        doubt("%s has no readable State" % iid)
-    builds.append(dict(id=iid, name=name, public=i["Public"], created=created,
+    for bd in mappings:
+        if not isinstance(bd, dict):
+            doubt("%s has a block-device mapping that is not an object: %r" % (iid, bd))
+        if "Ebs" in bd:
+            s = bd["Ebs"].get("SnapshotId") if isinstance(bd["Ebs"], dict) else None
+            if not isinstance(s, str) or not re.fullmatch(r"snap-[0-9a-f]+", s):
+                doubt("%s has an EBS mapping without a readable snapshot id" % iid)
+            snaps.append(s)
+        elif not (isinstance(bd.get("VirtualName"), str) or "NoDevice" in bd):
+            doubt("%s has a block-device mapping that is neither EBS nor instance store: %r" % (iid, bd))
+    builds.append(dict(id=iid, name=name, public=i["Public"], published=published, created=created,
                        deprecated=deprecated, snaps=snaps, disabled=state == "disabled"))
 
 # A DeprecationTime is not a deprecation until it has passed: AWS gives every
@@ -229,10 +274,20 @@ def pending(b):
 builds.sort(key=lambda b: b["name"], reverse=True)
 keep = [b for b in builds if b["public"] and not b["disabled"] and not past(b)][:2]
 keep_ids = {b["id"] for b in keep}
-# The two newest builds that were ever published (public now, or disabled by a
-# yank). Nothing among them is deregistered, whatever its dates say.
-newest = [b for b in builds if b["public"] or b["disabled"]][:2]
+# The two newest builds that were ever published: built public, whether live,
+# deprecated or disabled by a yank. Nothing among them is deregistered,
+# whatever its dates say. A private build is never among them: it is retired
+# by its own age.
+newest = [b for b in builds if b["published"]][:2]
 newest_ids = {b["id"] for b in newest}
+# An image in another state (pending, failed, deregistered) is not acted on.
+# If it would be one of the two newest, the region is left alone: a pending
+# copy of the build being published must not let an older one go.
+for o in sorted(odd, key=lambda o: o["name"], reverse=True):
+    if len(newest) < 2 or o["name"] > newest[-1]["name"]:
+        doubt("%s (%s) is in state %s and newer than a build retention would keep — wait, or clean it up by hand"
+              % (o["id"], o["name"], o["state"]))
+    out("say", "%s ignored: state %s" % (o["id"], o["state"]))
 for b in newest:
     if b["public"] and not b["disabled"] and past(b):
         doubt("%s (%s), one of the two newest public builds, passed its deprecation date %s ago — "
@@ -297,6 +352,26 @@ mutate() {
   return 1
 }
 
+# delete_snapshot REGION SNAPSHOT — deletes one snapshot of a just
+# deregistered image. AWS may still hold it for the image for a moment
+# (InvalidSnapshot.InUse): that one error is retried SNAP_TRIES times,
+# SNAP_DELAY seconds apart. Any other error, or the last try, fails.
+SNAP_TRIES=6 SNAP_DELAY=10
+delete_snapshot() {
+  local r=$1 s=$2 n=1
+  echo "delete-snapshot $s ($r)"
+  while :; do
+    if aws ec2 delete-snapshot --region "$r" --snapshot-id "$s" --output json > /dev/null 2> "$W/err" < /dev/null; then
+      return 0
+    fi
+    if [ "$n" -ge "$SNAP_TRIES" ] || ! grep -qF 'InvalidSnapshot.InUse' "$W/err"; then
+      echo "✗ $r: delete-snapshot $s failed (try $n): $(head -n1 "$W/err")" >&2
+      return 1
+    fi
+    n=$((n+1)); sleep "$SNAP_DELAY"
+  done
+}
+
 RC=0 ACTIONS=0 FOUND=0
 for r in $REGIONS; do
   if ! aws ec2 describe-images --region "$r" --owners self --include-deprecated --include-disabled \
@@ -322,8 +397,9 @@ for r in $REGIONS; do
         ACTIONS=$((ACTIONS+1))
         if [ "$APPLY" = 0 ]; then echo "would deprecate $a ($r)"; echo "    $b — $c"
         else
-          mutate "$r" "deprecate $a $b at $DEPRECATE_AT" \
-            ec2 enable-image-deprecation --region "$r" --image-id "$a" --deprecate-at "$DEPRECATE_AT" \
+          at="$(deprecate_at)" || { echo "✗ $r: could not compute the deprecation time — stopping $r" >&2; RC=1; break; }
+          mutate "$r" "deprecate $a $b at $at" \
+            ec2 enable-image-deprecation --region "$r" --image-id "$a" --deprecate-at "$at" \
             || { RC=1; break; }
         fi ;;
       deregister)
@@ -333,10 +409,10 @@ for r in $REGIONS; do
           for s in $c; do echo "would delete-snapshot $s ($r)"; done
         else
           mutate "$r" "deregister $a $b" ec2 deregister-image --region "$r" --image-id "$a" || { RC=1; break; }
-          read -ra left <<< "$c"
-          while [ ${#left[@]} -gt 0 ]; do
-            mutate "$r" "delete-snapshot ${left[0]}" ec2 delete-snapshot --region "$r" --snapshot-id "${left[0]}" || break
-            left=("${left[@]:1}")
+          read -ra snaps <<< "$c"
+          left=()
+          for s in "${snaps[@]}"; do
+            delete_snapshot "$r" "$s" || left+=("$s")
           done
           if [ ${#left[@]} -gt 0 ]; then
             echo "✗ $r: $a is deregistered, but these snapshots are left — delete them by hand in $r: ${left[*]}" >&2

@@ -23,12 +23,17 @@
 #       otherwise SSM hands the build instance a role although the build gives
 #       it no instance profile (the build holds no credential);
 #   G2c each region has room under the public-AMI quota (L-0E3CBAB9) for one
-#       more public image; deprecated public images count against it;
+#       more public image; deprecated public images count against it. Only
+#       NoSuchResourceException (no applied value) falls back to the AWS
+#       default quota; any other failed read is a failure;
 #   G3  every IAM user and role other than the publish role and AWS
 #       service-linked (/aws-service-role/) roles is EXPLICITLY denied every
 #       mutation of an image or snapshot tagged IdlefyPublishedImage=true:
 #       every simulated decision — top level and per resource, every fenced
-#       action, one resource ARN per region — is explicitDeny. implicitDeny
+#       action, one resource ARN per region — is explicitDeny, and the deny
+#       policy itself ($HARDENED_DENY_POLICY_NAME, default
+#       deny-idlefy-published-image-mutation) is among its matched statements;
+#       a deny from another policy fails. implicitDeny
 #       fails like allowed: simulation cannot decide a conditional Allow, so
 #       the only decidable rule is that each principal carries the deny
 #       policy, which the account's Terraform attaches to every principal.
@@ -56,6 +61,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REGIONS_FILE="$ROOT/image/hardened/regions"
 ACCOUNT_ID=995603458290
 FENCE_KEY=IdlefyPublishedImage
+# The managed policy that carries the fence deny. In a simulation result its
+# statements are matched by SourcePolicyId, which for an attached managed
+# policy is the policy's name.
+DENY_POLICY="${HARDENED_DENY_POLICY_NAME:-deny-idlefy-published-image-mutation}"
 QUOTA_CODE=L-0E3CBAB9
 DHMC_SETTING=/ssm/managed-instance/default-ec2-instance-management-role
 IMAGE_ACTIONS=(ec2:DeregisterImage ec2:ModifyImageAttribute ec2:ResetImageAttribute
@@ -197,11 +206,20 @@ for r in $REGIONS; do
   fi
   # G2c. GetServiceQuota has no applied value for a quota nobody raised; the
   # AWS default is then the quota.
-  quota="" count=""
+  # Only NoSuchResourceException means "no applied value"; any other failure
+  # (AccessDenied, throttling) is a failure, never a reason to fall back.
+  quota="" count="" qok=0
   if aws service-quotas get-service-quota --service-code ec2 --quota-code "$QUOTA_CODE" --region "$r" \
-       --output json > "$W/quota.json" 2> "$W/err" < /dev/null \
-     || awscall "$W/quota.json" "$r: service-quotas get-service-quota / get-aws-default-service-quota $QUOTA_CODE" \
-          service-quotas get-aws-default-service-quota --service-code ec2 --quota-code "$QUOTA_CODE" --region "$r"; then
+       --output json > "$W/quota.json" 2> "$W/err" < /dev/null; then
+    qok=1
+  elif grep -q 'NoSuchResourceException' "$W/err"; then
+    awscall "$W/quota.json" "$r: service-quotas get-aws-default-service-quota $QUOTA_CODE" \
+      service-quotas get-aws-default-service-quota --service-code ec2 --quota-code "$QUOTA_CODE" --region "$r" \
+      && qok=1
+  else
+    fail "$r: service-quotas get-service-quota $QUOTA_CODE: the call failed: $(head -n1 "$W/err")"
+  fi
+  if [ "$qok" = 1 ]; then
     quota="$(jfield "$W/quota.json" Quota Value '#int')" \
       || { quota=""; fail "$r: the public AMI quota $QUOTA_CODE came back without a whole Value"; }
   fi
@@ -227,6 +245,11 @@ echo
 # condition key anywhere in a principal's policies, related or not), so the
 # only decidable rule is that every principal but the publish role and
 # service-linked roles carries the deny policy itself.
+#
+# "explicitDeny" counts only when $DENY_POLICY is among the decision's
+# MatchedStatements (SourcePolicyId): a deny from any other policy (an SCP-like
+# boundary, a stray inline deny) can be removed without touching the fence and
+# fails as "explicitDeny (other policy)".
 #
 # The context says MFA is present on purpose: an account's "require MFA"
 # deny would otherwise read as explicitDeny and hide a principal that lacks
@@ -257,12 +280,21 @@ simulate() {
       SIM_ERRORS+=("$arn ($kind): $(head -n1 "$W/err")")
       continue
     fi
-    python3 -I - "$W/sim.json" "$(IFS=,; echo "${batch[*]}")" "$@" >> "$W/bad" <<'PY'
+    python3 -I - "$W/sim.json" "$DENY_POLICY" "$(IFS=,; echo "${batch[*]}")" "$@" >> "$W/bad" <<'PY'
 import json, sys
-arns, want = sys.argv[2].split(","), sys.argv[3:]
+fence, arns, want = sys.argv[2], sys.argv[3].split(","), sys.argv[4:]
 def region(arn):
     parts = arn.split(":")
     return parts[3] if len(parts) > 3 and parts[3] else "all"
+# verdict(decision, matched) — None when the decision is an explicitDeny that
+# the fence policy itself matched; otherwise what to report.
+def verdict(d, matched):
+    if d in ("allowed", "implicitDeny"):
+        return d
+    if d != "explicitDeny":
+        return "unreadable"
+    ids = [m.get("SourcePolicyId") for m in (matched or []) if isinstance(m, dict)]
+    return None if fence in ids else "explicitDeny (other policy)"
 try:
     res = {r["EvalActionName"]: r for r in json.load(open(sys.argv[1]))["EvaluationResults"]}
 except (OSError, ValueError, KeyError, TypeError, AttributeError):
@@ -275,20 +307,20 @@ for a in want:
         continue
     per = r.get("ResourceSpecificResults") or []
     if not per and len(arns) == 1 and r.get("EvalResourceName") == arns[0]:
-        per = [{"EvalResourceName": arns[0], "EvalResourceDecision": r.get("EvalDecision")}]
+        per = [{"EvalResourceName": arns[0], "EvalResourceDecision": r.get("EvalDecision"),
+                "MatchedStatements": r.get("MatchedStatements")}]
     got = {}
     for p in per:
         if isinstance(p, dict):
-            got[p.get("EvalResourceName")] = p.get("EvalResourceDecision")
+            got[p.get("EvalResourceName")] = verdict(p.get("EvalResourceDecision"), p.get("MatchedStatements"))
     for x in arns:
-        d = got.get(x)
-        if d is None:
+        if x not in got:
             print("unreadable\t%s@%s" % (a, region(x)))
-        elif d != "explicitDeny":
-            print("%s\t%s@%s" % (d if d in ("allowed", "implicitDeny") else "unreadable", a, region(x)))
-    top = r.get("EvalDecision")
-    if top != "explicitDeny" and all(got.get(x) == "explicitDeny" for x in arns):
-        print("%s\t%s@all" % (top if top in ("allowed", "implicitDeny") else "unreadable", a))
+        elif got[x] is not None:
+            print("%s\t%s@%s" % (got[x], a, region(x)))
+    top = verdict(r.get("EvalDecision"), r.get("MatchedStatements"))
+    if top is not None and all(x in got and got[x] is None for x in arns):
+        print("%s\t%s@all" % (top, a))
 PY
   done
 }
@@ -298,7 +330,7 @@ summarize() {
   python3 -I - "$W/bad" "$1" "$2" <<'PY'
 import sys
 lines = [l.rstrip("\n").split("\t", 1) for l in open(sys.argv[1]) if "\t" in l]
-order = ["allowed", "implicitDeny", "error", "unreadable"]
+order = ["allowed", "implicitDeny", "explicitDeny (other policy)", "error", "unreadable"]
 worst = min((d for d, _ in lines), key=lambda d: order.index(d) if d in order else len(order))
 examples = []
 for d, where in lines:
@@ -418,7 +450,7 @@ if [ ${#FAILS[@]} -gt 0 ]; then
     echo "✗ hardened-guard-check: $n $word — do not publish from this account until they are fixed:"
     printf '  - %s\n' "${FAILS[@]}"
     if [ "${G3_FAIL:-0}" -gt 0 ]; then
-      echo "attach deny-idlefy-published-image-mutation to these principals (terraform apply in idlefy/infra, terraform/aws/account)"
+      echo "attach $DENY_POLICY to these principals (terraform apply in idlefy/infra, terraform/aws/account)"
     fi
   } >&2
   exit 1

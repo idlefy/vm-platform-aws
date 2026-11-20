@@ -12,7 +12,9 @@
 # The checks read `[ … ]; echo $?` and `run_retire; check … "$?"` on purpose.
 # shellcheck disable=SC2181,SC2319
 
-set -uo pipefail
+# -e for the setup only: a failed copy or shim must stop the run before
+# any script runs. The checks below run without it.
+set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PASS=0; FAIL=0
 check() { if [ "$2" = "0" ]; then PASS=$((PASS+1)); echo "  ok   $1"; else FAIL=$((FAIL+1)); echo "  FAIL $1"; fi; }
@@ -45,14 +47,41 @@ case "$1 $2" in
     shift
     echo "$*" >> "$MUT_LOG"
     if in_list "$region:$1" "${MUT_FAIL:-}"; then echo "An error occurred (InvalidAMIID.Unavailable)" >&2; exit 254; fi
+    # SNAP_IN_USE="snap-x:N …" — that snapshot is in use for its first N tries.
+    if [ "$1" = delete-snapshot ]; then
+      for e in ${SNAP_IN_USE:-}; do
+        [ "${e%%:*}" = "$5" ] || continue
+        n=$(grep -c -- "--snapshot-id $5 " "$MUT_LOG")
+        if [ "$n" -le "${e##*:}" ]; then
+          echo "An error occurred (InvalidSnapshot.InUse) when calling the DeleteSnapshot operation: The snapshot $5 is currently in use by ami-0" >&2
+          exit 254
+        fi
+      done
+    fi
     echo '{"Return": true}' ;;
   *) echo "shim: unexpected aws $*" >&2; exit 9 ;;
 esac
 SH
-chmod +x "$T/bin/aws"
+# sleep: logged, never waited — the retry delay is the script's clock.
+printf '#!/usr/bin/env bash\necho "sleep $*" >> "$SLEEP_LOG"\n' > "$T/bin/sleep"
+chmod +x "$T/bin/aws" "$T/bin/sleep"
+# No test may reach a real cloud CLI: each name below must resolve to its
+# shim, or the run stops here.
+shimmed() {
+  local dir=$1 c; shift
+  for c in "$@"; do
+    [ "$(PATH="$dir:$PATH" command -v "$c")" = "$dir/$c" ] \
+      || { echo "setup: $c does not resolve to the shim in $dir — stopping" >&2; exit 1; }
+  done
+}
+shimmed "$T/bin" aws sleep
+set +e
 
 # imgs SPEC… — a describe-images answer. SPEC is
-# ID:AGE_DAYS:PUBLIC[:DEPRECATED_DAYS_AGO[:NAME[:STATE]]]. DEPRECATED empty
+# ID:AGE_DAYS:PUBLIC[:DEPRECATED_DAYS_AGO[:NAME[:STATE[:DESCRIPTION]]]]. PUBLIC
+# is how the build was made: its Description says visibility=public or
+# private, and "disabled" then makes the image private. DESCRIPTION "none"
+# leaves it out, any other value replaces it. DEPRECATED empty
 # means what AWS does: a public image is deprecated 730 days after its creation
 # (so its DeprecationTime is in the future), a private one has none; "none" means
 # no DeprecationTime at all; a negative value is a deprecation still ahead;
@@ -67,9 +96,10 @@ def iso(t):
     return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 out = []
 for spec in sys.argv[3:]:
-    f = spec.split(":") + [""] * 6
-    iid, age, public, dep, name, state = f[0], float(f[1]), f[2] == "true", f[3], f[4], f[5] or "available"
-    if state == "disabled":
+    f = spec.split(":") + [""] * 7
+    iid, age, public, dep, name, state, desc = f[0], float(f[1]), f[2] == "true", f[3], f[4], f[5] or "available", f[6]
+    built = "Idlefy hardened image for AI agents; visibility=%s" % ("public" if public else "private")
+    if state != "available":
         public = False
     created = now - int(age * 86400)
     if not name:
@@ -78,6 +108,8 @@ for spec in sys.argv[3:]:
           "OwnerId": "995603458290", "CreationDate": iso(created),
           "BlockDeviceMappings": [{"DeviceName": "/dev/sda1",
                                    "Ebs": {"SnapshotId": "snap-" + iid.split("-", 1)[1], "VolumeSize": 20}}]}
+    if desc != "none":
+        im["Description"] = desc or built
     if dep == "" and public:
         im["DeprecationTime"] = iso(created + 730 * 86400)
     elif dep.endswith("s"):
@@ -94,8 +126,12 @@ for i in json.loads(sys.argv[1])["Images"]:
 
 # run_retire ARGS… — runs the script with the shim; returns its status.
 run_retire() {
-  : > "$T/aws.log"; : > "$T/mut.log"
-  ( cd "$T" && env PATH="$T/bin:$PATH" AWS_LOG="$T/aws.log" MUT_LOG="$T/mut.log" HARDENED_NOW="${CLOCK:-$NOW}" \
+  shimmed "$T/bin" aws sleep
+  : > "$T/aws.log"; : > "$T/mut.log"; : > "$T/sleep.log"
+  # NO_CLOCK: no HARDENED_NOW, so the script reads `date` (shimmed in $T/clock).
+  local now="${CLOCK:-$NOW}" path="$T/bin:$PATH"
+  if [ -n "${NO_CLOCK:-}" ]; then shimmed "$T/clock" date; now=""; path="$T/clock:$path"; fi
+  ( cd "$T" && env PATH="$path" AWS_LOG="$T/aws.log" MUT_LOG="$T/mut.log" SLEEP_LOG="$T/sleep.log" HARDENED_NOW="$now" \
       "$R/scripts/hardened-image-retire.sh" "$@" > "$T/stdout" 2> "$T/stderr" )
 }
 would() { grep -c '^would ' "$T/stdout"; }
@@ -198,8 +234,8 @@ check "eu-west-1 is flagged for the previous build" "$(grep -F 'eu-west-1' "$T/s
 check "--help states the rule" "$(run_retire --help; grep -qF 'never' "$T/stdout" && grep -qF 'deregistered' "$T/stdout" && grep -qiF 'two-year' "$T/stdout"; echo $?)"
 
 echo "== disabled builds (a yank) =="
-IMAGES_us_east_1=$(imgs "ami-0a9:10:false:none:$PREFIX-20991231-01:disabled" ami-0a1:10:true ami-0a2:40:true \
-  "ami-0a7:20:false:none:$PREFIX-20000102-01:disabled" "ami-0a8:5:false:none:$PREFIX-20000101-01:disabled")
+IMAGES_us_east_1=$(imgs "ami-0a9:10:true:none:$PREFIX-20991231-01:disabled" ami-0a1:10:true ami-0a2:40:true \
+  "ami-0a7:20:true:none:$PREFIX-20000102-01:disabled" "ami-0a8:5:true:none:$PREFIX-20000101-01:disabled")
 IMAGES_eu_west_1=""
 run_retire; check "exit 0" "$?"
 check "a disabled build among the newest two waits" "$(grep -F 'ami-0a9' "$T/stdout" | grep -qF 'waits'; echo $?)"
@@ -261,7 +297,7 @@ check "7 days: deprecate, deregister and deprecate the private one in eu-west-1"
 echo "== a deprecated build is never one of the two kept =="
 # Two yanked builds are the newest two; behind them a public build deprecated
 # 8 days ago, then three live ones.
-IMAGES_us_east_1=$(imgs "ami-0a8:3:false:none:$PREFIX-20991231-02:disabled" "ami-0a9:3:false:none:$PREFIX-20991231-01:disabled" \
+IMAGES_us_east_1=$(imgs "ami-0a8:3:true:none:$PREFIX-20991231-02:disabled" "ami-0a9:3:true:none:$PREFIX-20991231-01:disabled" \
   ami-0a1:10:true:8 ami-0a2:40:true ami-0a3:70:true ami-0a4:100:true)
 IMAGES_eu_west_1=""
 run_retire; check "exit 0" "$?"
@@ -344,6 +380,104 @@ run_retire --apply; check "a deregistration candidate with no snapshot → exit 
 IMAGES_us_east_1='not json'
 run_retire --apply; check "an unreadable answer → exit 1, nothing in us-east-1" \
   "$([ $? -eq 1 ] && ! grep -qF -- '--region us-east-1' "$T/mut.log"; echo $?)"
+
+echo "== ever published: read from the Description, not from Public =="
+# The review's case: the newest public build, then a newer-than-previous
+# disabled PRIVATE build, then the previous public build, past its default
+# deprecation date 10 days ago. The private build must not stand in for it.
+IMAGES_us_east_1=$(imgs "ami-0a1:10:true::$PREFIX-20260301-01" "ami-0a5:5:false:none:$PREFIX-20260201-01:disabled" \
+  "ami-0a2:740:true:10:$PREFIX-20240101-01")
+IMAGES_eu_west_1=""
+run_retire --apply
+check "a disabled private build is not a published one: the previous public build is kept, region flagged" \
+  "$([ $? -eq 1 ] && [ "$(mut)" = 0 ] && grep -F 'us-east-1' "$T/stderr" | grep -F 'ami-0a2' | grep -qF 'publish a new build'; echo $?)"
+IMAGES_us_east_1=$(imgs "ami-0a1:10:true::$PREFIX-20260301-01" "ami-0a5:8:false:none:$PREFIX-20260201-01:disabled" \
+  "ami-0a2:40:true::$PREFIX-20240101-01")
+run_retire
+check "a disabled private build among the newest names is retired by its own age" \
+  "$([ $? -eq 0 ] && grep -qxF 'would deregister ami-0a5 (us-east-1)' "$T/stdout" && [ "$(would)" = 2 ]; echo $?)"
+IMAGES_us_east_1=$(imgs "ami-0a9:3:true:none:$PREFIX-20260401-01:disabled" "ami-0a1:10:true::$PREFIX-20260301-01" \
+  "ami-0a2:740:true:10:$PREFIX-20240101-01")
+run_retire
+check "a disabled public (yanked) build still counts: the previous public one may go" \
+  "$([ $? -eq 0 ] && grep -qxF 'would deregister ami-0a2 (us-east-1)' "$T/stdout" \
+     && grep -F 'ami-0a9' "$T/stdout" | grep -qF 'waits'; echo $?)"
+for d in none "Ubuntu 24.04" "Idlefy hardened image for AI agents; visibility=maybe"; do
+  IMAGES_us_east_1=$(imgs ami-0a1:10:true ami-0a2:40:true "ami-0a3:70:true:8:::$d")
+  run_retire --apply
+  check "a Description of '$d' → exit 1, nothing in us-east-1, says why" \
+    "$([ $? -eq 1 ] && [ "$(mut)" = 0 ] && grep -F 'us-east-1' "$T/stderr" | grep -F 'ami-0a3' | grep -qF 'Description'; echo $?)"
+done
+IMAGES_us_east_1=$(imgs ami-0a1:10:true ami-0a2:40:true \
+  "ami-0a3:70:true:8:::Idlefy hardened image for AI agents; visibility=private")
+run_retire --apply; check "public, but built private → exit 1, nothing in us-east-1" \
+  "$([ $? -eq 1 ] && [ "$(mut)" = 0 ]; echo $?)"
+IMAGES_us_east_1=$(imgs ami-0a1:10:true ami-0a2:40:true \
+  "ami-0a3:70:false:8:::Idlefy hardened image for AI agents; visibility=public")
+run_retire --apply; check "built public, private and not disabled → exit 1, nothing in us-east-1" \
+  "$([ $? -eq 1 ] && [ "$(mut)" = 0 ]; echo $?)"
+
+echo "== image states other than available and disabled =="
+IMAGES_us_east_1=$(imgs ami-0a1:10:true ami-0a2:40:true ami-0a3:70:true \
+  "ami-0a9:100:true::$PREFIX-20000101-01:deregistered" "ami-0a8:100:true:::failed::none")
+IMAGES_eu_west_1=""
+run_retire; check "older images in another state are ignored, said so; the rest is planned" \
+  "$([ $? -eq 0 ] && grep -qxF 'would deprecate ami-0a3 (us-east-1)' "$T/stdout" && [ "$(would)" = 1 ] \
+     && grep -qF 'ami-0a9 ignored: state deregistered' "$T/stdout"; echo $?)"
+IMAGES_us_east_1=$(imgs "ami-0a0:0:true::$PREFIX-20991231-01:pending::none" ami-0a1:10:true ami-0a2:40:true ami-0a3:70:true:8)
+run_retire --apply; check "a pending image newer than the kept builds → exit 1, nothing in us-east-1" \
+  "$([ $? -eq 1 ] && [ "$(mut)" = 0 ] && grep -F 'us-east-1' "$T/stderr" | grep -F 'ami-0a0' | grep -qF 'pending'; echo $?)"
+IMAGES_us_east_1=$(imgs ami-0a1:10:true ami-0a2:40:true ami-0a3:70:true:8 \
+  | python3 -I -c 'import json, sys; d = json.load(sys.stdin); del d["Images"][1]["State"]; print(json.dumps(d))')
+run_retire --apply; check "no State → exit 1, nothing in us-east-1" "$([ $? -eq 1 ] && [ "$(mut)" = 0 ]; echo $?)"
+
+echo "== block-device mappings must all be readable =="
+for bad in None '"x"' '{"DeviceName": "/dev/sdb"}'; do
+  IMAGES_us_east_1=$(imgs ami-0a1:10:true ami-0a2:40:true ami-0a3:70:true:8 \
+    | python3 -I -c 'import json, sys; d = json.load(sys.stdin); d["Images"][2]["BlockDeviceMappings"].append(json.loads(sys.argv[1] if sys.argv[1] != "None" else "null")); print(json.dumps(d))' "$bad")
+  run_retire --apply; check "a mapping $bad → exit 1, nothing in us-east-1" "$([ $? -eq 1 ] && [ "$(mut)" = 0 ]; echo $?)"
+done
+IMAGES_us_east_1=$(imgs ami-0a1:10:true ami-0a2:40:true ami-0a3:70:true:8 \
+  | python3 -I -c 'import json, sys; d = json.load(sys.stdin); d["Images"][2]["BlockDeviceMappings"] = {"x": 1}; print(json.dumps(d))')
+run_retire --apply; check "mappings that are not a list → exit 1" "$([ $? -eq 1 ] && [ "$(mut)" = 0 ]; echo $?)"
+IMAGES_us_east_1=$(imgs ami-0a1:10:true ami-0a2:40:true ami-0a3:70:true:8 \
+  | python3 -I -c 'import json, sys; d = json.load(sys.stdin); d["Images"][2]["BlockDeviceMappings"].append({"DeviceName": "/dev/sdd", "NoDevice": ""}); print(json.dumps(d))')
+run_retire --apply; check "a NoDevice mapping is fine" "$([ $? -eq 0 ] && grep -q '^deregister-image' "$T/mut.log"; echo $?)"
+
+echo "== a snapshot still in use is retried =="
+IMAGES_us_east_1=$(imgs ami-0a1:10:true ami-0a2:40:true ami-0a3:70:true:8 \
+  | python3 -I -c 'import json, sys
+d = json.load(sys.stdin)
+d["Images"][2]["BlockDeviceMappings"].append({"DeviceName": "/dev/sdb", "Ebs": {"SnapshotId": "snap-0a3b"}})
+print(json.dumps(d))')
+SNAP_IN_USE="snap-0a3:2" run_retire --apply
+check "in use twice → deleted on the third try, 10 s apart, then the next snapshot" \
+  "$([ $? -eq 0 ] && [ "$(grep -c -- '--snapshot-id snap-0a3 ' "$T/mut.log")" = 3 ] && [ "$(grep -cxF 'sleep 10' "$T/sleep.log")" = 2 ] \
+     && grep -qxF 'delete-snapshot --region us-east-1 --snapshot-id snap-0a3b --output json' "$T/mut.log"; echo $?)"
+SNAP_IN_USE="snap-0a3:9" run_retire --apply
+check "in use past six tries → the other snapshot is still deleted; exit 1 names only the one left" \
+  "$([ $? -eq 1 ] && [ "$(grep -c -- '--snapshot-id snap-0a3 ' "$T/mut.log")" = 6 ] && [ "$(grep -c . "$T/sleep.log")" = 5 ] \
+     && grep -qxF 'delete-snapshot --region us-east-1 --snapshot-id snap-0a3b --output json' "$T/mut.log" \
+     && grep -F 'by hand' "$T/stderr" | grep -qE 'snap-0a3$'; echo $?)"
+MUT_FAIL="us-east-1:delete-snapshot" run_retire --apply
+check "any other error is not retried" "$([ $? -eq 1 ] && [ ! -s "$T/sleep.log" ] && [ "$(grep -c '^delete-snapshot' "$T/mut.log")" = 2 ]; echo $?)"
+
+echo "== the deprecation time is read right before each call =="
+mkdir -p "$T/clock"
+# date: NOW, then +700 s on every later call.
+cat > "$T/clock/date" <<SH
+#!/usr/bin/env bash
+n=\$(cat "$T/clock/n" 2>/dev/null || echo 0); echo \$((n+1)) > "$T/clock/n"
+echo \$(( $NOW + n * 700 ))
+SH
+chmod +x "$T/clock/date"; rm -f "$T/clock/n"
+IMAGES_us_east_1=$(imgs ami-0a1:10:true ami-0a2:40:true ami-0a3:70:true)
+IMAGES_eu_west_1=$(imgs ami-0b1:10:true ami-0b2:40:true ami-0b3:70:true)
+at() { python3 -I -c 'import datetime, sys; print(datetime.datetime.fromtimestamp(int(sys.argv[1]) + 600, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))' "$1"; }
+NO_CLOCK=1 run_retire --apply
+check "each enable-image-deprecation gets now + 10 min of its own moment" \
+  "$([ $? -eq 0 ] && grep -qxF "enable-image-deprecation --region us-east-1 --image-id ami-0a3 --deprecate-at $(at $((NOW + 700))) --output json" "$T/mut.log" \
+     && grep -qxF "enable-image-deprecation --region eu-west-1 --image-id ami-0b3 --deprecate-at $(at $((NOW + 1400))) --output json" "$T/mut.log"; echo $?)"
 
 echo "== the wrong account =="
 IMAGES_us_east_1=$(imgs ami-0a1:10:true ami-0a2:40:true ami-0a3:70:true)

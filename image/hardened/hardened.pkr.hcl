@@ -79,11 +79,17 @@ locals {
 }
 
 source "amazon-ebs" "hardened" {
-  profile            = var.aws_profile == "" ? null : var.aws_profile
-  region             = var.build_region
-  ami_regions        = [for r in var.ami_regions : r if r != var.build_region]
-  ami_name           = var.ami_name
-  ami_groups         = var.public ? ["all"] : null
+  profile     = var.aws_profile == "" ? null : var.aws_profile
+  region      = var.build_region
+  ami_regions = [for r in var.ami_regions : r if r != var.build_region]
+  ami_name    = var.ami_name
+  ami_groups  = var.public ? ["all"] : null
+  # Retention reads "ever published" from this: a disabled image is private,
+  # whether it was yanked or never public. The plugin sets it on the image and
+  # on every regional copy in the same step as ami_groups; the fence deny
+  # keeps anyone else from changing it. The release record carries the same
+  # string (scripts/hardened-image-build.sh) — change both together.
+  ami_description    = "Idlefy hardened image for AI agents; visibility=${var.public ? "public" : "private"}"
   encrypt_boot       = false
   instance_type      = var.instance_type
   subnet_id          = var.subnet_id == "" ? null : var.subnet_id

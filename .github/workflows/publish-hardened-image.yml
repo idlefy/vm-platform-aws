@@ -28,9 +28,9 @@ on:
   schedule:
     - cron: "0 3 1 * *"
 
-permissions:
-  contents: write
-  id-token: write
+# Nothing at workflow level: each job names what it needs, so a job added
+# later starts with no token rights at all.
+permissions: {}
 
 concurrency:
   group: hardened-publish
@@ -83,6 +83,11 @@ jobs:
     name: guard, build and publish
     needs: resolve
     runs-on: ubuntu-latest
+    # contents: write for the release asset, record and notes; id-token: write
+    # for the OIDC role. Nothing broader.
+    permissions:
+      contents: write
+      id-token: write
     environment: hardened-publish
     timeout-minutes: 240
     env:

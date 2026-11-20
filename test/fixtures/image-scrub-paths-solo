@@ -2,7 +2,8 @@
 # carry from its build instance into every VM.
 #
 # PROVISIONAL — copied from the fleet list minus the components the solo
-# run_list drops; re-measured after the first live build (Task 4, decision 6 of
+# run_list drops; re-measured after the first live build ("Measured" in
+# `docs/design/hardened-image.md`; the method is decision 6 of
 # `docs/design/ami-image.md`).
 #
 # Left out of the fleet list (test/fixtures/image-scrub-paths): every Alloy,
@@ -12,7 +13,7 @@
 # a credential, so the list removes it regardless.
 #
 # Same grammar as the fleet list: `remove <path or glob>`, `empty <path>` or
-# `keep <path>`, then `#` and the reason. image/files/dev-vm-image-scrub
+# `keep <path>`, then `#` and the reason. image/files/dev-vm-image-scrub-solo
 # carries the remove and empty lines verbatim in REMOVE_SOLO / EMPTY_SOLO;
 # test/test-image-scrub.sh fails if the two drift, and checks every keep line
 # survives. /etc/dev-vm itself is a directory, which this grammar cannot

@@ -11,12 +11,14 @@
 # (a UUID), HARDENED_INSTANCE_TYPE (default c7a.xlarge), HARDENED_SUBNET_ID,
 # HARDENED_OUT (default dist), GH_REPO (default idlefy/vm-platform-aws).
 # Test hooks, never set in a real build: HARDENED_SKIP_TAG_CHECK=1 (exactly 1)
-# skips the tag check; HARDENED_TODAY=YYYYMMDD replaces today's UTC date, and
+# skips the tag check and the clean-tree check with it; HARDENED_TODAY=YYYYMMDD replaces today's UTC date, and
 # is refused unless HARDENED_SKIP_TAG_CHECK=1 is set too — a forward-dated
 # name would stay the "newest" build for retention forever.
 #
 # What it does, refusing at the first thing that is not so:
-#   1. the tag names PLATFORM_SHA and the tree is that commit;
+#   1. the tag names PLATFORM_SHA and the tree is that commit: HEAD, no
+#      modified or staged tracked file, no untracked file under image/,
+#      scripts/ or cinc/;
 #   2. image/hardened/regions parses (the first region is the build region);
 #   3. the committed solo lock is what solo.rb resolves to today;
 #   4. the lock's base-X.Y.Z tag exists on GitHub;
@@ -87,6 +89,16 @@ if [ "${HARDENED_SKIP_TAG_CHECK:-}" != 1 ]; then
   [ "$tagged" = "$PLATFORM_SHA" ] || die "$PLATFORM_TAG names ${tagged:0:12}, PLATFORM_SHA is ${PLATFORM_SHA:0:12} — pass the tag's commit"
   [ "$(git -C "$ROOT" rev-parse HEAD)" = "$PLATFORM_SHA" ] \
     || die "the checkout is not PLATFORM_SHA ${PLATFORM_SHA:0:12} — check out $PLATFORM_TAG and retry"
+  # HEAD alone is not the tree: a modified tracked file, a staged change or an
+  # untracked file the build reads (image/, scripts/, cinc/ — ignored ones
+  # included: an export packs them too) would go into the image while the
+  # record names the clean commit. dist/ is the build's output.
+  dirty="$(git -C "$ROOT" status --porcelain --untracked-files=no)" \
+    || die "git status failed in $ROOT"
+  [ -z "$dirty" ] || die "the working tree or index differs from $PLATFORM_TAG — commit or discard: $(printf '%s' "$dirty" | tr '\n' ' ')"
+  untracked="$(git -C "$ROOT" ls-files --others -- image scripts cinc)" \
+    || die "git ls-files failed in $ROOT"
+  [ -z "$untracked" ] || die "untracked files under image/, scripts/ or cinc/ would enter the build — remove them: $(printf '%s' "$untracked" | tr '\n' ' ')"
 fi
 
 TMPS=()
@@ -368,6 +380,10 @@ d = {
     "owner_id": owner,
     "architecture": "x86_64",
     "public": public == "true",
+    # The same string as ami_description in image/hardened/hardened.pkr.hcl;
+    # retention reads "ever published" from the image's copy of it.
+    "description": "Idlefy hardened image for AI agents; visibility=%s"
+                   % ("public" if public == "true" else "private"),
     "root_volume_gib": int(volume),
     "login_user": "ubuntu",
     "platform_tag": tag,

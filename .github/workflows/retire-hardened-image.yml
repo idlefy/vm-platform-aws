@@ -30,9 +30,8 @@ on:
         default: ""
         description: "yank one build: idlefy-hardened-agent-ubuntu-24.04-amd64-YYYYMMDD-NN (empty = retention)"
 
-permissions:
-  contents: read
-  id-token: write
+# Nothing at workflow level: the job names what it needs.
+permissions: {}
 
 # Its own group: a publish waiting for approval never blocks a yank, and a
 # queued publish never replaces a pending retire.
@@ -44,6 +43,9 @@ jobs:
   retire:
     name: retention or yank
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     environment: hardened-publish
     timeout-minutes: 30
     steps:

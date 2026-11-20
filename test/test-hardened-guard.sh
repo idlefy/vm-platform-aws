@@ -29,13 +29,19 @@
 #                                           only that region's ARNs (top level
 #                                           implicitDeny). One entry per
 #                                           resource in ResourceSpecificResults
-#                                           unless $NO_PER_RESOURCE.
+#                                           unless $NO_PER_RESOURCE. Every
+#                                           decision carries MatchedStatements:
+#                                           an explicitDeny names the fence
+#                                           policy, or deny-other-policy for
+#                                           names in $OTHER_DENY.
 # Any call whose "service verb" is in $FAIL_CALL exits 254.
 
 # The checks read `[ … ]; echo $?` and `run_guard; check … "$?"` on purpose.
 # shellcheck disable=SC2181,SC2319
 
-set -uo pipefail
+# -e for the setup only: a failed copy or shim must stop the run before
+# any script runs. The checks below run without it.
+set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PASS=0; FAIL=0
 check() { if [ "$2" = "0" ]; then PASS=$((PASS+1)); echo "  ok   $1"; else FAIL=$((FAIL+1)); echo "  FAIL $1"; fi; }
@@ -139,10 +145,21 @@ JSON
     # REGION_ALLOWED=name:region — an Allow scoped to that region's ARNs only;
     # the top-level decision still reads implicitDeny.
     printf '%s\n' "${resources[@]}" > "$SIM_RES_LOG.last"
-    python3 -I - "$d" "$missing" "$name" "${REGION_ALLOWED:-}" "${NO_PER_RESOURCE:-}" "${actions[@]}" <<'PY'
+    python3 -I - "$d" "$missing" "$name" "${REGION_ALLOWED:-}" "${NO_PER_RESOURCE:-}" "${OTHER_DENY:-}" "${actions[@]}" <<'PY'
 import json, os, sys
-d, missing, name, region_allowed, no_per = sys.argv[1:6]
-actions = sys.argv[6:]
+d, missing, name, region_allowed, no_per, other_deny = sys.argv[1:7]
+actions = sys.argv[7:]
+# The real shape: an attached managed policy is named by SourcePolicyId.
+def stmt(policy):
+    return {"SourcePolicyId": policy, "SourcePolicyType": "IAM Policy",
+            "StartPosition": {"Line": 1, "Column": 1}, "EndPosition": {"Line": 1, "Column": 200}}
+def matched(dec):
+    if dec == "explicitDeny":
+        return [stmt("deny-other-policy" if name in other_deny.split() else
+                     "deny-idlefy-published-image-mutation")]
+    if dec == "allowed":
+        return [stmt("AdministratorAccess")]
+    return []
 resources = open(os.environ["SIM_RES_LOG"] + ".last").read().split()
 ra_name, _, ra_region = region_allowed.partition(":")
 out = []
@@ -153,11 +170,13 @@ for a in actions:
         if ra_name == name and (":%s::" % ra_region) in r:
             rd = "allowed"
         per.append({"EvalResourceName": r, "EvalResourceDecision": rd,
+                    "MatchedStatements": matched(rd),
                     "MissingContextValues": [missing] if missing else []})
     top = d
     if ra_name == name and d == "explicitDeny":
         top = "implicitDeny"
     e = {"EvalActionName": a, "EvalResourceName": "*", "EvalDecision": top,
+         "MatchedStatements": matched(top),
          "MissingContextValues": [missing] if missing else []}
     if not no_per:
         e["ResourceSpecificResults"] = per
@@ -169,9 +188,21 @@ PY
 esac
 SH
 chmod +x "$T/bin/aws"
+# No test may reach a real cloud CLI: each name below must resolve to its
+# shim, or the run stops here.
+shimmed() {
+  local dir=$1 c; shift
+  for c in "$@"; do
+    [ "$(PATH="$dir:$PATH" command -v "$c")" = "$dir/$c" ] \
+      || { echo "setup: $c does not resolve to the shim in $dir — stopping" >&2; exit 1; }
+  done
+}
+shimmed "$T/bin" aws
+set +e
 
 # run_guard — runs the guard with the shim; returns its status.
 run_guard() {
+  shimmed "$T/bin" aws
   : > "$T/aws.log"
   local e=(PATH="$T/bin:$PATH" AWS_LOG="$T/aws.log" SIM_RES_LOG="$T/simres")
   [ -n "${NO_CI_ROLE:-}" ] || e+=(HARDENED_CI_ROLE_ARN="${CI_ROLE_ARN:-$CI_ROLE}")
@@ -276,6 +307,13 @@ check "does not blame github-cfn-publish" "$(grep -qF 'github-cfn-publish' "$T/s
 MFA_MASKED=aleksei run_guard
 check "a 'require MFA' deny does not stand in for the fence deny → exit 1" \
   "$([ $? -eq 1 ] && line_of user/aleksei | grep -qF '(worst: allowed)'; echo $?)"
+OTHER_DENY=aleksei run_guard
+check "an explicit deny matched only by another policy → exit 1, worst 'explicitDeny (other policy)'" \
+  "$([ $? -eq 1 ] && line_of user/aleksei | grep -qF '(worst: explicitDeny (other policy)), e.g. ec2:DeregisterImage@us-east-1'; echo $?)"
+OTHER_DENY=aleksei HARDENED_DENY_POLICY_NAME=deny-other-policy run_guard
+check "HARDENED_DENY_POLICY_NAME names the fence policy: that policy's deny passes, the default's fails" \
+  "$([ $? -eq 1 ] && ! line_of user/aleksei | grep -q . && line_of role/github-cfn-publish | grep -qF '(worst: explicitDeny (other policy))' \
+     && grep -qxF 'attach deny-other-policy to these principals (terraform apply in idlefy/infra, terraform/aws/account)' "$T/stderr"; echo $?)"
 
 echo "== HARDENED_PUBLIC decides the block-public-access check =="
 BPA_ON="us-east-1 eu-central-1" HARDENED_PUBLIC=false run_guard
@@ -312,6 +350,10 @@ check "no applied quota → the AWS default is used, exit 0" "$?"
 check "…and the fallback was read" "$([ "$(calls 'get-aws-default-service-quota')" = 2 ]; echo $?)"
 QUOTA_APPLIED_MISSING=1 PUBLIC_COUNT=5 DEFAULT_QUOTA=5 run_guard
 check "no applied quota and no headroom under the default → exit 1" "$([ $? -eq 1 ]; echo $?)"
+FAIL_CALL="service-quotas:get-service-quota" PUBLIC_COUNT=0 run_guard
+check "get-service-quota denied → exit 1, named; never a fall-back to the default" \
+  "$([ $? -eq 1 ] && grep -qF 'us-east-1: service-quotas get-service-quota L-0E3CBAB9: the call failed: An error occurred (AccessDenied)' "$T/stderr" \
+     && [ "$(calls 'get-aws-default-service-quota')" = 0 ]; echo $?)"
 
 echo "== the wrong account =="
 GUARD_ACCOUNT=111111111111 run_guard; check "exit 1" "$([ $? -eq 1 ]; echo $?)"
