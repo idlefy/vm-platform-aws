@@ -61,6 +61,12 @@ REMOVE_SOLO=(
   "/root/.bash_history" # none expected; defensive
   "/tmp/*" # install leftovers (uv tarball, node compile cache, sockets)
   "/var/tmp/*" # systemd private dirs
+  "/var/lib/snapd" # snapd's state, device key and serial
+  "/snap" # snap mount points
+  "/var/snap" # per-snap data
+  "/var/cache/snapd" # snapd's cache
+  "/root/snap" # per-user snap data
+  "/home/*/snap" # per-user snap data
 )
 EMPTY_SOLO=(
   "/etc/machine-id" # systemd/journald identity; /var/lib/dbus/machine-id links here
@@ -88,15 +94,31 @@ solo_dir() {
 }
 
 # Hook 2, after the stops and before the removals: purge CINC (fatal, never a
-# note — an image with CINC on it is the thing law A1 forbids), then swap in
-# the solo lists, which mop up whatever the purge leaves.
+# note — an image with CINC on it is the thing law A1 forbids), check the SSM
+# agent is gone, purge snapd, drop apt's package cache, then swap in the solo
+# lists, which mop up whatever the purges leave.
 # apt-get waits for a dpkg lock unattended-upgrades may still hold.
-# The cinc-client check is here, not in solo_check: the lists remove /opt/cinc
-# defensively, so after them its absence would prove nothing.
+# The cinc-client and SSM-snap checks are here, not in solo_check: the lists
+# remove /opt/cinc, /snap and /var/lib/snapd, so after them an absence would
+# prove nothing.
 solo_prep() {
   DEBIAN_FRONTEND=noninteractive apt-get purge -y -o DPkg::Lock::Timeout=300 cinc \
     || refuse "cinc purge failed"
   [ ! -e "$R/opt/cinc/bin/cinc-client" ] || refuse "cinc still installed (/opt/cinc/bin/cinc-client is on disk)"
+  # The SSM agent is an inbound instruction channel; base::no_ssm_agent removed
+  # its snap. `snap list` also fails when snapd is unreachable, so the disk is
+  # checked as well — both before snapd's purge would hide a failed removal.
+  if snap list amazon-ssm-agent >/dev/null 2>&1; then refuse "the amazon-ssm-agent snap is still installed"; fi
+  if [ -e "$R/snap/amazon-ssm-agent" ] || compgen -G "$R/var/lib/snapd/snaps/amazon-ssm-agent_*.snap" >/dev/null; then
+    refuse "the amazon-ssm-agent snap is still on disk"
+  fi
+  # snapd leaves: its state holds a device key and serial made on the build
+  # instance, which every box would share; ubuntu has no sudo, so only the
+  # admin could use snap at all (ruling 2026-11-20). solo_check proves it gone.
+  DEBIAN_FRONTEND=noninteractive apt-get purge -y -o DPkg::Lock::Timeout=300 snapd \
+    || refuse "snapd purge failed"
+  # The package cache (321 MB on the first build); the lists stay.
+  apt-get clean || refuse "apt-get clean failed"
   # shellcheck disable=SC2034 # read by dev-vm-image-scrub
   REMOVE=("${REMOVE_SOLO[@]}")
   # shellcheck disable=SC2034 # read by dev-vm-image-scrub
@@ -190,12 +212,22 @@ solo_check() {
     || refuse "/etc/iptables/rules.v4 has an OUTPUT rule before its IMDS drop other than root's or Instance Connect's owner allow"
   meta_preamble_ok /etc/iptables/rules.v6 fd00:ec2::254/128 "$eic" \
     || refuse "/etc/iptables/rules.v6 has an OUTPUT rule before its IMDS drop other than root's or Instance Connect's owner allow"
-  # 7. The SSM agent is an inbound instruction channel. `snap list` also fails
-  #    when snapd is unreachable, so the disk is checked as well.
-  if snap list amazon-ssm-agent >/dev/null 2>&1; then refuse "the amazon-ssm-agent snap is still installed"; fi
-  if [ -e "$R/snap/amazon-ssm-agent" ] || compgen -G "$R/var/lib/snapd/snaps/amazon-ssm-agent_*.snap" >/dev/null; then
-    refuse "the amazon-ssm-agent snap is still on disk"
-  fi
+  # 7. snapd is gone, and with it every snap and the SSM agent (its snap was
+  #    checked gone in solo_prep): the package, its state, and every unit a
+  #    snap or snapd installs. No SSM agent as a package either.
+  # shellcheck disable=SC2016 # dpkg-query's format, not a shell expansion
+  for f in snapd amazon-ssm-agent; do
+    if st=$(dpkg-query -W -f='${db:Status-Status}' "$f" 2>/dev/null) && [ "$st" != not-installed ]; then
+      refuse "$f still installed (dpkg status '${st:-?}')"
+    fi
+  done
+  for f in /var/lib/snapd /snap; do
+    [ ! -e "$R$f" ] || refuse "$f is still on disk after the snapd purge"
+  done
+  st=$(find "$R/etc/systemd/system" "$R/lib/systemd/system" "$R/usr/lib/systemd/system" \
+         \( -name 'snap-*.mount' -o -name 'snapd.*' -o -name 'snap.*' -o -name 'amazon-ssm-agent*' \) \
+         -print 2>/dev/null | head -n 3) || true
+  [ -z "$st" ] || refuse "snap or SSM units are left: $(printf '%s' "$st" | tr '\n' ' ')"
   # 8. So is CINC (its files on disk were checked in solo_prep, after the
   #    purge). A purged package dpkg still remembers reads not-installed.
   # shellcheck disable=SC2016 # dpkg-query's format, not a shell expansion

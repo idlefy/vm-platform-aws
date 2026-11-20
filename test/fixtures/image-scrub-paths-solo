@@ -78,6 +78,17 @@ remove /root/.bash_history                                   # none expected; de
 remove /tmp/*                                                # install leftovers (uv tarball, node compile cache, sockets)
 remove /var/tmp/*                                            # systemd private dirs
 
+# --- snapd: purged by the solo scrub; these are what a purge can leave ----------
+# The build's snapd holds a device identity (private-keys-v1, a serial)
+# created at build time: every box would share it (measured, hand test
+# 2026-11-20). ubuntu has no sudo, so only the admin could use snap at all.
+remove /var/lib/snapd                                        # snapd's state, device key and serial
+remove /snap                                                 # snap mount points
+remove /var/snap                                             # per-snap data
+remove /var/cache/snapd                                      # snapd's cache
+remove /root/snap                                            # per-user snap data
+remove /home/*/snap                                          # per-user snap data
+
 # --- what the image is for ---------------------------------------------------------
 keep   /usr/share/dev-vm/home/.zshrc                         # base's staged home files
 keep   /etc/iptables/rules.v4     # IMDS + inbound rules A persists

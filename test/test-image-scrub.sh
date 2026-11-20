@@ -54,9 +54,15 @@ printf '[ -n "${SHIM_FAIL_CLOUDINIT:-}" ] && exit 1\nexit 0\n' >> "$T/bin/cloud-
   # id logs only the call it answers: the scrub's own `id -u` (the non-root
   # guard) must stay invisible to the fleet sections' "ran nothing" checks.
   printf '#!/usr/bin/env bash\n' > "$T/bin/id"; chmod +x "$T/bin/id"
-  printf 'exit "${SHIM_PURGE_RC:-0}"\n' >> "$T/bin/apt-get"
+  # apt-get: `purge … cinc` answers SHIM_PURGE_RC, `purge … snapd`
+  # SHIM_SNAPD_PURGE_RC, `clean` SHIM_CLEAN_RC.
+  printf 'case "$1 ${*: -1}" in "purge snapd") exit "${SHIM_SNAPD_PURGE_RC:-0}" ;; "clean clean") exit "${SHIM_CLEAN_RC:-0}" ;; esac\nexit "${SHIM_PURGE_RC:-0}"\n' >> "$T/bin/apt-get"
   printf 'exit 0\n' >> "$T/bin/dpkg"
-  printf '[ "${*: -1}" = cinc ] && [ -n "${SHIM_CINC_STILL_INSTALLED:-}" ] && exit 0\nexit 1\n' >> "$T/bin/dpkg-query"
+  printf '[ "${*: -1}" = cinc ] && [ -n "${SHIM_CINC_STILL_INSTALLED:-}" ] && exit 0\n' >> "$T/bin/dpkg-query"
+  printf '[ "${*: -1}" = snapd ] && [ -n "${SHIM_SNAPD_STILL_INSTALLED:-}" ] && { printf installed; exit 0; }\n' >> "$T/bin/dpkg-query"
+  printf '[ "${*: -1}" = amazon-ssm-agent ] && [ -n "${SHIM_SSM_DEB_INSTALLED:-}" ] && { printf installed; exit 0; }\n' >> "$T/bin/dpkg-query"
+  # A purged package dpkg still remembers answers not-installed.
+  printf '[ "${*: -1}" = snapd ] && { printf not-installed; exit 0; }\nexit 1\n' >> "$T/bin/dpkg-query"
   printf '[ "$1" = -c ] && exit "${SHIM_VISUDO_RC:-0}"\nexit 0\n' >> "$T/bin/visudo"
   printf '[ "$*" = "list amazon-ssm-agent" ] && [ -n "${SHIM_SSM_SNAP_PRESENT:-}" ] && exit 0\nexit 1\n' >> "$T/bin/snap"
   # Anything but `id -nG ubuntu` is the real id (the non-root check runs id -u).
@@ -246,6 +252,14 @@ check "checks the first-boot unit is enabled" "$(grep -q "systemctl is-enabled -
 check "checks sudoers with visudo -c" "$(grep -q '^visudo -c' "$T/log"; echo $?)"
 check "checks ubuntu's groups" "$(grep -q '^id -nG ubuntu' "$T/log"; echo $?)"
 check "checks the SSM snap is gone" "$(grep -q '^snap list amazon-ssm-agent' "$T/log"; echo $?)"
+SNAPD_PURGE='apt-get purge -y -o DPkg::Lock::Timeout=300 snapd'
+check "purges snapd, waiting for the dpkg lock" "$(grep -qx "$SNAPD_PURGE" "$T/log"; echo $?)"
+check "  …after the SSM snap check and the cinc purge" \
+  "$([ "$(lineno '^snap list amazon-ssm-agent')" -lt "$(lineno "^$SNAPD_PURGE\$")" ] && [ "$(lineno "^$PURGE\$")" -lt "$(lineno "^$SNAPD_PURGE\$")" ]; echo $?)"
+check "  …then cleans apt's cache" "$([ "$(lineno "^$SNAPD_PURGE\$")" -lt "$(lineno '^apt-get clean$')" ]; echo $?)"
+check "checks snapd and an SSM package are gone after the purge" \
+  "$(between "$(lineno '^dpkg-query .*snapd$')" "$(lineno "^$SNAPD_PURGE\$")" "$(lineno 'cloud-init clean')" \
+     && grep -q '^dpkg-query .*amazon-ssm-agent$' "$T/log"; echo $?)"
 check "checks cinc is gone after the purge" "$(rc between "$(lineno '^dpkg-query .*cinc')" "$(lineno '^apt-get purge')" "$(lineno 'cloud-init clean')")"
 check "records the sha" "$(grep -qx "$REV" "$R/etc/dev-vm/image-revision"; echo $?)"
 check "powers off last" "$(tail -1 "$T/log" | grep -q '^poweroff'; echo $?)"
@@ -349,9 +363,34 @@ done
 set --
 solo_refuses "SSM snap still installed"     "amazon-ssm-agent"   ":" SHIM_SSM_SNAP_PRESENT=1
 # snap list fails when snapd is unreachable; the disk still tells.
-solo_refuses "SSM snap mounted though snap list fails" "amazon-ssm-agent" "mkdir -p snap/amazon-ssm-agent/current"
+# build_root seeds /snap and /var/lib/snapd as plain files (the list removes
+# them); a real snap needs them as directories. Checked before snapd's purge
+# and the lists, which would remove the evidence.
+solo_refuses "SSM snap mounted though snap list fails" "amazon-ssm-agent" "rm snap && mkdir -p snap/amazon-ssm-agent/current"
 solo_refuses "SSM snap file though snap list fails"    "amazon-ssm-agent" \
-  "mkdir -p var/lib/snapd/snaps && echo x > var/lib/snapd/snaps/amazon-ssm-agent_1234.snap"
+  "rm var/lib/snapd && mkdir -p var/lib/snapd/snaps && echo x > var/lib/snapd/snaps/amazon-ssm-agent_1234.snap"
+check "  …and snapd was not purged first" "$(! grep -q '^apt-get purge .* snapd$' "$T/log"; echo $?)"
+solo_refuses "snapd purge fails"            "snapd purge failed" ":" SHIM_SNAPD_PURGE_RC=1
+solo_refuses "apt-get clean fails"          "apt-get clean failed" ":" SHIM_CLEAN_RC=1
+solo_refuses "snapd still installed"        "snapd still installed" ":" SHIM_SNAPD_STILL_INSTALLED=1
+solo_refuses "an SSM agent package"         "amazon-ssm-agent still installed" ":" SHIM_SSM_DEB_INSTALLED=1
+for u in etc/systemd/system/snap-core22-1380.mount etc/systemd/system/multi-user.target.wants/snap-lxd-1.mount \
+         usr/lib/systemd/system/snapd.service etc/systemd/system/snap.amazon-ssm-agent.amazon-ssm-agent.service \
+         lib/systemd/system/amazon-ssm-agent.service; do
+  solo_refuses "a unit left: $u"            "snap or SSM units are left" "mkdir -p \"\$(dirname $u)\" && touch $u"
+done
+# The lists remove /var/lib/snapd and /snap; the check after them catches a
+# list that lost either line (a scrub whose sibling lacks them).
+for gone in /var/lib/snapd /snap; do
+  mkdir -p "$T/nolist"; cp "$SCRUB" "$T/nolist/dev-vm-image-scrub"
+  grep -vxF "  \"$gone\" # $(grep -F "  \"$gone\" #" "$SOLO" | sed 's/^[^#]*# //')" "$SOLO" > "$T/nolist/dev-vm-image-scrub-solo"
+  check "the test copy lacks $gone" "$(! grep -qF "  \"$gone\" #" "$T/nolist/dev-vm-image-scrub-solo"; echo $?)"
+  build_root "$R" "2026-11-01T00:00:00Z ok $REV" "$LIST_SOLO"; seed_solo "$R"; : > "$T/log"
+  ( SCRUB="$T/nolist/dev-vm-image-scrub"; export DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$FIRSTBOOT"
+    run_scrub "$R" solo ); got=$?
+  check "a list without $gone → exit 70, named, no poweroff" \
+    "$([ "$got" = 70 ] && grep -qF "$gone is still on disk after the snapd purge" "$T/console" && ! grep -q '^poweroff' "$T/log"; echo $?)"
+done
 solo_refuses "no /etc/dev-vm"               "/etc/dev-vm"        "rm -r etc/dev-vm"
 check "  …and no image-revision written" "$(rc [ ! -e "$R/etc/dev-vm/image-revision" ])"
 
@@ -418,6 +457,13 @@ check "stops the SSM agent before any download" "$(rc before_curl 'snap stop --d
 check "  …after the seed wait" \
   "$(rc [ "$(first_line '^timeout 600 snap wait')" -lt "$(first_line 'snap stop --disable amazon-ssm-agent')" ])"
 check "  …and stops its unit directly too" "$(rc before_curl '^systemctl stop snap.amazon-ssm-agent.amazon-ssm-agent.service')"
+# A stock image has no apt lists: the converge's first package would have no
+# candidate (measured on the first build). Refreshed after the policy is
+# vetted, before the converge, and under the ERR trap (a failure is reported).
+check "apt-get update before the converge, after the policy check" \
+  "$(a=$(first_line '^apt-get update -qq$'); b=$(first_line '^if ! cinc-client -z '); c=$(first_line 'does not name the solo policy'); \
+     d=$(first_line '^trap bootstrap_failed ERR$'); \
+     [ -n "$a" ] && [ -n "$b" ] && [ -n "$c" ] && [ -n "$d" ] && [ "$c" -lt "$a" ] && [ "$a" -lt "$b" ] && [ "$d" -lt "$a" ]; echo $?)"
 
 # Run a rendered copy up to its guards: every absolute path it writes is moved
 # under $T, every command it would run before them is a shim.
