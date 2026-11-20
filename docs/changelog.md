@@ -85,16 +85,20 @@ publishes it from Idlefy's account; design record:
   instance profile, a fixed security group, never connecting — and
   `regions`, the 17 default-enabled regions it is copied to.
 - `scripts/hardened-image-build.sh`, the build driver: checks the account and
-  the tag, stores the solo policy archive once as a release asset and pins
-  its sha256 in the user data, builds, and writes the release record.
+  the tag — and that the checkout is exactly the tag, with no modified,
+  staged or untracked build input — stores the solo policy archive once as a
+  release asset and pins its sha256 in the user data, builds, and writes the
+  release record. The image's `Description` and the record say
+  `visibility=public` or `visibility=private`.
 - `scripts/hardened-guard-check.sh`: refuses to publish unless the account is
   still safe to publish from (encryption by default off, public sharing
   unblocked for a public build, SSM Default Host Management unset, quota
   room, every principal but the publisher and service-linked roles
-  explicitly denied any change to a published image, in every region, and
-  no unencrypted snapshot or image outside the published ones). A failing
-  principal is reported in one line, with a hint to apply the account's
-  Terraform.
+  explicitly denied any change to a published image by the fence policy
+  itself, in every region, and no unencrypted snapshot or image outside the
+  published ones). A failing principal is reported in one line, with a hint
+  to apply the account's Terraform. A quota read that fails for any reason
+  but "no applied value" fails the guard.
 - `scripts/hardened-image-leftovers.sh` lists, read-only, any image of a
   build's name in every listed region. The driver runs it when a build fails
   or is signalled after `packer build` started, and the publish workflow runs
@@ -104,11 +108,14 @@ publishes it from Idlefy's account; design record:
   Instance Connect's owner allows (an allowlist).
 - `scripts/hardened-image-retire.sh`: keeps the newest two public builds,
   deprecates and deregisters older ones on a 7-day cadence, never
-  deregisters one of the two newest, yanks one build with `--disable`, and
-  is a dry run unless `--apply`.
+  deregisters one of the two newest ever published (read from the image's
+  `Description`; a private build is retired by its own age), yanks one build
+  with `--disable`, and is a dry run unless `--apply`. It leaves a region
+  alone on anything it cannot read, and retries a snapshot still in use.
 - Two workflows: `publish-hardened-image` (dispatched on a `vX.Y.Z` tag, or
   monthly on the newest one) and `retire-hardened-image` (dispatch only),
-  both behind the protected environment `hardened-publish`.
+  both behind the protected environment `hardened-publish`, with no token
+  permission at workflow level and only what each job needs.
 - Hardened image builds are recorded on each GitHub release as
   `hardened-ami-<date>-<nn>.json` and in the release notes.
 - New gates in the `v` stream: `test-hardened-template`,

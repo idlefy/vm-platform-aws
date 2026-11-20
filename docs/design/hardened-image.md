@@ -26,9 +26,14 @@ customer's account, with no fleet behind it. The tenant-built image
 ([Prebuilt image](ami-image.md)) does not fit: it caches a fleet converge, its
 VMs keep fetching signed policy, and it is private to one tenant's account.
 
-So Idlefy publishes one image itself, from its own account `995603458290`,
+So Idlefy publishes one image itself, from its own publisher account,
 public in every default region:
 `idlefy-hardened-agent-ubuntu-24.04-amd64-YYYYMMDD-NN`.
+
+**The publisher account is `995603458290`.** This id is public by design: it
+is the owner id of the published images, which every consumer filters on.
+This is the one place the docs name it; elsewhere they say "the publisher
+account" (the scripts pin it as `ACCOUNT_ID`).
 
 **Law A1.** Nothing baked into this image takes instructions from Idlefy
 after launch. No policy fetch, no credential broker, no SSM agent, no CINC, no
@@ -107,15 +112,22 @@ reaches it only through what the customer's own account does to the instance
    present (`aws:MultiFactorAuthPresent=true`): an account's "require MFA"
    deny would otherwise read as `explicitDeny` and hide a principal that
    lacks the fence deny — measured on the account, the owner's user simulated
-   `explicitDeny` only because of such a policy. The report is one line per
+   `explicitDeny` only because of such a policy. For the same reason an
+   `explicitDeny` counts only when the fence policy itself
+   (`deny-idlefy-published-image-mutation`, overridable as
+   `HARDENED_DENY_POLICY_NAME`) is among the decision's `MatchedStatements`
+   (`SourcePolicyId` names an attached managed policy by its name): a deny
+   from any other policy can be removed without touching the fence, and
+   fails as `explicitDeny (other policy)`. The report is one line per
    failing principal (how many decisions were not `explicitDeny`, the worst,
    three `action@region` examples) and one hint to apply the Terraform;
    passing principals are only counted. The
    guard is read-only and reports every failure, not the first; roles under
    `/aws-reserved/` (Identity Center) cannot be simulated usefully, so they
    are skipped and listed for a manual check. For the public-AMI quota (G2c)
-   it falls back to AWS's default value when the account has no applied
-   one.
+   it falls back to AWS's default value only when the account has no applied
+   one (`NoSuchResourceException`); any other failed read, such as
+   `AccessDenied`, is a failure.
 
 7. **The name pattern is an assert, not a fence.** The template refuses any
    name but `idlefy-hardened-agent-ubuntu-24.04-amd64-YYYYMMDD-NN`, and the
@@ -144,13 +156,31 @@ reaches it only through what the customer's own account does to the instance
      and left be);
    - **deregister** a build deprecated 7 or more days ago, or disabled, 7 or
      more days old and not one of the two newest builds ever published; then
-     delete its snapshots;
+     delete its snapshots. A snapshot AWS still reports in use
+     (`InvalidSnapshot.InUse`) is retried 6 times, 10 s apart; the other
+     snapshots are still deleted, and every one left is named and the run
+     exits 1. Each deprecation time is computed right before its call;
+   - **ever published** is read from the image's `Description`, which the
+     template sets on the image and on every copy, in the same step that
+     shares it: `Idlefy hardened image for AI agents; visibility=public` or
+     `…private`, from the build's `public` input; the release record carries
+     the same string. `Public` cannot tell: a disabled image is private
+     whether it was yanked or never public. A yanked public build still
+     counts; **a private build never does — it is never kept, never one of
+     the two newest, and is retired by its own age**;
    - **safety net:** a build among the two newest ever published is never
      deregistered. If one of them has passed its deprecation date (the
      two-year default, should publishing stop), the region is reported,
      nothing is done in it, and the script exits 1;
+   - only images in state `available` or `disabled` are acted on; another
+     state (`pending`, `failed`, `deregistered` — a deregistered image stays
+     listed for a while) is ignored, unless the image is newer than a build
+     retention would keep;
    - a region the script is unsure of — a name outside the pattern, a name
-     twice, a date or snapshot it cannot read — is left alone, named, and the
+     twice, a date, snapshot, block-device mapping, state or `Description` it
+     cannot read, a public image whose `Description` says private, a
+     not-disabled private image whose `Description` says public, or an image
+     in another state among the two newest — is left alone, named, and the
      run exits 1. The retire workflow prints the plan into the job summary and
      fails visibly; it never hides a doubt behind a green run.
 
@@ -179,11 +209,12 @@ reaches it only through what the customer's own account does to the instance
       "architecture": "x86_64",
       "base_tag": "base-X.Y.Z",
       "built_at": "YYYY-MM-DDTHH:MM:SSZ",
+      "description": "Idlefy hardened image for AI agents; visibility=public",
       "format": 1,
       "image": "ubuntu-24.04-hardened",
       "login_user": "ubuntu",
       "name": "idlefy-hardened-agent-ubuntu-24.04-amd64-YYYYMMDD-NN",
-      "owner_id": "995603458290",
+      "owner_id": "<publisher account id>",
       "platform_sha": "<40 hex>",
       "platform_tag": "vX.Y.Z",
       "public": true,
@@ -275,11 +306,11 @@ not the first, and a denied or unreadable read is a failure, never a pass.
 
 | Check | Refuses when |
 |---|---|
-| G1 | the caller is not in account `995603458290` (nothing else is called) |
+| G1 | the caller is not in the publisher account (nothing else is called) |
 | G2 | in a region of `image/hardened/regions`: EBS encryption by default is on (the copy would be encrypted and could not be public); the region is not enabled; for a **public** build only, image block public access is not `unblocked` |
 | G2b | SSM Default Host Management Configuration is set in a region (it would hand the build instance a role) |
-| G2c | a region has no room under the public-AMI quota `L-0E3CBAB9` for one more public image (deprecated public images count; the AWS default applies when no value was applied) |
-| G3 | an IAM user or role other than the publish role and service-linked roles gets any simulated decision other than `explicitDeny` — top level or per resource, any fenced action on an image or snapshot tagged `IdlefyPublishedImage=true`, any listed region — or its simulation fails or answers short. `implicitDeny` fails like `allowed`. Policy simulation with the fence tag and `aws:MultiFactorAuthPresent=true`, one resource ARN per region (at most 10 per call). One line per failing principal plus the Terraform hint; passing ones are counted. `/aws-reserved/` roles are skipped and listed for a manual check |
+| G2c | a region has no room under the public-AMI quota `L-0E3CBAB9` for one more public image (deprecated public images count; the AWS default applies only when no value was applied — any other failed read fails) |
+| G3 | an IAM user or role other than the publish role and service-linked roles gets any simulated decision other than `explicitDeny` — top level or per resource, any fenced action on an image or snapshot tagged `IdlefyPublishedImage=true`, any listed region — or its simulation fails or answers short. `implicitDeny` fails like `allowed`; an `explicitDeny` whose `MatchedStatements` do not include the fence policy fails as `explicitDeny (other policy)`. Policy simulation with the fence tag and `aws:MultiFactorAuthPresent=true`, one resource ARN per region (at most 10 per call). One line per failing principal plus the Terraform hint; passing ones are counted. `/aws-reserved/` roles are skipped and listed for a manual check |
 | G4 | a region holds a self-owned unencrypted snapshot, or a self-owned image with an unencrypted snapshot, not tagged `IdlefyPublishedImage=true` — each named with its region |
 
 G4 exists because the publisher role can copy images inside the account, and
@@ -345,21 +376,29 @@ UTC):
   of the chosen name into the job summary (without a name file it says the
   build chose no name, or its record was uploaded), and the `record` step
   prints any record written.
-- `permissions: contents: write, id-token: write`, nothing broader;
+- `permissions: {}` at workflow level; `resolve` gets `contents: read`, and
+  only the `publish` job gets `contents: write, id-token: write`. The retire
+  workflow is the same: nothing at workflow level, its job `contents: read,
+  id-token: write`;
   `concurrency: hardened-publish` without cancel. A third queued run replaces
   a pending one, as GitHub concurrency does. The retire workflow has its own
   group, `hardened-retire`, so a publish waiting for approval never blocks a
   yank and a queued publish never replaces a pending retire. A retention that
-  runs during a build is harmless: the new image is registered only at the
-  end, and retention keys on registered public builds.
+  runs during a build changes nothing in a region where the new image is
+  still `pending`, or registered but not yet shared: it is newer than the
+  kept builds, so the region is left alone and the run exits 1.
 - The first scheduled run after this workflow reaches `main` builds the
   newest existing `v*` tag, whichever that is.
 - `public` is a boolean input, default `true`; the schedule always builds
   public. The expression is
   `github.event_name == 'schedule' && 'true' || inputs.public` — never
   `inputs.public || 'true'`, which turns a `false` into `'true'`.
-- The driver's test hooks `HARDENED_SKIP_TAG_CHECK` and `HARDENED_TODAY` are
-  never set by a workflow. The driver refuses `HARDENED_TODAY` unless
+- The driver refuses a checkout that is not exactly the tag: `HEAD` must be
+  `PLATFORM_SHA`, no tracked file may be modified or staged, and no untracked
+  file may sit under `image/`, `scripts/` or `cinc/` (ignored ones included);
+  `dist/` is the build's own output.
+- The driver's test hooks `HARDENED_SKIP_TAG_CHECK` (which also skips the
+  clean-tree check) and `HARDENED_TODAY` are never set by a workflow. The driver refuses `HARDENED_TODAY` unless
   `HARDENED_SKIP_TAG_CHECK=1` is set too: a forward-dated name would stay the
   "newest" build for retention forever.
 - A scheduled run also waits for the environment approval; an unapproved one
@@ -448,8 +487,9 @@ trailing comment. No input or ref name is interpolated into a `run:` script.
 - The solo section of `test/test-image-scrub.sh` — the solo lists against
   their fixture, the CINC purge, and the invariants of decision 12 refusing on
   a fake root.
-- The workflows have no local test; `actionlint` (run by CodeRabbit) checks
-  them, and the first private build is their test.
+- The workflows have no local test, and no automated check validates the
+  workflow files today: they were checked by a YAML parse and by reading.
+  The first private build is their test.
 
 ## To verify on the first private build
 

@@ -626,8 +626,9 @@ running VM, because the module ignores AMI changes on existing instances.
 ### Idlefy-published image
 
 Idlefy also publishes a public image built from this repository for its own
-Dev Boxes: `idlefy-hardened-agent-ubuntu-24.04-amd64-YYYYMMDD-NN`, owner
-`995603458290`. It is not a tenant image and nothing here builds it from a
+Dev Boxes: `idlefy-hardened-agent-ubuntu-24.04-amd64-YYYYMMDD-NN`, owned by
+Idlefy's publisher account (its id is stated in the design record). It is not
+a tenant image and nothing here builds it from a
 tenant. How it is built, published and retired is in
 [Hardened image for AI agents](design/hardened-image.md).
 
@@ -649,9 +650,12 @@ clean up **before any retention run or new build**:
    read-only):
    `aws ec2 describe-images --region <r> --owners self --include-deprecated --include-disabled --filters Name=name,Values=<name> --query 'Images[].[ImageId,State,Public,BlockDeviceMappings[].Ebs.SnapshotId]'`.
 2. **Tagged leftovers** (`IdlefyPublishedImage=true: yes`). Once tagged, no
-   principal but the publisher role may change them — not the owner either,
-   and that role trusts only the workflow's environment. The only path is
-   the retire workflow: run *retire-hardened-image* with
+   IAM user or role but the publisher role may change them — not the owner's
+   IAM identities either, and that role trusts only the workflow's
+   environment. The account root user is not restricted (there is no SCP on
+   this account) and can still change them; that is the break-glass path,
+   not a routine one. The routine path is the retire workflow: run
+   *retire-hardened-image* with
    `disable_name=<name>` and `apply=true`. It disables the name in every
    region and runs no retention; a disabled image is private and cannot be
    launched. A later retention run deregisters it and deletes its snapshots
