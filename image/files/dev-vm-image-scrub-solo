@@ -212,7 +212,8 @@ no_units_left() {
   local hits
   hits=$(find "$R/" -xdev \( -type f -o -type l \) \
            \( -name 'snap*.service' -o -name 'snap*.socket' -o -name 'snap*.mount' -o -name 'snap*.timer' \
-              -o -name 'snap*.target' -o -name 'snap*.path' -o -name 'amazon-ssm-agent*' \) -print) \
+              -o -name 'snap*.target' -o -name 'snap*.path' -o -name 'snap*.slice' -o -name 'snap*.scope' \
+              -o -name 'amazon-ssm-agent*' \) -print) \
     || refuse "cannot scan / for snap or SSM units"
   [ -z "$hits" ] || refuse "snap or SSM units are left: $(printf '%s' "$hits" | head -n 3 | tr '\n' ' ')"
 }

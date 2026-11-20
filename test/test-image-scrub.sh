@@ -514,12 +514,14 @@ for u in usr/local/lib/systemd/system/snapd.service \
          etc/xdg/systemd/user/snapd.session-agent.socket \
          usr/share/systemd/user/snap.z.timer \
          var/lib/somewhere/snap-core22-1.target \
-         etc/systemd/system/snapd.apparmor.path; do
+         etc/systemd/system/snapd.apparmor.path \
+         etc/systemd/system/snap.quota-group.slice \
+         etc/systemd/system/snap.lxd.lxc-1234.scope; do
   solo_refuses "a unit left: /$u" "snap or SSM units are left" "mkdir -p \"\$(dirname $u)\" && touch $u"
 done
 solo_passes "rootless Docker's user unit (~ubuntu/.config/systemd/user/docker.service) is not a snap unit" \
   "mkdir -p home/ubuntu/.config/systemd/user/default.target.wants && touch home/ubuntu/.config/systemd/user/docker.service && ln -s ../docker.service home/ubuntu/.config/systemd/user/default.target.wants/docker.service"
-solo_passes "a directory named like a unit is not a unit" "mkdir -p etc/systemd/system/snap.d-not-a-unit"
+solo_passes "a directory named like a unit is not a unit" "mkdir -p etc/systemd/system/snap.example.service"
 # Links are matched as links and never followed: a unit behind a linked
 # directory is found where it really lies.
 solo_refuses "a unit behind a linked directory is found at its real path" "opt/units/snap.q.service" \

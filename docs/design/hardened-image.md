@@ -314,7 +314,8 @@ reaches it only through what the customer's own account does to the instance
          `/var/lib/snapd`, `/snap`, `/usr/bin/snap` and `/usr/lib/snapd/snapd`
          are gone. **No unit-shaped file or link** named `snap*.service`,
          `snap*.socket`, `snap*.mount`, `snap*.timer`, `snap*.target`,
-         `snap*.path` or `amazon-ssm-agent*` is left **anywhere on the root
+         `snap*.path`, `snap*.slice` (snapd writes `snap.<group>.slice` for
+         quota groups), `snap*.scope` or `amazon-ssm-agent*` is left **anywhere on the root
          filesystem**: one `find / -xdev` over files and links, not a list
          of unit directories — three reviews each found another directory
          systemd reads units from (`/usr/local/lib`, `~/.config`,
@@ -679,7 +680,10 @@ trailing comment. No input or ref name is interpolated into a `run:` script.
     solo hook truncates the two open logs and runs `cloud-init clean` before
     the fill), and the ext4 reserve (set to 0 for the fill). Files still
     held open after deletion would escape it; the scrub refuses if any is
-    left (check 10), and `exec` drops bash's hold on its own script.
+    left through an open file descriptor (check 10), and `exec` drops bash's
+    hold on its own script. Deleted files held only through a memory mapping
+    are **not** checked — libraries apt replaced during the converge, still
+    mapped by running processes: they hold public package contents.
   - It does **not** cover:
     - the slack at the end of a file's last block (a live file's own block,
       not a free one);
@@ -874,6 +878,10 @@ build — none of it was exercised by hand:
   The purge left `/var/cache/apparmor/*/snap-confine*` (now on the list).
   The whole-filesystem unit scan (`find / -xdev`, the names of check 7)
   returned nothing on that image, rootless Docker included.
+- The scrub of `a47a083` — the `O_DIRECT` fill with the ext4 reserve at 0,
+  the deleted-but-open check, the whole-filesystem unit scan, the exec'd
+  scrub — passed every check on a real instance on 2026-11-20; it powered
+  off about 5.5 minutes after launch.
 
 - `ec2:Owner` for Canonical's images is the alias `amazon`, not the account
   id (run 1, a refused RunInstances).
