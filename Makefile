@@ -95,11 +95,17 @@ release: ## Gate and cut an artifact tag (usage: make release TAG=base-X.Y.Z | v
 	  grep -qxF '**`'"$$final"'`**' docs/changelog.md 2>/dev/null \
 	    || { echo "refusing: $(TAG) is a pre-release of $$final, and docs/changelog.md has no entry for it."; \
 	         echo "          A pre-release tests what $$final will ship: write its changelog entry first."; exit 1; }; \
-	  up=$$(git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null) || up=""; \
-	  if git rev-parse -q --verify "refs/tags/$$final" >/dev/null \
-	     || { [ -n "$$up" ] && [ -n "$$(git ls-remote --tags "$${up%%/*}" "refs/tags/$$final" 2>/dev/null)" ]; }; then \
+	  if git rev-parse -q --verify "refs/tags/$$final" >/dev/null; then \
 	    echo "refusing: $$final is already tagged; $(TAG) would be a pre-release of a released version."; \
-	    echo "          Test the next version instead."; exit 1; fi ;; \
+	    echo "          Test the next version instead."; exit 1; fi; \
+	  up=$$(git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null) || up=""; \
+	  if [ -n "$$up" ]; then \
+	    remote_final=$$(git ls-remote --tags "$${up%%/*}" "refs/tags/$$final") \
+	      || { echo "refusing: could not ask $${up%%/*} whether $$final is already tagged (git ls-remote failed, above)."; exit 1; }; \
+	    if [ -n "$$remote_final" ]; then \
+	      echo "refusing: $$final is already tagged on $${up%%/*}; $(TAG) would be a pre-release of a released version."; \
+	      echo "          Test the next version instead."; exit 1; fi; \
+	  fi ;; \
 	esac
 	@git rev-parse -q --verify "refs/tags/$(TAG)" >/dev/null \
 	  && { echo "refusing: tag $(TAG) already exists. Tags are immutable — use a new number."; exit 1; } || true

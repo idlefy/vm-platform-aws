@@ -324,8 +324,8 @@ on a failure, INT or TERM runs `scripts/hardened-image-leftovers.sh`
 whether the fence tag is set) and keeps the failure's exit status. A
 cancelled or timed-out Actions run is listed by the workflow's `leftovers`
 step instead, which reads that file. The next build's NN skips their number.
-Images are never removed automatically; clean-up comes before any retention
-run or new build (`docs/runbook.md`).
+Images and their snapshots are never removed automatically; they are
+removed by hand, before any retention run or new build (`docs/runbook.md`).
 
 The same script lists, in the build region, every live instance tagged
 `Name=idlefy-hardened-image-build` and every `packer_*` key pair with that

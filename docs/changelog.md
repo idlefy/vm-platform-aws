@@ -93,8 +93,10 @@ publishes it from Idlefy's account to the regions of
   is safe to publish from, in every listed region.
 - `scripts/hardened-image-retire.sh`: keeps the newest two public builds and
   retires older ones; a dry run unless `--apply`.
-- `scripts/hardened-image-leftovers.sh`: lists, and with `--clean-build`
-  removes, what an interrupted build left.
+- `scripts/hardened-image-leftovers.sh`: lists what an interrupted build
+  left. With `--clean-build` it removes the tagged build instances and their
+  temporary key pairs; images and snapshots are only listed and are removed
+  by hand (runbook).
 - Two workflows, `publish-hardened-image` and `retire-hardened-image`, behind
   the protected environment `hardened-publish`.
 - Pre-release tags `vX.Y.Z-rc.N` for private test builds: `make release`

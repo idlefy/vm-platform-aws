@@ -660,7 +660,9 @@ before it cleaned up.
 The workflow's `leftovers` step then terminates every instance tagged
 `Name=idlefy-hardened-image-build` that is still alive in the build region
 and deletes every `packer_*` key pair with that tag — first, before it lists
-images across the regions — and lists both in the job summary. Nothing else is removed — never an image. It first checks the
+images across the regions — and lists both in the job summary. Nothing else
+is removed — never an image or a snapshot; those are removed by hand (below).
+It first checks the
 credentials are the publisher account's and stops, removing nothing, if not.
 If the run never got AWS credentials, the step says "No AWS credentials were
 configured: nothing could have been launched." — nothing to clean. If that

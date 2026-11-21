@@ -274,6 +274,15 @@ OUT=$( cd "$WORK" && make release TAG=v9.0.0-rc.1 2>&1 )
 check "v9.0.0 only on the remote: exit non-zero, says already tagged" \
   "$([ $? -ne 0 ] && echo "$OUT" | grep -q 'v9.0.0 is already tagged' && echo 0 || echo 1)"
 check "...no tag created" "$(git -C "$WORK" rev-parse -q --verify v9.0.0-rc.1 >/dev/null && echo 1 || echo 0)"
+# The remote cannot be asked: the lookup fails, which must refuse, not read
+# as "not tagged".
+git -C "$WORK" remote set-url origin "$TMP/missing.git"
+OUT=$( cd "$WORK" && make release TAG=v9.0.0-rc.1 2>&1 )
+check "a failing remote lookup: exit non-zero, says the lookup failed" \
+  "$([ $? -ne 0 ] && echo "$OUT" | grep -q 'could not ask origin whether v9.0.0 is already tagged' && echo 0 || echo 1)"
+check "...git's own error is shown" "$(echo "$OUT" | grep -qi 'missing.git\|does not appear to be a git repository' && echo 0 || echo 1)"
+check "...the gates did not run" "$(echo "$OUT" | grep -q 'boundary stub' && echo 1 || echo 0)"
+check "...no tag created" "$(git -C "$WORK" rev-parse -q --verify v9.0.0-rc.1 >/dev/null && echo 1 || echo 0)"
 teardown
 
 echo "== malformed pre-release shapes are refused =="
