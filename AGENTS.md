@@ -258,8 +258,8 @@ failing.
 
 **Packer loads every `*.pkr.hcl` in a directory as one build.** A second
 template next to `image/dev-vm.pkr.hcl` redeclares its variables and
-`packer validate .` fails with "Duplicate variable" (reproduced 2026-11-20 by
-copying both templates into one directory). The Idlefy template lives in
+`packer validate .` fails with "Duplicate variable" (reproduced by copying both
+templates into one directory). The Idlefy template lives in
 `image/hardened/`, and `test/test-hardened-template.sh` fails if a second
 `*.pkr.hcl` appears in either directory.
 
@@ -278,6 +278,12 @@ make release TAG=base-1.0.0
 make release TAG=v1.0.0
 git push origin <tag>
 ```
+
+`vX.Y.Z-rc.N` (N from 1, no leading zero) is a pre-release of `vX.Y.Z` in the
+`v` stream, with the same gates; `make release` also requires the changelog's
+`vX.Y.Z` entry. It exists for private hardened-image test builds: the publish
+workflow and the driver refuse a public build from it, and the schedule never
+picks it.
 
 The `v` stream's gate needs Packer (CI pins 1.11.2) on the releasing
 workstation, plus network access for `packer init`.

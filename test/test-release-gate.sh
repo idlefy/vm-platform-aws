@@ -229,6 +229,65 @@ check "names both streams" "$(echo "$OUT" | grep -q 'base-X.Y.Z' && echo "$OUT" 
 check "no tag created" "$(git -C "$WORK" rev-parse -q --verify 3.1.0 >/dev/null && echo 1 || echo 0)"
 teardown
 
+echo "== a pre-release vX.Y.Z-rc.N runs the same Terraform gates once the changelog holds vX.Y.Z =="
+setup 0.11.0
+mkdir -p "$WORK/docs"
+printf '# Changelog\n\n## 9.0.0\n\n**`v9.0.0`**\n\n- a change\n' > "$WORK/docs/changelog.md"
+( cd "$WORK" && git add -A && git -c user.email=t@t -c user.name=t commit -qm changelog && git push -q origin main )
+OUT=$( cd "$WORK" && make release TAG=v9.0.0-rc.1 2>&1 )
+check "exit 0" "$?"
+check "ran the boundary guard" "$(echo "$OUT" | grep -q 'boundary stub' && echo 0 || echo 1)"
+check "ran the hardened-build gate" "$(echo "$OUT" | grep -q 'hardened-build stub' && echo 0 || echo 1)"
+check "ran the smoke gate" "$(echo "$OUT" | grep -q 'smoke stub' && echo 0 || echo 1)"
+check "no chefspec on the rc path" "$(echo "$OUT" | grep -q 'chefspec stub' && echo 1 || echo 0)"
+check "tag exists on HEAD" "$([ "$(git -C "$WORK" rev-parse v9.0.0-rc.1 2>/dev/null)" = "$(git -C "$WORK" rev-parse HEAD)" ] && echo 0 || echo 1)"
+OUT=$( cd "$WORK" && make release TAG=v9.0.0-rc.12 2>&1 )
+check "rc.12 is accepted too" "$?"
+teardown
+
+echo "== a pre-release without its vX.Y.Z changelog entry is refused before the gates =="
+setup 0.11.0
+mkdir -p "$WORK/docs"
+printf '# Changelog\n\n## 8.0.0\n\n**`v8.0.0`**\n\nmentions v9.0.0 in passing\n' > "$WORK/docs/changelog.md"
+( cd "$WORK" && git add -A && git -c user.email=t@t -c user.name=t commit -qm changelog && git push -q origin main )
+OUT=$( cd "$WORK" && make release TAG=v9.0.0-rc.1 2>&1 )
+check "exit non-zero" "$([ $? -ne 0 ] && echo 0 || echo 1)"
+check "names the missing entry" "$(echo "$OUT" | grep -q 'docs/changelog.md has no entry' && echo 0 || echo 1)"
+check "the gates did not run" "$(echo "$OUT" | grep -q 'boundary stub' && echo 1 || echo 0)"
+check "no tag created" "$(git -C "$WORK" rev-parse -q --verify v9.0.0-rc.1 >/dev/null && echo 1 || echo 0)"
+teardown
+
+echo "== a pre-release of a version already tagged is refused, locally or on the remote =="
+setup 0.11.0
+mkdir -p "$WORK/docs"
+printf '# Changelog\n\n**`v9.0.0`**\n' > "$WORK/docs/changelog.md"
+( cd "$WORK" && git add -A && git -c user.email=t@t -c user.name=t commit -qm changelog && git push -q origin main )
+git -C "$WORK" tag v9.0.0
+OUT=$( cd "$WORK" && make release TAG=v9.0.0-rc.1 2>&1 )
+check "local v9.0.0: exit non-zero" "$([ $? -ne 0 ] && echo 0 || echo 1)"
+check "...says it is already tagged" "$(echo "$OUT" | grep -q 'v9.0.0 is already tagged' && echo 0 || echo 1)"
+check "...the gates did not run" "$(echo "$OUT" | grep -q 'boundary stub' && echo 1 || echo 0)"
+check "...no tag created" "$(git -C "$WORK" rev-parse -q --verify v9.0.0-rc.1 >/dev/null && echo 1 || echo 0)"
+git -C "$WORK" tag -d v9.0.0 >/dev/null
+git -C "$ORIGIN" update-ref refs/tags/v9.0.0 "$(git -C "$WORK" rev-parse HEAD)"
+OUT=$( cd "$WORK" && make release TAG=v9.0.0-rc.1 2>&1 )
+check "v9.0.0 only on the remote: exit non-zero, says already tagged" \
+  "$([ $? -ne 0 ] && echo "$OUT" | grep -q 'v9.0.0 is already tagged' && echo 0 || echo 1)"
+check "...no tag created" "$(git -C "$WORK" rev-parse -q --verify v9.0.0-rc.1 >/dev/null && echo 1 || echo 0)"
+teardown
+
+echo "== malformed pre-release shapes are refused =="
+setup 0.11.0
+mkdir -p "$WORK/docs"
+printf '# Changelog\n\n**`v9.0.0`**\n' > "$WORK/docs/changelog.md"
+( cd "$WORK" && git add -A && git -c user.email=t@t -c user.name=t commit -qm changelog && git push -q origin main )
+for bad in v9.0.0-rc v9.0.0-rc.0 v9.0.0-rc.01 v9.0.0-rc.1.2 v9.0.0-beta.1 v9.0.0-rc.1x base-0.11.0-rc.1; do
+  OUT=$( cd "$WORK" && make release TAG="$bad" 2>&1 )
+  check "$bad: refused as in neither stream, no tag" \
+    "$([ $? -ne 0 ] && echo "$OUT" | grep -q 'in neither stream' && ! git -C "$WORK" rev-parse -q --verify "$bad" >/dev/null && echo 0 || echo 1)"
+done
+teardown
+
 echo "== a stale local tracking ref is refused: the remote no longer has HEAD =="
 setup
 ( cd "$WORK" && echo x > x && git add x && git -c user.email=t@t -c user.name=t commit -qm second && git push -q origin main )

@@ -83,12 +83,24 @@ test-boundary-check: ## Test the boundary guard (no network)
 # whatever HEAD becomes later. The reachability check fetches first: a local
 # `origin/main` is only as fresh as the last fetch, and a stale one certified a
 # commit the remote no longer had (first external review, M3).
-release: ## Gate and cut an artifact tag (usage: make release TAG=base-X.Y.Z | vX.Y.Z)
-	@[ -n "$(TAG)" ] || { echo "usage: make release TAG=base-X.Y.Z (cookbook) | vX.Y.Z (terraform)"; exit 1; }
-	@printf '%s\n' "$(TAG)" | grep -Eq '^(base-|v)[0-9]+\.[0-9]+\.[0-9]+$$' \
+release: ## Gate and cut an artifact tag (usage: make release TAG=base-X.Y.Z | vX.Y.Z | vX.Y.Z-rc.N)
+	@[ -n "$(TAG)" ] || { echo "usage: make release TAG=base-X.Y.Z (cookbook) | vX.Y.Z (terraform) | vX.Y.Z-rc.N (test build of vX.Y.Z)"; exit 1; }
+	@printf '%s\n' "$(TAG)" | grep -Eq '^(base-[0-9]+\.[0-9]+\.[0-9]+|v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[1-9][0-9]*)?)$$' \
 	  || { echo "refusing: '$(TAG)' is in neither stream."; \
 	       echo "          base-X.Y.Z publishes the cookbook; vX.Y.Z publishes Terraform."; \
-	       echo "          Both need all three version segments."; exit 1; }
+	       echo "          Both need all three version segments. vX.Y.Z-rc.N (N from 1, no"; \
+	       echo "          leading zero) is a pre-release of vX.Y.Z for a private test build."; exit 1; }
+	@case "$(TAG)" in v*-rc.*) \
+	  final=$$(printf '%s' "$(TAG)" | sed 's/-rc\.[0-9]*$$//'); \
+	  grep -qxF '**`'"$$final"'`**' docs/changelog.md 2>/dev/null \
+	    || { echo "refusing: $(TAG) is a pre-release of $$final, and docs/changelog.md has no entry for it."; \
+	         echo "          A pre-release tests what $$final will ship: write its changelog entry first."; exit 1; }; \
+	  up=$$(git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null) || up=""; \
+	  if git rev-parse -q --verify "refs/tags/$$final" >/dev/null \
+	     || { [ -n "$$up" ] && [ -n "$$(git ls-remote --tags "$${up%%/*}" "refs/tags/$$final" 2>/dev/null)" ]; }; then \
+	    echo "refusing: $$final is already tagged; $(TAG) would be a pre-release of a released version."; \
+	    echo "          Test the next version instead."; exit 1; fi ;; \
+	esac
 	@git rev-parse -q --verify "refs/tags/$(TAG)" >/dev/null \
 	  && { echo "refusing: tag $(TAG) already exists. Tags are immutable — use a new number."; exit 1; } || true
 	@[ -z "$$(git status --porcelain)" ] \

@@ -7,6 +7,10 @@
 #   PLATFORM_TAG=vX.Y.Z PLATFORM_SHA=<40 hex> HARDENED_SECURITY_GROUP_ID=sg-… \
 #     scripts/hardened-image-build.sh
 #
+# A pre-release tag vX.Y.Z-rc.N (N a positive integer, no leading zero) is a
+# test build: it is refused unless HARDENED_PUBLIC=false, and a release this
+# script creates for it is a pre-release, never Latest.
+#
 # Optional: HARDENED_PUBLIC (true|false, default true), HARDENED_ATTACHED_ORG_ID
 # (a UUID), HARDENED_INSTANCE_TYPE (default c7a.xlarge), HARDENED_SUBNET_ID,
 # HARDENED_OUT (default dist), GH_REPO (default idlefy/vm-platform-aws),
@@ -54,11 +58,8 @@ LOCKFILE="$ROOT/cinc/policyfiles/solo.lock.json"
 OWNER_ID=995603458290
 # The root volume, in GiB: the build's and every copy's. A snapshot of the
 # zero-filled volume stores every block, so this is the stored size in each
-# region (owner decision 2026-11-20). 9, not 8: the publisher role's fence for
-# tagging copied snapshots uses ec2:VolumeSize as a discriminator, and 8 GiB
-# is the default root of stock Ubuntu images, so 8 would match ordinary
-# snapshots. Change hardened_volume_gib in idlefy/infra
-# terraform/aws/account/github_hardened_image.tf with it.
+# region. The publisher role's policy, kept outside this repository, names
+# the same size: change both together.
 VOLUME_GIB=9
 NAME_PREFIX=idlefy-hardened-agent-ubuntu-24.04-amd64
 
@@ -78,18 +79,25 @@ HARDENED_SUBNET_ID="${HARDENED_SUBNET_ID:-}"
 HARDENED_OUT="${HARDENED_OUT:-dist}"
 GH_REPO="${GH_REPO:-idlefy/vm-platform-aws}"
 
-[[ $PLATFORM_TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "PLATFORM_TAG='$PLATFORM_TAG' is not a vX.Y.Z tag"
+[[ $PLATFORM_TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[1-9][0-9]*)?$ ]] \
+  || die "PLATFORM_TAG='$PLATFORM_TAG' is not a vX.Y.Z or vX.Y.Z-rc.N tag"
+PRERELEASE=false
+[[ $PLATFORM_TAG == *-rc.* ]] && PRERELEASE=true
 [[ $PLATFORM_SHA =~ ^[0-9a-f]{40}$ ]] || die "PLATFORM_SHA='$PLATFORM_SHA' is not a full commit SHA"
 [[ $HARDENED_SECURITY_GROUP_ID =~ ^sg-[0-9a-f]+$ ]] \
   || die "HARDENED_SECURITY_GROUP_ID='$HARDENED_SECURITY_GROUP_ID' is not a security group id — set it to the build's fixed group"
 [[ $HARDENED_PUBLIC =~ ^(true|false)$ ]] || die "HARDENED_PUBLIC='$HARDENED_PUBLIC' must be true or false"
+# A pre-release tag is a test build: never public. Refused here, before any
+# call to GitHub or AWS, whatever the workflow passed.
+[ "$PRERELEASE" = false ] || [ "$HARDENED_PUBLIC" = false ] \
+  || die "$PLATFORM_TAG is a pre-release tag: it builds a private image only — set HARDENED_PUBLIC=false, or tag vX.Y.Z for a public build"
 [ -z "$HARDENED_ATTACHED_ORG_ID" ] \
   || [[ $HARDENED_ATTACHED_ORG_ID =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] \
   || die "HARDENED_ATTACHED_ORG_ID='$HARDENED_ATTACHED_ORG_ID' is not a lowercase UUID"
 # The console watcher reads `get-console-output --latest`, which only Nitro
 # instance types serve: a non-Nitro type loses the fast failure path (Packer's
-# own 2 h stop timeout remains). The publisher role allows exactly c7a.xlarge,
-# so only a hand run with other credentials could choose another type.
+# own 2 h stop timeout remains). The instance type is fixed at c7a.xlarge;
+# only a hand run with other credentials could choose another type.
 [[ $HARDENED_INSTANCE_TYPE =~ ^[a-z0-9-]+\.[a-z0-9]+$ ]] || die "HARDENED_INSTANCE_TYPE='$HARDENED_INSTANCE_TYPE' is not an instance type"
 # positive_seconds VALUE: a decimal number of seconds above zero.
 positive_seconds() { [[ $1 =~ ^[0-9]+(\.[0-9]+)?$ ]] && [[ $1 =~ [1-9] ]]; }
@@ -209,8 +217,12 @@ chef export "$POLICYFILE" "$W/export" --archive > "$W/export.log" 2>&1 \
 [ -f "$W/export/solo-$LOCK_REV.tgz" ] || die "chef export wrote no solo-$LOCK_REV.tgz"
 cp "$W/export/solo-$LOCK_REV.tgz" "$W/$ASSET"
 
+# A release that already exists keeps its flags. One created here for a
+# pre-release tag is a pre-release and never the repository's Latest.
+RELEASE_FLAGS=()
+[ "$PRERELEASE" = false ] || RELEASE_FLAGS=(--prerelease --latest=false)
 gh release view -R "$GH_REPO" "$PLATFORM_TAG" >/dev/null 2>&1 \
-  || gh release create -R "$GH_REPO" "$PLATFORM_TAG" --verify-tag --title "$PLATFORM_TAG" --notes "" >/dev/null \
+  || gh release create -R "$GH_REPO" "$PLATFORM_TAG" --verify-tag "${RELEASE_FLAGS[@]}" --title "$PLATFORM_TAG" --notes "" >/dev/null \
   || die "could not create the release $PLATFORM_TAG — is the tag pushed?"
 
 # The same comparison as tree() in scripts/policy-publish.sh, duplicated: that

@@ -1,10 +1,9 @@
 # What a solo image build (the hardened public image, base::solo) must not
 # carry from its build instance into every VM.
 #
-# PROVISIONAL — copied from the fleet list minus the components the solo
-# run_list drops; re-measured after the first live build ("Measured" in
-# `docs/design/hardened-image.md`; the method is decision 6 of
-# `docs/design/ami-image.md`).
+# The fleet list minus the components the solo run_list drops, plus what the
+# solo scrub removes (decision 12 of `docs/design/hardened-image.md`; the
+# method is decision 6 of `docs/design/ami-image.md`).
 #
 # Left out of the fleet list (test/fixtures/image-scrub-paths): every Alloy,
 # Traefik, AWS-CLI and policy-delivery line — base::solo installs none of them,
@@ -80,8 +79,8 @@ remove /var/tmp/*                                            # systemd private d
 
 # --- snapd: purged by the solo scrub; these are what a purge can leave ----------
 # The build's snapd holds a device identity (private-keys-v1, a serial)
-# created at build time: every box would share it (measured, hand test
-# 2026-11-20). ubuntu has no sudo, so only the admin could use snap at all.
+# created at build time: every box would share it. ubuntu has no sudo, so
+# only the admin could use snap at all.
 remove /var/lib/snapd                                        # snapd's state, device key and serial
 remove /snap                                                 # snap mount points
 remove /var/snap                                             # per-snap data

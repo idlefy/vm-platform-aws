@@ -90,7 +90,7 @@ if json.load(open(sys.argv[1])).get("name") != "solo":
 EOF
 
 # A stock image ships no apt lists: without this the first package the converge
-# asks for has no candidate version (measured on the first build). The fleet's
+# asks for has no candidate version. The fleet's
 # bootstrap does the same before its converge. --error-on=any: a list that
 # fails to download (a mirror error, a bad signature) fails the bootstrap here,
 # where plain apt-get update would only warn and exit 0.
