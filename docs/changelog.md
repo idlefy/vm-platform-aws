@@ -1,5 +1,14 @@
 # Changelog
 
+## 2.2.1
+
+**`v2.2.1`**
+
+- `image/hardened/regions`: the hardened image is now published to nine
+  regions. Besides `us-east-1` and `eu-central-1`: `us-east-2`, `us-west-2`,
+  `eu-west-1`, `eu-west-2`, `ap-south-1`, `ap-northeast-1` and
+  `ap-southeast-1`. The image itself is unchanged.
+
 ## 2.2.0
 
 A second published policy, `solo`: one developer's box with an AI agent
