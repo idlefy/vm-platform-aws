@@ -65,7 +65,17 @@ SG=sg-0f0f0f0f0f0f0f0f0
 URL=https://github.com/idlefy/vm-platform-aws/releases/download/v2.2.0/solo-v2.2.0.tgz
 printf '{"name":"solo","revision_id":"%s","cookbook_locks":{"base":{"version":"2.1.0"}}}' "$REV" \
   > "$R/cinc/policyfiles/solo.lock.json"
-mapfile -t REGIONS < <(grep -v '^[[:space:]]*\(#\|$\)' "$ROOT/image/hardened/regions")
+# The driver's behaviour is tested on a fixed list of the 17 default-enabled
+# commercial regions (build region first), not on the repository's current
+# list, which the owner widens step by step; the real file is pinned below.
+printf '# test fixture\n%s\n' us-east-1 us-east-2 us-west-1 us-west-2 ca-central-1 eu-central-1 eu-west-1 eu-west-2 \
+  eu-west-3 eu-north-1 ap-south-1 ap-northeast-1 ap-northeast-2 ap-northeast-3 ap-southeast-1 ap-southeast-2 \
+  sa-east-1 > "$R/image/hardened/regions"
+mapfile -t REGIONS < <(grep -v '^[[:space:]]*\(#\|$\)' "$R/image/hardened/regions")
+# The repository's list: us-east-1, the build region, then eu-central-1; the
+# remaining regions are added after the first region test and wait as
+# comments.
+mapfile -t REAL_REGIONS < <(grep -v '^[[:space:]]*\(#\|$\)' "$ROOT/image/hardened/regions")
 REGIONS_JSON=$(printf '%s\n' "${REGIONS[@]}" | python3 -I -c 'import json,sys; print(json.dumps(sys.stdin.read().split(), separators=(",", ":")))')
 
 # Two export trees: the same contents written twice (other mtimes, other
@@ -312,6 +322,8 @@ check "chef export ran on the committed cinc/policyfiles/solo.rb" \
   "$(grep -q "^chef export $R/cinc/policyfiles/solo.rb .* --archive$" "$T/chef.log"; echo $?)"
 check "the missing release was created on the existing tag" \
   "$(grep -q '^gh .*release create v2.2.0 --verify-tag ' "$T/gh.log"; echo $?)"
+check "...as a normal release: a vX.Y.Z tag is not a pre-release" \
+  "$(grep '^gh .*release create ' "$T/gh.log" | grep -qv -- '--prerelease\|--latest'; echo $?)"
 check "the archive was uploaded, then downloaded back" \
   "$(grep -n 'release upload v2.2.0 .*/solo-v2.2.0.tgz$' "$T/gh.log" | head -1 | cut -d: -f1 > "$T/n1"; \
      grep -n 'release download v2.2.0 .*solo-v2.2.0.tgz' "$T/gh.log" | tail -1 | cut -d: -f1 > "$T/n2"; \
@@ -322,7 +334,12 @@ check "packer init on image/hardened, then a machine-readable build" \
 check "ami_name is today's first" "$(var "ami_name=idlefy-hardened-agent-ubuntu-24.04-amd64-$DATE-01"; echo $?)"
 check "build_region is the first region" "$(var build_region=us-east-1; echo $?)"
 check "ami_regions is every region, in order" "$(var "ami_regions=$REGIONS_JSON"; echo $?)"
-check "the regions file holds 17 regions" "$([ "${#REGIONS[@]}" = 17 ]; echo $?)"
+check "the test's region list holds 17 regions" "$([ "${#REGIONS[@]}" = 17 ]; echo $?)"
+check "image/hardened/regions builds in us-east-1 and copies to eu-central-1" \
+  "$([ "${REAL_REGIONS[*]}" = "us-east-1 eu-central-1" ]; echo $?)"
+check "...and keeps the remaining fifteen as comments, so adding them is one change" \
+  "$([ "$(grep -cE '^# (us|ca|eu|ap|sa)-[a-z]+-[0-9]$' "$ROOT/image/hardened/regions")" = 15 ] \
+     && for r in "${REGIONS[@]:1}"; do [ "$r" = eu-central-1 ] || grep -qx "# $r" "$ROOT/image/hardened/regions" || exit 1; done; echo $?)"
 check "instance_type defaults to c7a.xlarge" "$(var instance_type=c7a.xlarge; echo $?)"
 check "the security group is passed" "$(var "security_group_id=$SG"; echo $?)"
 check "public defaults to true" "$(var public=true; echo $?)"
@@ -763,8 +780,35 @@ for z in 0 0.0 00.000; do
   HARDENED_PACKER_GRACE=$z run_build; refuses_early $? "a Packer grace of '$z' refuses" HARDENED_PACKER_GRACE
 done
 HARDENED_PACKER_GRACE=soon run_build; refuses_early $? "a Packer grace that is not a number refuses" HARDENED_PACKER_GRACE
-check "the driver says why a non-Nitro type loses the fast failure path, and that the role pins the type" \
-  "$(grep -qF 'only Nitro' "$R/scripts/hardened-image-build.sh" && grep -qF 'allows exactly c7a.xlarge' "$R/scripts/hardened-image-build.sh"; echo $?)"
+check "the driver says why a non-Nitro type loses the fast failure path, and that the type is fixed" \
+  "$(grep -qF 'only Nitro' "$R/scripts/hardened-image-build.sh" && grep -qF 'type is fixed at c7a.xlarge' "$R/scripts/hardened-image-build.sh"; echo $?)"
+
+echo "== a pre-release tag vX.Y.Z-rc.N: a private test build only =="
+# no_cloud_call — nothing reached chef, GitHub or AWS.
+no_cloud_call() { [ ! -s "$T/chef.log" ] && [ ! -s "$T/gh.log" ] && [ ! -s "$T/aws.log" ] && [ ! -s "$T/packer.log" ]; }
+RC_RECORD="$T/out/hardened-ami-$DATE-01.json"
+PLATFORM_TAG=v2.2.0-rc.1 PUBLIC=false GH_RELEASE_MISSING=1 run_build
+check "a private build from v2.2.0-rc.1 → exits 0" "$?"
+check "...its missing release is created as a pre-release, never Latest" \
+  "$(grep -q -- '^gh release create v2.2.0-rc.1 --verify-tag --prerelease --latest=false --title v2.2.0-rc.1 ' "$T/gh.log"; echo $?)"
+check "...the archive is solo-v2.2.0-rc.1.tgz on that release" \
+  "$(grep -q 'release upload v2.2.0-rc.1 .*/solo-v2.2.0-rc.1.tgz$' "$T/gh.log"; echo $?)"
+check "...the record names the rc tag and says private" \
+  "$(python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d["platform_tag"]=="v2.2.0-rc.1" and d["public"] is False and d["description"].endswith("visibility=private") else 1)' "$RC_RECORD"; echo $?)"
+PLATFORM_TAG=v2.2.0-rc.2 PUBLIC=false run_build
+check "an rc build whose release exists → exits 0" "$?"
+check "...and leaves the release's flags alone: no create, no flag in any edit" \
+  "$(! grep -q 'release create' "$T/gh.log" && ! grep '^gh release edit' "$T/gh.log" | grep -q -- '--prerelease\|--latest\|--draft'; echo $?)"
+for pub in true default; do
+  if [ "$pub" = default ]; then PLATFORM_TAG=v2.2.0-rc.1 run_build; else PLATFORM_TAG=v2.2.0-rc.1 PUBLIC=$pub run_build; fi
+  check "a public build ($pub) from v2.2.0-rc.1 refuses, names the pre-release, before any cloud call" \
+    "$([ $? -ne 0 ] && grep -q 'pre-release tag: it builds a private image only' "$T/stderr" && no_cloud_call; echo $?)"
+done
+for bad in v2.2.0-rc v2.2.0-rc.0 v2.2.0-rc.01 v2.2.0-rc.1.2 v2.2.0-beta.1 v2.2.0-rc.1x v2.2.0rc.1 v2.2.0-RC.1; do
+  PLATFORM_TAG=$bad PUBLIC=false run_build
+  check "PLATFORM_TAG=$bad refuses before any cloud call" \
+    "$([ $? -ne 0 ] && grep -q 'is not a vX.Y.Z or vX.Y.Z-rc.N tag' "$T/stderr" && no_cloud_call; echo $?)"
+done
 
 echo "== the tag must name PLATFORM_SHA, and the tree must be it =="
 git -C "$R" init -q && git -C "$R" add -A && git -C "$R" -c user.name=t -c user.email=t@t commit -qm t && git -C "$R" tag v2.2.0
@@ -774,7 +818,10 @@ NO_TODAY=1 SKIP_TAG= PLATFORM_SHA=$HEAD_SHA run_build; check "the tag's commit, 
 NO_TODAY=1 SKIP_TAG= run_build; refuses_early $? "a PLATFORM_SHA the tag does not name refuses" PLATFORM_SHA
 NO_TODAY=1 SKIP_TAG=false run_build; refuses_early $? "HARDENED_SKIP_TAG_CHECK=false still checks the tag" PLATFORM_SHA
 NO_TODAY=1 SKIP_TAG=yes run_build; refuses_early $? "...and so does any value but 1" PLATFORM_SHA
-NO_TODAY=1 SKIP_TAG= PLATFORM_TAG=v2.2.1 PLATFORM_SHA=$HEAD_SHA run_build; refuses_early $? "a tag that does not exist refuses" v2.2.1
+NO_TODAY=1 SKIP_TAG= PLATFORM_TAG=v9.9.9 PLATFORM_SHA=$HEAD_SHA run_build; refuses_early $? "a tag that does not exist refuses" v9.9.9
+git -C "$R" tag v2.2.0-rc.1
+NO_TODAY=1 SKIP_TAG= PLATFORM_TAG=v2.2.0-rc.1 PUBLIC=false PLATFORM_SHA=$HEAD_SHA run_build
+check "a real v2.2.0-rc.1 tag on the checked-out commit → a private build passes the tag check" "$?"
 cp "$R/image/hardened/regions" "$T/regions.clean"
 printf '# edited\n' >> "$R/image/hardened/regions"
 NO_TODAY=1 SKIP_TAG= PLATFORM_SHA=$HEAD_SHA run_build
@@ -849,6 +896,40 @@ ok = (int(build["timeout-minutes"]) + 45 + 15 <= int(job["timeout-minutes"])
 sys.exit(0 if ok else 1)
 PY
 )"
+
+echo "== the publish workflow's resolve step: which tags it builds =="
+# The step's own script, run with a stub git whose ls-remote prints $REFS.
+python3 -I -c 'import sys, yaml; print(yaml.safe_load(open(sys.argv[1]))["jobs"]["resolve"]["steps"][0]["run"])' \
+  "$ROOT/.github/workflows/publish-hardened-image.yml" > "$T/resolve.sh"
+mkdir -p "$T/rbin"
+printf '#!/bin/sh\n[ "$1" = ls-remote ] || exit 99\ncat "$REFS"\n' > "$T/rbin/git"; chmod +x "$T/rbin/git"
+A=$(printf 'a%.0s' {1..40}); B=$(printf 'b%.0s' {1..40}); C=$(printf 'c%.0s' {1..40}); D=$(printf 'd%.0s' {1..40})
+# resolve EVENT REF_NAME PUBLIC — runs the step; its outputs land in $T/resolve.out.
+resolve() {
+  : > "$T/resolve.out"
+  ( cd "$T" && env PATH="$T/rbin:$PATH" REFS="$T/refs" GITHUB_OUTPUT="$T/resolve.out" EVENT="$1" REF_TYPE=tag \
+      REF_NAME="$2" RUN_SHA="$D" REPO_URL=https://example.invalid/r PUBLIC="$3" bash "$T/resolve.sh" ) > "$T/resolve.log" 2>&1
+}
+printf '%s\trefs/tags/v2.1.0\n%s\trefs/tags/v2.2.0-rc.1\n%s\trefs/tags/v2.2.0-rc.2\n%s\trefs/tags/v3.0.0-rc.1\n%s\trefs/tags/base-2.2.0\n' \
+  "$A" "$B" "$C" "$C" "$C" > "$T/refs"
+resolve schedule "" ""
+check "the schedule builds the newest vX.Y.Z and skips every rc tag" \
+  "$([ $? -eq 0 ] && grep -qx 'tag=v2.1.0' "$T/resolve.out" && grep -qx "sha=$A" "$T/resolve.out"; echo $?)"
+printf '%s\trefs/tags/v2.2.0-rc.1\n' "$B" > "$T/refs"
+resolve schedule "" ""
+check "...and with only rc tags on origin it builds nothing" "$([ $? -ne 0 ] && [ ! -s "$T/resolve.out" ]; echo $?)"
+resolve workflow_dispatch v2.2.0-rc.1 false
+check "a dispatch on v2.2.0-rc.1 with public=false resolves it" \
+  "$([ $? -eq 0 ] && grep -qx 'tag=v2.2.0-rc.1' "$T/resolve.out" && grep -qx "sha=$D" "$T/resolve.out"; echo $?)"
+resolve workflow_dispatch v2.2.0-rc.1 true
+check "a dispatch on v2.2.0-rc.1 with public=true is refused" \
+  "$([ $? -ne 0 ] && grep -q 'pre-release tag' "$T/resolve.log" && [ ! -s "$T/resolve.out" ]; echo $?)"
+resolve workflow_dispatch v2.2.0 true
+check "a dispatch on v2.2.0 with public=true resolves it" "$([ $? -eq 0 ] && grep -qx 'tag=v2.2.0' "$T/resolve.out"; echo $?)"
+for bad in v2.2.0-rc v2.2.0-rc.0 v2.2.0-rc.01 v2.2.0-rc.1.2 v2.2.0-beta.1 v2.2.0-rc.1x; do
+  resolve workflow_dispatch "$bad" false
+  check "a dispatch on $bad is refused" "$([ $? -ne 0 ] && grep -q 'not on' "$T/resolve.log" && [ ! -s "$T/resolve.out" ]; echo $?)"
+done
 
 echo
 echo "passed: $PASS  failed: $FAIL"

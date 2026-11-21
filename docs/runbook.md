@@ -632,17 +632,23 @@ a tenant image and nothing here builds it from a
 tenant. How it is built, published and retired is in
 [Hardened image for AI agents](design/hardened-image.md).
 
+A test build runs on a pre-release tag: `make release TAG=vX.Y.Z-rc.N`, push
+it, then run *publish-hardened-image* on that tag with `public` unticked. It
+is private only, and its GitHub release is a pre-release; leave creating
+that release to the driver (one created by hand without `--prerelease` could
+become Latest). Tag `vX.Y.Z` for the public build once the test has passed.
+
 #### A hardened build whose bootstrap or scrub failed
 
 The build log says "the bootstrap failed on the build instance" (or "the
 image scrub refused the image …") and shows the end of the instance's serial
 console above it. The build ends by itself about a minute after the failure (the console tail
 in the log is the instance's own output — the build prints no secret, and must
-not):
-the driver reads the console while Packer runs, interrupts Packer, and Packer
+not): the driver reads the console while Packer runs, interrupts Packer, and Packer
 terminates the instance and deletes its key pair. No image is taken and
 nothing needs cleaning. Fix the cause the console names (it is the converge
-or the scrub, on the instance), cut a new `v` release and publish again.
+or the scrub, on the instance), cut the next `vX.Y.Z-rc.N` tag (a test
+build) or a new `v` release, and publish again.
 A refusal that names "files deleted but still open" lists each file, its
 size and the process holding it: make that process close or truncate the
 file before the scrub (in the scrub or the cookbook), never add an
@@ -654,7 +660,9 @@ before it cleaned up.
 The workflow's `leftovers` step then terminates every instance tagged
 `Name=idlefy-hardened-image-build` that is still alive in the build region
 and deletes every `packer_*` key pair with that tag — first, before it lists
-images across the regions — and lists both in the job summary. Nothing else is removed — never an image. It first checks the
+images across the regions — and lists both in the job summary. Nothing else
+is removed — never an image or a snapshot; those are removed by hand (below).
+It first checks the
 credentials are the publisher account's and stops, removing nothing, if not.
 If the run never got AWS credentials, the step says "No AWS credentials were
 configured: nothing could have been launched." — nothing to clean. If that
@@ -696,21 +704,25 @@ clean up **before any retention run or new build**:
 1. For every "could not list" region, read it yourself (owner credentials,
    read-only):
    `aws ec2 describe-images --region <r> --owners self --include-deprecated --include-disabled --filters Name=name,Values=<name> --query 'Images[].[ImageId,State,Public,BlockDeviceMappings[].Ebs.SnapshotId]'`.
-2. **Tagged leftovers** (`IdlefyPublishedImage=true: yes`). Once tagged, no
-   IAM user or role but the publisher role may change them — not the owner's
-   IAM identities either, and that role trusts only the workflow's
-   environment. The account root user is not restricted (there is no SCP on
-   this account) and can still change them; that is the break-glass path,
-   not a routine one. The routine path is the retire workflow: run
-   *retire-hardened-image* with
+2. **Tagged leftovers** (`IdlefyPublishedImage=true: yes`). Once tagged, they
+   are changed only through the publisher role, so remove them with the
+   retire workflow: run *retire-hardened-image* with
    `disable_name=<name>` and `apply=true`. It disables the name in every
    region and runs no retention; a disabled image is private and cannot be
    launched. A later retention run deregisters it and deletes its snapshots
-   once it is 7 days old and two newer builds exist.
-3. **Untagged leftovers** (`IdlefyPublishedImage=true: no` — tagging failed).
-   The owner removes them with the owner's credentials: note the snapshot ids
+   once it is 7 days old and two newer builds exist. If the retire
+   workflow cannot run, the account root user can disable the image.
+3. **Untagged leftovers** (`IdlefyPublishedImage=true: no`): an image that
+   was never fenced — the run stopped after CreateImage and before Packer's
+   last step (a cancel, a timeout, a refused copy Packer could not clean up),
+   or tagging failed. It is usually in the build region only, `public=false`,
+   carries only `Name=idlefy-hardened-image-build`, and no release record
+   names it. The `leftovers` step lists it and does not remove it. The
+   owner removes it with the owner's credentials: note the snapshot ids
    (step 1), `aws ec2 deregister-image --region <r> --image-id <ami>`, then
-   `aws ec2 delete-snapshot --region <r> --snapshot-id <snap>` for each.
+   `aws ec2 delete-snapshot --region <r> --snapshot-id <snap>` for each. Until
+   it is gone, G4 refuses the next publish (its snapshot is unencrypted and
+   unfenced).
 4. Run `scripts/hardened-guard-check.sh` (G4 names any unencrypted, untagged
    snapshot still left), then retry the build. It takes the next NN.
 

@@ -122,7 +122,7 @@ solo_prep() {
   fi
   # snapd leaves: its state holds a device key and serial made on the build
   # instance, which every box would share; ubuntu has no sudo, so only the
-  # admin could use snap at all (ruling 2026-11-20). solo_check proves it gone.
+  # admin could use snap at all. solo_check proves it gone.
   # A second defence for that key, beside the zero-fill: overwrite it in
   # place before the purge unlinks it (ext4 rewrites a file's own blocks).
   # Best effort, never a refusal; no key directory is fine.
@@ -131,7 +131,7 @@ solo_prep() {
   fi
   DEBIAN_FRONTEND=noninteractive apt-get purge -y -o DPkg::Lock::Timeout=300 snapd \
     || refuse "snapd purge failed"
-  # The package cache (321 MB on the first build); the lists stay.
+  # The package cache (several hundred MB); the lists stay.
   apt-get clean || refuse "apt-get clean failed"
   # shellcheck disable=SC2034 # read by dev-vm-image-scrub
   REMOVE=("${REMOVE_SOLO[@]}")
