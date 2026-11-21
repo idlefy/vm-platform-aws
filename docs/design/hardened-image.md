@@ -113,8 +113,7 @@ reaches it only through what the customer's own account does to the instance
 
 8. **Regions are an explicit list, one copy each.** `image/hardened/regions`
    lists the regions the image is built in and copied to: `us-east-1`, the
-   build region, and `eu-central-1`. More regions follow; the remaining
-   default-enabled regions are in the file as comments. The driver refuses
+   build region, first, then the other published regions. The driver refuses
    a record that does not name exactly the listed regions, and the guard,
    the leftovers listing and retention read the same file. Adding a region
    is a line here and the same line in the consumer's copy; an opt-in

@@ -66,15 +66,14 @@ URL=https://github.com/idlefy/vm-platform-aws/releases/download/v2.2.0/solo-v2.2
 printf '{"name":"solo","revision_id":"%s","cookbook_locks":{"base":{"version":"2.1.0"}}}' "$REV" \
   > "$R/cinc/policyfiles/solo.lock.json"
 # The driver's behaviour is tested on a fixed list of the 17 default-enabled
-# commercial regions (build region first), not on the repository's current
-# list, which the owner widens step by step; the real file is pinned below.
+# commercial regions (build region first), not on the repository's own list;
+# the real file is pinned below.
 printf '# test fixture\n%s\n' us-east-1 us-east-2 us-west-1 us-west-2 ca-central-1 eu-central-1 eu-west-1 eu-west-2 \
   eu-west-3 eu-north-1 ap-south-1 ap-northeast-1 ap-northeast-2 ap-northeast-3 ap-southeast-1 ap-southeast-2 \
   sa-east-1 > "$R/image/hardened/regions"
 mapfile -t REGIONS < <(grep -v '^[[:space:]]*\(#\|$\)' "$R/image/hardened/regions")
-# The repository's list: us-east-1, the build region, then eu-central-1; the
-# remaining regions are added after the first region test and wait as
-# comments.
+# The repository's list: us-east-1, the build region, then eu-central-1 and
+# the other published regions.
 mapfile -t REAL_REGIONS < <(grep -v '^[[:space:]]*\(#\|$\)' "$ROOT/image/hardened/regions")
 REGIONS_JSON=$(printf '%s\n' "${REGIONS[@]}" | python3 -I -c 'import json,sys; print(json.dumps(sys.stdin.read().split(), separators=(",", ":")))')
 
@@ -335,11 +334,11 @@ check "ami_name is today's first" "$(var "ami_name=idlefy-hardened-agent-ubuntu-
 check "build_region is the first region" "$(var build_region=us-east-1; echo $?)"
 check "ami_regions is every region, in order" "$(var "ami_regions=$REGIONS_JSON"; echo $?)"
 check "the test's region list holds 17 regions" "$([ "${#REGIONS[@]}" = 17 ]; echo $?)"
-check "image/hardened/regions builds in us-east-1 and copies to eu-central-1" \
-  "$([ "${REAL_REGIONS[*]}" = "us-east-1 eu-central-1" ]; echo $?)"
-check "...and keeps the remaining fifteen as comments, so adding them is one change" \
-  "$([ "$(grep -cE '^# (us|ca|eu|ap|sa)-[a-z]+-[0-9]$' "$ROOT/image/hardened/regions")" = 15 ] \
-     && for r in "${REGIONS[@]:1}"; do [ "$r" = eu-central-1 ] || grep -qx "# $r" "$ROOT/image/hardened/regions" || exit 1; done; echo $?)"
+check "image/hardened/regions builds in us-east-1 and copies to the eight other published regions" \
+  "$([ "${REAL_REGIONS[*]}" = "us-east-1 eu-central-1 us-east-2 us-west-2 eu-west-1 eu-west-2 ap-south-1 ap-northeast-1 ap-southeast-1" ]; echo $?)"
+check "...and every region it lists is a default-enabled one from this test's list, none left as a comment" \
+  "$(for r in "${REAL_REGIONS[@]}"; do printf '%s\n' "${REGIONS[@]}" | grep -qx "$r" || exit 1; done \
+     && ! grep -qE '^# *(us|ca|eu|ap|sa)-[a-z]+-[0-9]$' "$ROOT/image/hardened/regions"; echo $?)"
 check "instance_type defaults to c7a.xlarge" "$(var instance_type=c7a.xlarge; echo $?)"
 check "the security group is passed" "$(var "security_group_id=$SG"; echo $?)"
 check "public defaults to true" "$(var public=true; echo $?)"
