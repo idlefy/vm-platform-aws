@@ -31,6 +31,20 @@ if [ "$1" = is-enabled ]; then
   for u in ${SHIM_ENABLED_UNITS:-}; do [ "${*: -1}" = "$u" ] && exit 0; done
   exit "${SHIM_ENABLED:-1}"
 fi
+# `is-failed` prints the state: failed for a unit in SHIM_FAILED_UNITS,
+# nothing (systemd unreachable) with SHIM_ISFAILED_SILENT, else inactive.
+if [ "$1" = is-failed ]; then
+  for u in ${SHIM_FAILED_UNITS:-}; do [ "${*: -1}" = "$u" ] && { echo failed; exit 0; }; done
+  [ -n "${SHIM_ISFAILED_SILENT:-}" ] && exit 1
+  echo inactive; exit 1
+fi
+# `show -P DropInPaths` prints SHIM_DROPINS (default: base::nvidia_baked's
+# drop-in after a vendor one); SHIM_SHOW_RC makes it fail.
+if [ "$1 $2 $3" = "show -P DropInPaths" ]; then
+  [ -n "${SHIM_SHOW_RC:-}" ] && exit "$SHIM_SHOW_RC"
+  echo "${SHIM_DROPINS-/usr/lib/systemd/system/service.d/10-timeout-abort.conf /etc/systemd/system/nvidia-cdi-refresh.service.d/20-idlefy-gpu-present.conf}"
+  exit 0
+fi
 # SHIM_FETCHED: the queued converge had fetched (and extracted) this other
 # revision when it was stopped — mid-converge, so status and last-serial are
 # still the bootstrap's.
@@ -127,6 +141,18 @@ chmod +x "$T/bin/find"
   printf '[ "${*: -1}" = snapd ] && { printf not-installed; exit 0; }\n' >> "$T/bin/dpkg-query"
   # dpkg knows itself as installed, unless its database is empty.
   printf '[ "${*: -1}" = dpkg ] && [ -z "${SHIM_DPKG_DB_EMPTY:-}" ] && { printf installed; exit 0; }\n' >> "$T/bin/dpkg-query"
+  # base::nvidia_baked's four packages, by exact name, are installed unless
+  # named in SHIM_NVIDIA_MISSING (unknown to dpkg) or SHIM_NVIDIA_HALF.
+  cat >> "$T/bin/dpkg-query" <<'SHIM'
+case "${*: -1}" in
+  linux-modules-nvidia-580-server-open-aws | nvidia-headless-no-dkms-580-server-open | nvidia-utils-580-server | nvidia-container-toolkit)
+    for m in ${SHIM_NVIDIA_MISSING:-}; do
+      [ "${*: -1}" = "$m" ] && { echo "dpkg-query: no packages found matching $m" >&2; exit 1; }
+    done
+    [ "${*: -1}" = "${SHIM_NVIDIA_HALF:-}" ] && { printf half-installed; exit 0; }
+    printf installed; exit 0 ;;
+esac
+SHIM
   # Any other package is unknown to dpkg, as on a real image.
   printf 'echo "dpkg-query: no packages found matching ${*: -1}" >&2\nexit 1\n' >> "$T/bin/dpkg-query"
   printf '[ "$1" = -c ] && exit "${SHIM_VISUDO_RC:-0}"\nexit 0\n' >> "$T/bin/visudo"
@@ -279,6 +305,21 @@ seed_solo() {  # seed_solo DIR
     "$1/etc/systemd/system/multi-user.target.wants/idlefy-hardened-firstboot.service"
   printf '%s\n' 'root:x:0:0:root:/root:/bin/bash' 'ec2-instance-connect:x:113:65534::/nonexistent:/usr/sbin/nologin' \
     'ubuntu:x:1000:1000::/home/ubuntu:/bin/bash' > "$1/etc/passwd"
+  # base::nvidia_baked: two kernels in /boot, the module for the newest only;
+  # the drop-in and tmpfiles line as the recipe writes them; both refresh units
+  # enabled on disk; the toolkit's config with no-cgroups in its table.
+  mkdir -p "$1/boot" "$1/lib/modules/7.0.0-1017-aws/kernel" "$1/lib/modules/7.0.0-1018-aws/kernel/nvidia-580srv-open"
+  echo k > "$1/boot/vmlinuz-7.0.0-1017-aws"; echo k > "$1/boot/vmlinuz-7.0.0-1018-aws"
+  echo ko > "$1/lib/modules/7.0.0-1018-aws/kernel/nvidia-580srv-open/nvidia.ko.zst"
+  printf '%s\n' '# Managed by CINC' '[Unit]' 'Before=user@1000.service' '' '[Service]' \
+    "ExecCondition=/bin/sh -c 'grep -qsx 0x10de /sys/bus/pci/devices/*/vendor'" 'TimeoutStartSec=120' \
+    > "$1/etc/systemd/system/nvidia-cdi-refresh.service.d/20-idlefy-gpu-present.conf"
+  echo 'd /run/cdi 0755 root root -' > "$1/etc/tmpfiles.d/idlefy-cdi.conf"
+  for u in service path; do
+    ln -sfn /usr/lib/systemd/system/nvidia-cdi-refresh.$u "$1/etc/systemd/system/multi-user.target.wants/nvidia-cdi-refresh.$u"
+  done
+  printf '%s\n' '[nvidia-container-cli]' 'environment = []' 'no-cgroups = true' '' \
+    '[nvidia-container-runtime]' 'log-level = "info"' > "$1/etc/nvidia-container-runtime/config.toml"
   cat > "$1/etc/iptables/rules.v6" <<'V6'
 *filter
 :INPUT DROP [0:0]
@@ -305,13 +346,14 @@ V4
 }
 SOLO_STATE="$R/var/lib/dev-vm/policy"
 FIRSTBOOT=idlefy-hardened-firstboot.service
+SOLO_UNITS="$FIRSTBOOT nvidia-cdi-refresh.service nvidia-cdi-refresh.path"
 # The solo code: sourced by the scrub from its own directory, embedded only in
 # the solo build's user data (the scrub rides in every fleet VM's 16 KB).
 SOLO="$ROOT/image/files/dev-vm-image-scrub-solo"
 
 echo "== solo profile: a green build is scrubbed, cinc purged, powered off =="
 build_root "$R" "2026-11-01T00:00:00Z ok $REV" "$LIST_SOLO"; seed_solo "$R"; : > "$T/log"
-DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$FIRSTBOOT" run_scrub "$R" solo; check "exits 0" "$?"
+DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$SOLO_UNITS" run_scrub "$R" solo; check "exits 0" "$?"
 while read -r verb path _; do
   p="$R${path//\*/x}"
   case "$verb" in
@@ -354,6 +396,14 @@ check "checks snapd and an SSM package are gone after the purge" \
   "$(between "$(lineno '^dpkg-query .*snapd$')" "$(lineno "^$SNAPD_PURGE\$")" "$(lineno 'cloud-init clean')" \
      && grep -q '^dpkg-query .*amazon-ssm-agent$' "$T/log"; echo $?)"
 check "checks cinc is gone after the purge" "$(rc between "$(lineno '^dpkg-query .*cinc')" "$(lineno '^apt-get purge')" "$(lineno 'cloud-init clean')")"
+NVIDIA_PKGS="linux-modules-nvidia-580-server-open-aws nvidia-headless-no-dkms-580-server-open nvidia-utils-580-server nvidia-container-toolkit"
+check "checks the four NVIDIA packages, before cloud-init clean" \
+  "$(for p in $NVIDIA_PKGS; do between "$(lineno "^dpkg-query .* $p\$")" 0 "$(lineno 'cloud-init clean')" || exit 1; done; echo 0)"
+check "checks the drop-in is among the refresh service's drop-ins" \
+  "$(grep -qx 'systemctl show -P DropInPaths nvidia-cdi-refresh.service' "$T/log"; echo $?)"
+check "checks both CDI refresh units are enabled and the service has not failed" \
+  "$(grep -qx 'systemctl is-enabled --quiet nvidia-cdi-refresh.service' "$T/log" && grep -qx 'systemctl is-enabled --quiet nvidia-cdi-refresh.path' "$T/log" \
+     && grep -qx 'systemctl is-failed nvidia-cdi-refresh.service' "$T/log"; echo $?)"
 check "records the sha" "$(grep -qx "$REV" "$R/etc/dev-vm/image-revision"; echo $?)"
 check "powers off last" "$(tail -1 "$T/log" | grep -q '^poweroff'; echo $?)"
 check "the status default is /run/dev-vm/solo" "$(grep -qF 'DEV_VM_POLICY_STATE:-/run/dev-vm/solo' "$SOLO"; echo $?)"
@@ -364,7 +414,7 @@ solo_refuses() {
   local label=$1 want=$2 mutate=$3 got; shift 3
   build_root "$R" "2026-11-01T00:00:00Z ok $REV" "$LIST_SOLO"; seed_solo "$R"; : > "$T/log"
   ( cd "$R" && eval "$mutate" )
-  ( export DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$FIRSTBOOT"
+  ( export DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$SOLO_UNITS"
     for kv in "$@"; do export "${kv?}"; done
     run_scrub "$R" solo ); got=$?
   check "$label → exit 70" "$(rc [ "$got" = 70 ])"
@@ -411,7 +461,7 @@ solo_passes() {  # solo_passes LABEL MUTATION [VAR=VALUE…]
   local label=$1 mutate=$2 got; shift 2
   build_root "$R" "2026-11-01T00:00:00Z ok $REV" "$LIST_SOLO"; seed_solo "$R"; : > "$T/log"
   ( cd "$R" && eval "$mutate" )
-  ( export DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$FIRSTBOOT"
+  ( export DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$SOLO_UNITS"
     for kv in "$@"; do export "${kv?}"; done
     run_scrub "$R" solo ); got=$?
   check "$label → exit 0, powers off" "$([ "$got" = 0 ] && tail -1 "$T/log" | grep -q '^poweroff'; echo $?)"
@@ -485,7 +535,7 @@ rm -f "$T/cons.fifo"; mkfifo "$T/cons.fifo"; printf 'ip-10-0-1-5 login: ' > "$T/
 cat "$T/cons.fifo" >> "$T/cons.seen" & catpid=$!
 exec 9>"$T/cons.fifo"   # held open: the reader sees one stream, not one per write
 SHIM_LOG="$T/log" PATH="$T/bin:$PATH" DEV_VM_IMAGE_ROOT="$R" DEV_VM_IMAGE_CONSOLE="$T/cons.fifo" \
-  DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$FIRSTBOOT" SHIM_UBUNTU_GROUPS="ubuntu sudo" \
+  DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$SOLO_UNITS" SHIM_UBUNTU_GROUPS="ubuntu sudo" \
   "$SCRUB" --profile solo "$REV" > /dev/null 2>&1; got=$?
 exec 9>&-; wait "$catpid"
 check "a solo refusal right after an unterminated login prompt → exit 70, on a line of its own" \
@@ -497,6 +547,58 @@ solo_refuses "an SSM agent package"         "amazon-ssm-agent still installed" "
 for pkg in cinc snapd amazon-ssm-agent; do
   solo_refuses "dpkg-query cannot answer for $pkg (exit 2)" "$pkg still installed, or dpkg cannot say" ":" SHIM_DPKGQ_ERR=$pkg
 done
+# base::nvidia_baked (check 9).
+for pkg in $NVIDIA_PKGS; do
+  solo_refuses "$pkg not installed"         "$pkg is not installed" ":" SHIM_NVIDIA_MISSING=$pkg
+done
+solo_refuses "nvidia-container-toolkit half-installed" "nvidia-container-toolkit is not installed" ":" SHIM_NVIDIA_HALF=nvidia-container-toolkit
+solo_refuses "dpkg-query cannot answer for nvidia-utils-580-server" "nvidia-utils-580-server is not installed, or dpkg cannot say" ":" SHIM_DPKGQ_ERR=nvidia-utils-580-server
+solo_refuses "no nvidia.ko for the newest kernel in /boot" "no nvidia.ko* for 7.0.0-1019-aws" \
+  "echo k > boot/vmlinuz-7.0.0-1019-aws && mkdir -p lib/modules/7.0.0-1019-aws/kernel"
+solo_refuses "no /lib/modules for the newest kernel in /boot" "cannot scan /lib/modules/7.0.0-1019-aws" "echo k > boot/vmlinuz-7.0.0-1019-aws"
+solo_refuses "the module only for an older kernel" "no nvidia.ko* for 7.0.0-1018-aws" \
+  "mv lib/modules/7.0.0-1018-aws/kernel/nvidia-580srv-open lib/modules/7.0.0-1017-aws/kernel/"
+solo_refuses "no kernel in /boot"           "no kernel in /boot" "rm boot/vmlinuz-*"
+solo_passes "an older kernel without the module sorts below the newest (7.0.0-999-aws)" "echo k > boot/vmlinuz-7.0.0-999-aws"
+solo_passes "a newer /lib/modules tree without a kernel in /boot is not the one booted" "mkdir -p lib/modules/7.0.0-1020-aws/kernel"
+DROPIN=/etc/systemd/system/nvidia-cdi-refresh.service.d/20-idlefy-gpu-present.conf
+solo_refuses "no GPU drop-in"               "20-idlefy-gpu-present.conf is missing" "rm .$DROPIN"
+solo_refuses "drop-in without the NVIDIA condition" "lacks the NVIDIA device condition" "printf '%s\n' '[Service]' > .$DROPIN"
+solo_refuses "drop-in with the condition commented out" "lacks the NVIDIA device condition" \
+  "printf '%s\n' '[Service]' \"#ExecCondition=/bin/sh -c 'grep -qsx 0x10de /sys/bus/pci/devices/*/vendor'\" > .$DROPIN"
+solo_refuses "drop-in without the ordering before the user manager" "does not order the refresh before the user manager" \
+  "printf '%s\n' '[Service]' \"ExecCondition=/bin/sh -c 'grep -qsx 0x10de /sys/bus/pci/devices/*/vendor'\" > .$DROPIN"
+solo_refuses "drop-in with the ordering commented out" "does not order the refresh before the user manager" \
+  "printf '%s\n' '[Unit]' '#Before=user@1000.service' '[Service]' \"ExecCondition=/bin/sh -c 'grep -qsx 0x10de /sys/bus/pci/devices/*/vendor'\" > .$DROPIN"
+solo_refuses "systemd lists no drop-in"     "systemd does not list $DROPIN" ":" SHIM_DROPINS=
+solo_refuses "systemd lists another drop-in" "systemd does not list $DROPIN" ":" SHIM_DROPINS="$DROPIN.bak /etc/systemd/system/nvidia-cdi-refresh.service.d/10-other.conf"
+solo_refuses "systemctl show fails"         "systemd does not list $DROPIN" ":" SHIM_SHOW_RC=1
+for u in service path; do
+  other=path; [ $u = path ] && other=service
+  solo_refuses "refresh $u not enabled"     "nvidia-cdi-refresh.$u is not enabled" ":" SHIM_ENABLED_UNITS="$FIRSTBOOT nvidia-cdi-refresh.$other"
+  solo_refuses "refresh $u enabled but no wants link on disk" "nvidia-cdi-refresh.$u has no multi-user.target.wants link" \
+    "rm etc/systemd/system/multi-user.target.wants/nvidia-cdi-refresh.$u"
+done
+solo_refuses "refresh service failed on the build host" "nvidia-cdi-refresh.service failed" ":" SHIM_FAILED_UNITS=nvidia-cdi-refresh.service
+solo_refuses "systemctl is-failed says nothing" "nvidia-cdi-refresh.service failed on the build host, or systemctl cannot say" ":" SHIM_ISFAILED_SILENT=1
+solo_refuses "no /run/cdi tmpfiles line"    "/etc/tmpfiles.d/idlefy-cdi.conf is missing" "rm etc/tmpfiles.d/idlefy-cdi.conf"
+solo_refuses "/run/cdi tmpfiles line with another mode" "idlefy-cdi.conf is missing or is not exactly" \
+  "echo 'd /run/cdi 0777 root root -' > etc/tmpfiles.d/idlefy-cdi.conf"
+solo_refuses "/run/cdi tmpfiles file with a second line" "idlefy-cdi.conf is missing or is not exactly" \
+  "printf '%s\n' 'd /run/cdi 0755 root root -' 'L /run/cdi/x - - - - /tmp' > etc/tmpfiles.d/idlefy-cdi.conf"
+for f in etc/cdi/nvidia.yaml var/run/cdi/nvidia.yaml run/cdi/nvidia.yaml; do
+  solo_refuses "a baked CDI spec: /$f"      "/$f is present" "mkdir -p \"\$(dirname $f)\" && echo spec > $f"
+done
+solo_refuses "a CDI spec link: /etc/cdi/nvidia.yaml" "/etc/cdi/nvidia.yaml is present" "mkdir -p etc/cdi && ln -s /nowhere etc/cdi/nvidia.yaml"
+solo_refuses "no-cgroups not set"           "does not set no-cgroups = true" \
+  "printf '%s\n' '[nvidia-container-cli]' '#no-cgroups = false' > etc/nvidia-container-runtime/config.toml"
+solo_refuses "no-cgroups = false"           "does not set no-cgroups = true" \
+  "printf '%s\n' '[nvidia-container-cli]' 'no-cgroups = false' > etc/nvidia-container-runtime/config.toml"
+solo_refuses "no-cgroups only outside [nvidia-container-cli]" "does not set no-cgroups = true" \
+  "printf '%s\n' 'no-cgroups = true' '[nvidia-container-cli]' 'load-kmods = true' > etc/nvidia-container-runtime/config.toml"
+solo_refuses "no-cgroups only in another table" "does not set no-cgroups = true" \
+  "printf '%s\n' '[nvidia-container-cli]' 'load-kmods = true' '[nvidia-container-runtime]' 'no-cgroups = true' > etc/nvidia-container-runtime/config.toml"
+solo_refuses "no toolkit config"            "does not set no-cgroups = true" "rm etc/nvidia-container-runtime/config.toml"
 for f in usr/bin/snap usr/lib/snapd/snapd; do
   solo_refuses "/$f left behind"            "/$f is still on disk" "mkdir -p \"\$(dirname $f)\" && touch $f"
 done
@@ -537,7 +639,7 @@ fill_refuses() {  # fill_refuses LABEL CONSOLE MUTATION [VAR=VALUE…]
   local label=$1 want=$2 mutate=$3 got; shift 3
   build_root "$R" "2026-11-01T00:00:00Z ok $REV" "$LIST_SOLO"; seed_solo "$R"; : > "$T/log"
   ( cd "$R" && eval "$mutate" )
-  ( export DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$FIRSTBOOT"
+  ( export DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$SOLO_UNITS"
     for kv in "$@"; do export "${kv?}"; done
     run_scrub "$R" solo ); got=$?
   check "$label → exit 70, console names it, no poweroff" \
@@ -582,7 +684,7 @@ for gone in /var/lib/snapd /snap; do
   grep -vxF "  \"$gone\" # $(grep -F "  \"$gone\" #" "$SOLO" | sed 's/^[^#]*# //')" "$SOLO" > "$T/nolist/dev-vm-image-scrub-solo"
   check "the test copy lacks $gone" "$(! grep -qF "  \"$gone\" #" "$T/nolist/dev-vm-image-scrub-solo"; echo $?)"
   build_root "$R" "2026-11-01T00:00:00Z ok $REV" "$LIST_SOLO"; seed_solo "$R"; : > "$T/log"
-  ( SCRUB="$T/nolist/dev-vm-image-scrub"; export DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$FIRSTBOOT"
+  ( SCRUB="$T/nolist/dev-vm-image-scrub"; export DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$SOLO_UNITS"
     run_scrub "$R" solo ); got=$?
   check "a list without $gone → exit 70, named, no poweroff" \
     "$([ "$got" = 70 ] && grep -qF "$gone is still on disk after the snapd purge" "$T/console" && ! grep -q '^poweroff' "$T/log"; echo $?)"
@@ -594,7 +696,7 @@ mkdir -p "$T/nolist"
 grep -vF '"/var/log/apt/*"' "$SCRUB" > "$T/nolist/dev-vm-image-scrub"; chmod +x "$T/nolist/dev-vm-image-scrub"
 grep -vF '"/var/log/apt/*"' "$SOLO" > "$T/nolist/dev-vm-image-scrub-solo"
 build_root "$R" "2026-11-01T00:00:00Z ok $REV" "$LIST_SOLO"; seed_solo "$R"; : > "$T/log"
-( SCRUB="$T/nolist/dev-vm-image-scrub"; export DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$FIRSTBOOT"
+( SCRUB="$T/nolist/dev-vm-image-scrub"; export DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$SOLO_UNITS"
   run_scrub "$R" solo )
 check "a list without /var/log/apt/* → the fill-time check names it (the check can fail)" \
   "$([ "$(cat "$T/log.fill-left" 2>/dev/null)" = '/var/log/apt/*' ]; echo $?)"
@@ -605,7 +707,7 @@ echo "== solo profile without its sibling file fails closed =="
 mkdir -p "$T/alone"; cp "$SCRUB" "$T/alone/dev-vm-image-scrub"
 build_root "$R" "2026-11-01T00:00:00Z ok $REV" "$LIST_SOLO"; seed_solo "$R"; : > "$T/log"
 ( SCRUB="$T/alone/dev-vm-image-scrub"
-  DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$FIRSTBOOT" run_scrub "$R" solo ); got=$?
+  DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$SOLO_UNITS" run_scrub "$R" solo ); got=$?
 check "no dev-vm-image-scrub-solo next to the scrub → exit 70" "$(rc [ "$got" = 70 ])"
 check "  …console names it" "$(grep -q 'dev-vm-image-scrub-solo' "$T/console"; echo $?)"
 check "  …no poweroff" "$(! grep -q '^poweroff' "$T/log"; echo $?)"
@@ -614,12 +716,12 @@ check "  …touched nothing" "$(rc untouched)"
 
 echo "== whole-word group match: lxd-installer is not lxd =="
 build_root "$R" "2026-11-01T00:00:00Z ok $REV" "$LIST_SOLO"; seed_solo "$R"; : > "$T/log"
-DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$FIRSTBOOT" SHIM_UBUNTU_GROUPS="ubuntu lxd-installer sudoers adm1" \
+DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$SOLO_UNITS" SHIM_UBUNTU_GROUPS="ubuntu lxd-installer sudoers adm1" \
   run_scrub "$R" solo; check "groups that only contain an admin group's name → exit 0" "$?"
 
 echo "== the solo status file is checked like the fleet's =="
 build_root "$R" "2026-11-01T00:00:00Z converge-failed $REV" "$LIST_SOLO"; seed_solo "$R"; : > "$T/log"
-DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$FIRSTBOOT" run_scrub "$R" solo; got=$?
+DEV_VM_POLICY_STATE="$SOLO_STATE" SHIM_ENABLED_UNITS="$SOLO_UNITS" run_scrub "$R" solo; got=$?
 check "a failed solo converge → exit 65" "$(rc [ "$got" = 65 ])"
 check "  …and purges nothing" "$(! grep -qE '^(apt-get|dpkg)' "$T/log"; echo $?)"
 
@@ -634,6 +736,25 @@ echo "== the solo lists are the solo fixture's =="
 fx=$(grep -E '^(remove|empty) ' "$LIST_SOLO" | awk '{print $1" "$2}' | sort)
 sc=$(awk '/^REMOVE_SOLO=\(/{v="remove";next} /^EMPTY_SOLO=\(/{v="empty";next} /^\)/{v="";next} v && $1 !~ /^#/ && NF {gsub(/"/,"",$1); print v" "$1}' "$SOLO" 2>/dev/null | sort)
 check "REMOVE_SOLO/EMPTY_SOLO equal the solo fixture's remove/empty lines" "$([ -n "$fx" ] && [ "$fx" = "$sc" ]; echo $?)"
+
+echo "== the solo scrub and base::nvidia_baked agree =="
+ATTR="$ROOT/cinc/cookbooks/base/attributes/default.rb"
+NVB="$ROOT/cinc/cookbooks/base/recipes/nvidia_baked.rb"
+cb=$(sed -n "s/^default\['base'\]\['nvidia'\]\['driver_branch'\] = '\([^']*\)'$/\1/p" "$ATTR")
+sc=$(sed -n 's/^NVIDIA_BRANCH=//p' "$SOLO")
+check "NVIDIA_BRANCH ($sc) is the cookbook's driver_branch default (${cb:-none})" \
+  "$([ -n "$cb" ] && [ "$cb" = "$sc" ]; echo $?)"
+cond=$(sed -n 's/^NVIDIA_CONDITION="\(.*\)"$/\1/p' "$SOLO")
+check "the scrub's drop-in condition is the line base::nvidia_baked writes" \
+  "$([ -n "$cond" ] && grep -qxF -- "$cond" <(sed 's/^[[:space:]]*//' "$NVB"); echo $?)"
+ord=$(sed -n 's/^NVIDIA_ORDER="\(.*\)"$/\1/p' "$SOLO")
+check "the scrub's drop-in ordering is the line base::nvidia_baked writes" \
+  "$([ -n "$ord" ] && grep -qxF -- "$ord" <(sed 's/^[[:space:]]*//' "$NVB"); echo $?)"
+dp=$(sed -n 's/^NVIDIA_DROPIN=//p' "$SOLO")
+check "the scrub's drop-in path ($dp) is the file base::nvidia_baked writes" \
+  "$([ "$dp" = "$DROPIN" ] && grep -qxF "file '$dp' do" "$NVB"; echo $?)"
+check "the scrub's /run/cdi tmpfiles line is the one base::nvidia_baked writes" \
+  "$(grep -qF '"d /run/cdi 0755 root root -' "$SOLO" && grep -qF 'content "d /run/cdi 0755 root root -\n"' "$NVB"; echo $?)"
 
 echo "== the fleet's scrub carries no solo code (its user data is capped at 16 KB) =="
 check "no solo lists, purge or invariants in dev-vm-image-scrub" \

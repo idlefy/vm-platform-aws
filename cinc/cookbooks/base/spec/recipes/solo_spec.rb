@@ -13,7 +13,7 @@ require_relative '../support/home_boundary'
 
 SOLO_RECIPES = %w(
   packages firewall ssh imds sudoers fail2ban unattended_upgrades chrony sysctl
-  docker werf kubernetes nodejs claude_code codex gh shell_default yq uv
+  docker nvidia_baked werf kubernetes nodejs claude_code codex gh shell_default yq uv
   tailscale hardened_firstboot share_helper no_ssm_agent
 ).freeze
 
@@ -124,6 +124,36 @@ describe 'base::solo' do
 
     it 'enables the hardened first-boot unit' do
       expect(chef_run).to enable_systemd_unit('idlefy-hardened-firstboot.service')
+    end
+
+    context 'GPU sizes: base::nvidia_baked' do
+      let(:resources) { chef_run.resource_collection.all_resources }
+      let(:dropin) { '/etc/systemd/system/nvidia-cdi-refresh.service.d/20-idlefy-gpu-present.conf' }
+
+      it 'bakes the NVIDIA driver and toolkit without a GPU on the build host' do
+        expect(chef_run).to install_package('nvidia-driver')
+        expect(chef_run).to install_package('nvidia-container-toolkit')
+        expect(chef_run).to create_file(dropin)
+        expect(chef_run).to create_file('/etc/tmpfiles.d/idlefy-cdi.conf')
+        expect(chef_run).to run_execute('nvidia-baked-no-cgroups')
+      end
+
+      it 'declares the GPU drop-in before the toolkit package' do
+        file_at = resources.index { |r| r.declared_type.to_s == 'file' && r.name == dropin }
+        pkg_at = resources.index { |r| r.declared_type.to_s == 'package' && r.name == 'nvidia-container-toolkit' }
+        expect([file_at, pkg_at]).to all(be_an(Integer))
+        expect(file_at).to be < pkg_at
+      end
+
+      it 'runs nvidia_baked after docker' do
+        loaded = chef_run.run_context.loaded_recipes
+        expect(loaded.index('base::nvidia_baked')).to be > loaded.index('base::docker')
+      end
+
+      it 'generates no CDI spec at converge' do
+        offenders = resources.select { |r| solo_resource_text(r).match?(/cdi generate/) }
+        expect(offenders.map(&:to_s)).to eq([])
+      end
     end
 
     it 'removes the SSM agent snap' do

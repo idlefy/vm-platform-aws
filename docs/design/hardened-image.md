@@ -3,7 +3,8 @@
 > Design record.
 
 **Status:** implemented. **Ships as:** `v2.2.0`, with the cookbook it
-converges at `base-2.2.0`.
+converges at `base-2.2.0`; GPU sizes from `v2.3.0` and `base-2.3.0`
+(decision 15).
 
 | Need | Where |
 |---|---|
@@ -12,7 +13,7 @@ converges at `base-2.2.0`.
 | Driver, guard, retention | `scripts/hardened-image-build.sh`, `scripts/hardened-guard-check.sh`, `scripts/hardened-image-retire.sh` (headers state the env contract and exit codes) |
 | Template and regions | `image/hardened/hardened.pkr.hcl`, `image/hardened/regions` |
 | Build user data and scrub | `image/files/bootstrap-solo`, `image/files/dev-vm-image-scrub`, `image/files/dev-vm-image-scrub-solo` |
-| What the image converges | `cinc/policyfiles/solo.rb`, `base::solo` (changelog `2.2.0`) |
+| What the image converges | `cinc/policyfiles/solo.rb`, `base::solo` (changelog `2.2.0`, `2.3.0`) |
 | Release records | `hardened-ami-YYYYMMDD-NN.json` assets on each `v` release |
 
 ## The request
@@ -44,8 +45,10 @@ reaches it only through what the customer's own account does to the instance
 1. **One cookbook, a second Policyfile — no fork.** `cinc/policyfiles/solo.rb`
    runs `base::solo`: `base::default` without the fleet recipes
    (`cinc_client`, `aws_access`, `traefik`, `falco`, `alloy`,
-   `nvidia_docker`) plus `hardened_firstboot`, `share_helper` and
-   `no_ssm_agent`. Every hardening fix lands in both products at once, and
+   `nvidia_docker`) plus `nvidia_baked`, `hardened_firstboot`,
+   `share_helper` and `no_ssm_agent`. `nvidia_baked` stands in for
+   `nvidia_docker`, which needs a GPU on the host it converges (decision
+   15). Every hardening fix lands in both products at once, and
    chefspec covers both run lists.
 
 2. **Public and unencrypted.** AWS refuses to share an encrypted AMI publicly,
@@ -122,7 +125,11 @@ reaches it only through what the customer's own account does to the instance
 9. **Retention: the newest two public builds are kept; nothing runs
    unattended.** Per region, over images tagged `IdlefyPublishedImage=true`:
    - **keep** the two newest public builds that are not deprecated, whatever
-     their age — the consumer pins exactly these two. A build is deprecated
+     their age — the consumer pins exactly these two. A consumer may pin
+     only the newest build for one cycle, when the builds before it lack
+     something it needs (builds before `v2.3.0` have no GPU driver), and
+     returns to two with the next build. Retention does not change. A build
+     is deprecated
      once its `DeprecationTime` has **passed** (AWS gives every public image
      a default deprecation date two years ahead; a future date is not a
      deprecation);
@@ -233,10 +240,27 @@ reaches it only through what the customer's own account does to the instance
          left anywhere on the root filesystem (one `find / -xdev`, links
          matched and never followed; a `find` error refuses);
       8. dpkg reports `cinc` as unknown or not installed, by the same rule;
-      9. last: cloud-init's two open logs are truncated, `cloud-init clean`
-         runs, no process may hold a deleted non-empty file on `/`, and the
-         free space of `/` is zero-filled (below). Each step that cannot be
-         confirmed refuses.
+      9. the GPU support of decision 15: dpkg reports
+         `linux-modules-nvidia-580-server-open-aws`,
+         `nvidia-headless-no-dkms-580-server-open`, `nvidia-utils-580-server`
+         and `nvidia-container-toolkit` installed (the branch is the scrub's
+         `NVIDIA_BRANCH`, which the test holds equal to the cookbook's
+         default); the newest kernel under `/boot` (`vmlinuz-*`, version
+         order) has an `nvidia.ko*` under `/lib/modules`; the drop-in holds
+         its `ExecCondition` line and its `Before=user@1000.service` line,
+         and systemd names it among the service's
+         drop-ins; `nvidia-cdi-refresh.service` and `.path` are enabled, each
+         with its `multi-user.target.wants` symlink on disk, and the service
+         has not failed; `/etc/tmpfiles.d/idlefy-cdi.conf` holds exactly
+         `d /run/cdi 0755 root root -`; `/etc/cdi/nvidia.yaml`,
+         `/var/run/cdi/nvidia.yaml` and `/run/cdi/nvidia.yaml` are absent;
+         and
+         `/etc/nvidia-container-runtime/config.toml` sets `no-cgroups = true`
+         in its `[nvidia-container-cli]` table;
+      10. last: cloud-init's two open logs are truncated, `cloud-init clean`
+          runs, no process may hold a deleted non-empty file on `/`, and the
+          free space of `/` is zero-filled (below). Each step that cannot be
+          confirmed refuses.
 
     **The zero-fill.** A public snapshot's freed blocks are readable, and EBS
     root volumes accept no discard, so the solo scrub overwrites the free
@@ -279,6 +303,89 @@ reaches it only through what the customer's own account does to the instance
     the test has passed. A pre-release tag's GitHub release is left to the
     driver: one created by hand without `--prerelease` could become Latest.
     `make release` refuses an rc of a version already tagged.
+
+15. **GPU sizes.** The image carries the NVIDIA driver and the NVIDIA
+    Container Toolkit for NVIDIA GPU sizes; one image serves every size.
+    `base::nvidia_baked` (solo only; the fleet's `nvidia_docker` is
+    unchanged) bakes:
+    - the driver from Ubuntu's archive, branch `580-server-open`
+      (`node['base']['nvidia']['driver_branch']`):
+      `linux-modules-nvidia-580-server-open-aws`, prebuilt and signed for the
+      AWS kernel, with `nvidia-headless-no-dkms-580-server-open` and
+      `nvidia-utils-580-server`. No DKMS and no compiler. These are NVIDIA's
+      open kernel modules, which do not cover NVIDIA GPUs older than the
+      Turing generation (on AWS, the P3 and G3 families);
+    - the NVIDIA Container Toolkit, from the source `nvidia_docker` uses,
+      with `no-cgroups = true` in its `[nvidia-container-cli]` table for
+      rootless Docker (`nvidia-ctk config --set
+      nvidia-container-cli.no-cgroups=true --in-place`).
+
+    How updates are configured: the kernel meta package and the modules meta
+    package both come from Ubuntu's `-updates` and `-security` pockets, which
+    unattended-upgrades already allows, so a new kernel and its modules are
+    both eligible for the same unattended run. A driver update that lands
+    while the old module is loaded needs a restart of the box: until then
+    the new libraries and the loaded module differ, and new GPU work can
+    fail. The toolkit's source is not
+    in `Origins-Pattern`, as on the fleet, so the toolkit does not update
+    unattended.
+
+    Measured on 2026-11-24 on a stock Ubuntu 24.04 `t3.large` with kernel
+    `7.0.0-1018-aws`: the prebuilt module package matches the running
+    kernel, so one kernel is installed; the driver (branch 580, open kernel
+    modules, `580.178.04`) adds twelve packages and needs no compiler, no
+    DKMS and no `binutils`; no new setuid binary appears, with or without the
+    toolkit; `nvidia-persistenced` is not enabled; driver and toolkit add
+    about 0.6 GB (2.0 GB to 2.6 GB used). The root volume stays 9 GiB.
+
+    The CDI spec is made on the box, never baked. The toolkit (1.20.2 when
+    measured) ships `nvidia-cdi-refresh.service` and `.path`, both enabled by
+    its package, which write the spec to `/var/run/cdi/nvidia.yaml`, on
+    tmpfs, so a box moved to a size without a GPU keeps no stale spec. The
+    service's own condition passes on any machine that has the module
+    installed. Measured on 2026-11-24 on a stock Ubuntu 24.04 instance
+    without a GPU: the service failed and restarted until its start limit. A
+    drop-in, `nvidia-cdi-refresh.service.d/20-idlefy-gpu-present.conf`, adds
+    an `ExecCondition` that passes only when a PCI device of vendor `0x10de`
+    exists; a failed condition skips the unit without marking it failed.
+    Measured the same day on the same kind of instance, with the drop-in: the
+    unit is skipped with result `exec-condition`, and no unit has failed. The
+    drop-in is written before any NVIDIA package is installed, because the
+    build host has no GPU either. Nothing runs `nvidia-ctk cdi generate` or
+    `nvidia-ctk runtime configure` at converge time. Law A1 holds: the
+    refresh unit reads only local files and hardware.
+
+    Rootless Docker reads the spec without any daemon configuration.
+    Measured on 2026-11-24 on the published image (rootless Docker 29.10.0):
+    `docker info` lists `/etc/cdi` and `/var/run/cdi` as CDI spec
+    directories. RootlessKit copies up `/run` when the rootless daemon
+    starts, so a `/run/cdi` created after that is not visible to the daemon.
+    `/etc/tmpfiles.d/idlefy-cdi.conf` (`d /run/cdi 0755 root root -`)
+    therefore creates the directory at boot. With it in place, a spec written
+    after the daemon started was used at once (checked with a test spec, not
+    with a GPU).
+
+    The drop-in also orders the refresh before `user@1000.service`, where
+    rootless Docker starts, and gives it `TimeoutStartSec=120`. Measured on
+    2026-11-25 on a `g4dn.xlarge` (Tesla T4), on the published `v2.2.1`
+    image with the packages, the drop-in and the tmpfiles entry applied by
+    hand in the recipe's order: without the ordering, on the first boot the
+    spec appeared about 15 s after the rootless daemon had started, the
+    daemon logged `permission denied` for it and
+    `--device nvidia.com/gpu=all` failed until the directory next changed;
+    regenerating the spec later did not reproduce it. With the ordering, a
+    reboot and a stop and start were both clean; the refresh took about
+    8.5 s of the boot.
+
+    Measured in the same run, as `ubuntu`, which still has no sudo:
+    `nvidia-smi` reports the GPU with driver `580.178.04`; containers
+    started with `--device nvidia.com/gpu=all` and with `--gpus all` see it;
+    a PyTorch CUDA image computes on it; a container started without either
+    flag has no NVIDIA device. The spec names `/dev/nvidia0`, `nvidiactl`,
+    `nvidia-uvm`, `nvidia-uvm-tools` and `nvidia-modeset`; no unit failed.
+    The same instance switched to a `t3.large`: the refresh is skipped
+    (`exec-condition`), no spec exists, the module is not loaded, no unit
+    failed, `cloud-init status` is `done`, and containers run as before.
 
 ### The guard
 

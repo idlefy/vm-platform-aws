@@ -100,3 +100,6 @@ keep   /usr/local/sbin/idlefy-hardened-firstboot # …and what it runs
 keep   /etc/sudoers.d/50-tailscale-login # the one grant from base::sudoers
 keep   /etc/sudoers.d/51-idlefy-share   # the second grant (spec I6)
 keep   /usr/local/sbin/idlefy-share     # the share helper (spec I6)
+keep   /etc/systemd/system/nvidia-cdi-refresh.service.d/20-idlefy-gpu-present.conf # base::nvidia_baked: CDI refresh only with an NVIDIA device
+keep   /etc/nvidia-container-runtime/config.toml # the toolkit's config (no-cgroups = true)
+keep   /etc/tmpfiles.d/idlefy-cdi.conf  # /run/cdi at boot, before rootless Docker starts
