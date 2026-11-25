@@ -587,7 +587,7 @@ Published with this cookbook:
 | Policy | Run list | Use case |
 |--------|----------|----------|
 | `dev-vm` | `base::default` (SSH, firewall, sysctl, Docker, GPU auto-detect, credential broker, Falco, Alloy when `base.loki.enabled`) | General developer VM |
-| `solo` | `base::solo` (`base::default` without `cinc_client`, `aws_access`, `traefik`, `falco`, `alloy`, `nvidia_docker`; plus `nvidia_baked`, `hardened_firstboot`, `share_helper`, `no_ssm_agent`; no public web ports) | A single developer's box with an AI agent; no fleet services; Idlefy's public image; NVIDIA GPU sizes included, except the P3 and G3 families |
+| `solo` | `base::solo` (`base::default` without `cinc_client`, `aws_access`, `traefik`, `falco`, `alloy`, `nvidia_docker`; plus `nvidia_baked`, `hardened_firstboot`, `share_helper`, `no_ssm_agent`; no public web ports) | A single developer's box with an AI agent; no fleet services; Idlefy's public image; NVIDIA GPU sizes included, except the P3 and G3 families and the fractional-GPU G6f and Gr6f families |
 
 ## Policy assignment
 

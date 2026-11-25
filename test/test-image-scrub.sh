@@ -45,6 +45,13 @@ if [ "$1 $2 $3" = "show -P DropInPaths" ]; then
   echo "${SHIM_DROPINS-/usr/lib/systemd/system/service.d/10-timeout-abort.conf /etc/systemd/system/nvidia-cdi-refresh.service.d/20-idlefy-gpu-present.conf}"
   exit 0
 fi
+# `show -P Before` prints SHIM_BEFORE (default: what systemd reports with the
+# drop-in loaded).
+if [ "$1 $2 $3" = "show -P Before" ]; then
+  [ -n "${SHIM_SHOW_RC:-}" ] && exit "$SHIM_SHOW_RC"
+  echo "${SHIM_BEFORE-shutdown.target user@1000.service multi-user.target}"
+  exit 0
+fi
 # SHIM_FETCHED: the queued converge had fetched (and extracted) this other
 # revision when it was stopped — mid-converge, so status and last-serial are
 # still the bootstrap's.
@@ -571,6 +578,9 @@ solo_refuses "drop-in without the ordering before the user manager" "does not or
 solo_refuses "drop-in with the ordering commented out" "does not order the refresh before the user manager" \
   "printf '%s\n' '[Unit]' '#Before=user@1000.service' '[Service]' \"ExecCondition=/bin/sh -c 'grep -qsx 0x10de /sys/bus/pci/devices/*/vendor'\" > .$DROPIN"
 solo_refuses "systemd lists no drop-in"     "systemd does not list $DROPIN" ":" SHIM_DROPINS=
+solo_refuses "the ordering line is not in effect (wrong section)" "systemd does not order nvidia-cdi-refresh.service before user@1000.service" ":" SHIM_BEFORE="shutdown.target multi-user.target"
+solo_refuses "systemd reports no ordering" "systemd does not order nvidia-cdi-refresh.service before user@1000.service" ":" SHIM_BEFORE=
+solo_refuses "another user manager is not this one" "systemd does not order nvidia-cdi-refresh.service before user@1000.service" ":" SHIM_BEFORE="user@10000.service shutdown.target"
 solo_refuses "systemd lists another drop-in" "systemd does not list $DROPIN" ":" SHIM_DROPINS="$DROPIN.bak /etc/systemd/system/nvidia-cdi-refresh.service.d/10-other.conf"
 solo_refuses "systemctl show fails"         "systemd does not list $DROPIN" ":" SHIM_SHOW_RC=1
 for u in service path; do

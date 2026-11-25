@@ -430,6 +430,8 @@ solo_check() {
     || refuse "$NVIDIA_DROPIN does not order the refresh before the user manager"
   st=$(systemctl show -P DropInPaths nvidia-cdi-refresh.service) || st=""
   [[ " $st " == *" $NVIDIA_DROPIN "* ]] || refuse "systemd does not list $NVIDIA_DROPIN for nvidia-cdi-refresh.service"
+  st=$(systemctl show -P Before nvidia-cdi-refresh.service) || st=""
+  [[ " $st " == *" ${NVIDIA_ORDER#Before=} "* ]] || refuse "systemd does not order nvidia-cdi-refresh.service before ${NVIDIA_ORDER#Before=}"
   for f in nvidia-cdi-refresh.service nvidia-cdi-refresh.path; do
     systemctl is-enabled --quiet "$f" || refuse "$f is not enabled"
     [ -L "$R/etc/systemd/system/multi-user.target.wants/$f" ] || refuse "$f has no multi-user.target.wants link on disk"

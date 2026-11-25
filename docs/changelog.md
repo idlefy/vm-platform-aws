@@ -14,7 +14,8 @@ Toolkit for NVIDIA GPU sizes. One image serves every size; design record:
   and `nvidia-utils-<branch without -open>`, with `base.nvidia.driver_branch`
   defaulting to `580-server-open`. No DKMS and no compiler. The open kernel
   modules do not cover NVIDIA GPUs older than the Turing generation (on AWS,
-  the P3 and G3 families).
+  the P3 and G3 families). Sizes that expose a fraction of a GPU (G6f,
+  Gr6f) need NVIDIA's GRID driver, which the image does not carry.
 - The NVIDIA Container Toolkit from the source `base::nvidia_docker` uses,
   with `no-cgroups = true` in its `[nvidia-container-cli]` table for
   rootless Docker. Its source is not added to `Origins-Pattern`, so it does

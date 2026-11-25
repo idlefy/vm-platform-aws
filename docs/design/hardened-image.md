@@ -248,7 +248,7 @@ reaches it only through what the customer's own account does to the instance
          default); the newest kernel under `/boot` (`vmlinuz-*`, version
          order) has an `nvidia.ko*` under `/lib/modules`; the drop-in holds
          its `ExecCondition` line and its `Before=user@1000.service` line,
-         and systemd names it among the service's
+         systemd reports that ordering as in effect, and names it among the service's
          drop-ins; `nvidia-cdi-refresh.service` and `.path` are enabled, each
          with its `multi-user.target.wants` symlink on disk, and the service
          has not failed; `/etc/tmpfiles.d/idlefy-cdi.conf` holds exactly
@@ -314,7 +314,9 @@ reaches it only through what the customer's own account does to the instance
       AWS kernel, with `nvidia-headless-no-dkms-580-server-open` and
       `nvidia-utils-580-server`. No DKMS and no compiler. These are NVIDIA's
       open kernel modules, which do not cover NVIDIA GPUs older than the
-      Turing generation (on AWS, the P3 and G3 families);
+      Turing generation (on AWS, the P3 and G3 families). Sizes that expose
+      a fraction of a GPU (the G6f and Gr6f families) need NVIDIA's GRID
+      driver instead, which this image does not carry;
     - the NVIDIA Container Toolkit, from the source `nvidia_docker` uses,
       with `no-cgroups = true` in its `[nvidia-container-cli]` table for
       rootless Docker (`nvidia-ctk config --set
