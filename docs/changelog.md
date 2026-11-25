@@ -1,5 +1,66 @@
 # Changelog
 
+## 2.3.0
+
+The hardened image carries the NVIDIA driver and the NVIDIA Container
+Toolkit for NVIDIA GPU sizes. One image serves every size; design record:
+[Hardened image for AI agents](design/hardened-image.md), decision 15.
+
+**`base-2.3.0`**
+
+- `base::nvidia_baked`, in `base::solo` only: Ubuntu's prebuilt, signed
+  NVIDIA kernel modules for the AWS kernel
+  (`linux-modules-nvidia-<branch>-aws`), `nvidia-headless-no-dkms-<branch>`
+  and `nvidia-utils-<branch without -open>`, with `base.nvidia.driver_branch`
+  defaulting to `580-server-open`. No DKMS and no compiler. The open kernel
+  modules do not cover NVIDIA GPUs older than the Turing generation (on AWS,
+  the P3 and G3 families). Sizes that expose a fraction of a GPU (G6f,
+  Gr6f) need NVIDIA's GRID driver, which the image does not carry.
+- The NVIDIA Container Toolkit from the source `base::nvidia_docker` uses,
+  with `no-cgroups = true` in its `[nvidia-container-cli]` table for
+  rootless Docker. Its source is not added to `Origins-Pattern`, so it does
+  not update unattended. The driver comes from the Ubuntu pockets
+  unattended-upgrades already allows; after a driver update, new GPU work can
+  fail until the box restarts.
+- No CDI spec is made at converge time: the toolkit's `nvidia-cdi-refresh`
+  units write it at boot to `/var/run/cdi`. A drop-in, written before the
+  toolkit is installed, skips that refresh when no NVIDIA PCI device is
+  present. Measured on 2026-11-24 on a stock Ubuntu 24.04 instance without
+  a GPU: without the drop-in the unit failed and restarted until its start
+  limit; with it the unit is skipped and no unit has failed. The drop-in
+  also orders the refresh before `user@1000.service`, where rootless Docker
+  starts: on a GPU instance (2026-11-25, `g4dn.xlarge`) a spec that first
+  appeared after the daemon had started was not picked up on the first
+  boot.
+- `/etc/tmpfiles.d/idlefy-cdi.conf` creates `/run/cdi` at boot. Rootless
+  Docker cannot see a `/run/cdi` created after its daemon started (measured
+  on 2026-11-24 on the published image, rootless Docker 29.10.0).
+- Measured on 2026-11-24 on a stock Ubuntu 24.04 `t3.large` with kernel
+  `7.0.0-1018-aws`, which the prebuilt modules already match: twelve new
+  packages for the driver, no compiler, DKMS or `binutils`, about 0.6 GB for
+  driver and toolkit, no new setuid binary, `nvidia-persistenced` not
+  enabled.
+- `base::default` keeps `base::nvidia_docker`, and `base::solo` still
+  leaves it out.
+- **Fleet-visible:** `base::nvidia_docker` sets `no-cgroups` with
+  `--set nvidia-container-cli.no-cgroups=true`. The old spelling,
+  `--set no-cgroups=true`, is rejected by current toolkit releases
+  (measured on 2026-11-24 with toolkit 1.20.2), so that step failed on a VM
+  with a GPU.
+
+**`v2.3.0`**
+
+- The solo scrub refuses the image unless the three driver packages and
+  `nvidia-container-toolkit` are installed, the newest kernel under `/boot`
+  has an `nvidia.ko*`, the drop-in holds its condition and its ordering and
+  systemd loads it, `nvidia-cdi-refresh.service` and `.path` are enabled with their
+  `multi-user.target.wants` symlinks on disk and the service has not
+  failed, `/etc/tmpfiles.d/idlefy-cdi.conf` holds its one line, no
+  `nvidia.yaml` exists in `/etc/cdi`, `/var/run/cdi` or `/run/cdi`, and the
+  toolkit's config sets `no-cgroups = true`.
+- Builds from `v2.3.0` on carry the driver; earlier builds do not. The
+  release record's format is unchanged.
+
 ## 2.2.1
 
 **`v2.2.1`**

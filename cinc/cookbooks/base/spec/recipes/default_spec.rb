@@ -69,4 +69,6 @@ describe 'base::default' do
   end
 
   it_behaves_like 'root never writes under /home/ubuntu'
+
+  it('leaves base::nvidia_baked out of the fleet run list') { expect(chef_run).not_to include_recipe('base::nvidia_baked') }
 end

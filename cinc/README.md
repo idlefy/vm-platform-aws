@@ -50,6 +50,10 @@ The recipe list is in `default.rb` order, which is converge order. The last two
 entries are ordered deliberately — see the comment above `include_recipe
 'base::falco'`.
 
+The `solo` policy's own recipes — `nvidia_baked`, `hardened_firstboot`,
+`share_helper`, `no_ssm_agent` — are listed with the reasons in
+`recipes/solo.rb`.
+
 ## Security model
 
 ### Access model
@@ -172,7 +176,7 @@ Requires IAM permission `ec2-instance-connect:SendSSHPublicKey`. All access is l
 
 - **Rootless Docker** — no docker group, no privilege escalation
 - Container root maps to ubuntu uid on host (user namespaces)
-- GPU access via CDI (`--device nvidia.com/gpu=all`), auto-detected by `/dev/nvidia0`
+- GPU access via CDI (`--device nvidia.com/gpu=all`), auto-detected by `/dev/nvidia0`; on the `solo` policy the driver and toolkit are baked, and the toolkit's refresh unit writes the spec at boot when an NVIDIA device is present
 - IMDSv2 hop limit = 1 blocks container IMDS access (defense in depth)
 
 ### Developer home directory
@@ -214,10 +218,11 @@ kernel updates apply without anyone scheduling a reboot.
 | Grafana (apt.grafana.com) | repo yes, `alloy` **no** | The site is in `Origins-Pattern`, but `alloy` is in `Package-Blacklist` — its config template is written against specific Alloy stages. Bump in `alloy.rb`. Both Grafana lines are dropped when `base.loki.enabled` is false. |
 | Tailscale (pkgs.tailscale.com) | yes | Deliberately unlike Falco, and the reasoning is recorded in `unattended_upgrades.rb`: `tailscaled` also runs as root *and* is invocable by an unprivileged user through a path-matched sudoers rule, so the exposure is larger — but neither of the things that force the Alloy and Falco pins (a version-locked config template, a breaking CLI) applies. Note tailscaled's own c2n `/update` RPC is a second channel that `Package-Blacklist` cannot reach. |
 | Falco (download.falco.org) | **no** | The site is deliberately *absent* from `Origins-Pattern`, so unattended cannot see the package at all; `falco` is also blacklisted as belt-and-braces. Bump in `falco.rb`. |
+| NVIDIA Container Toolkit (nvidia.github.io) | **no** | Not in `Origins-Pattern`, on the fleet (`nvidia_docker.rb`) and on `solo` (`nvidia_baked.rb`). The NVIDIA driver on `solo` comes from Ubuntu's archive (`-updates`, `-security`) and is updated with the kernel; a new driver takes effect after the box restarts. |
 | Claude Code (claude.ai/install.sh) | user-managed | Per-user install via official installer; `claude update` from the user's shell. Not an apt repo; unattended-upgrades does not apply. |
 | Codex (chatgpt.com/codex/install.sh) | user-managed | Same shape as Claude Code: per-user install, `codex update` from the user's shell, not an apt repo. Its sandbox dependency `bubblewrap` **is** an apt package (Ubuntu `${distro_codename}`), so that half is patched automatically. |
 
-The two `no` rows are not oversights, and both carry a cost worth stating: a
+The Alloy and Falco `no` rows are not oversights, and both carry a cost worth stating: a
 pinned package receives no automatic security patches. For Alloy the pin exists
 because a config the new binary rejects fails silently — green unit, zero logs
 collected. For Falco it exists for the same reason plus a sharper one: Falco runs
@@ -582,7 +587,7 @@ Published with this cookbook:
 | Policy | Run list | Use case |
 |--------|----------|----------|
 | `dev-vm` | `base::default` (SSH, firewall, sysctl, Docker, GPU auto-detect, credential broker, Falco, Alloy when `base.loki.enabled`) | General developer VM |
-| `solo` | `base::solo` (`base::default` without `cinc_client`, `aws_access`, `traefik`, `falco`, `alloy`, `nvidia_docker`; plus `hardened_firstboot`, `share_helper`, `no_ssm_agent`; no public web ports) | A single developer's box with an AI agent; no fleet services; Idlefy's public image |
+| `solo` | `base::solo` (`base::default` without `cinc_client`, `aws_access`, `traefik`, `falco`, `alloy`, `nvidia_docker`; plus `nvidia_baked`, `hardened_firstboot`, `share_helper`, `no_ssm_agent`; no public web ports) | A single developer's box with an AI agent; no fleet services; Idlefy's public image; NVIDIA GPU sizes included, except the P3 and G3 families and the fractional-GPU G6f and Gr6f families |
 
 ## Policy assignment
 

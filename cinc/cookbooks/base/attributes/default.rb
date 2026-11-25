@@ -48,3 +48,13 @@ default['base']['firewall']['public_web_ports'] = [80, 443]
 # exclusion for `sudo idlefy-share`: the grant and the Falco exclusion are one
 # change (AGENTS.md trap 7), and without it every share pages someone.
 default['base']['share_helper']['enabled'] = false
+
+# The NVIDIA driver branch base::nvidia_baked installs (solo only; the fleet's
+# base::nvidia_docker installs no driver). Ubuntu's prebuilt, signed modules for
+# the AWS kernel, linux-modules-nvidia-<branch>-aws, with
+# nvidia-headless-no-dkms-<branch> and nvidia-utils-<branch without -open> (the
+# utils package has no -open variant). '-open' selects NVIDIA's open kernel
+# modules, which support Turing and newer GPUs only.
+# image/files/dev-vm-image-scrub-solo names the same branch (NVIDIA_BRANCH), and
+# test/test-image-scrub.sh fails if the two differ.
+default['base']['nvidia']['driver_branch'] = '580-server-open'

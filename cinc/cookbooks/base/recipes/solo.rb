@@ -20,11 +20,14 @@
 #                   reading the alerts; there is none on a solo box.
 #   alloy         — ships the journal to the fleet's Loki; no Loki here
 #                   (loki.enabled = false).
-#   nvidia_docker — GPU container runtime is decided per image variant, not by
-#                   this run list; the solo image is built for CPU instances.
+#   nvidia_docker — needs a GPU on the host it converges and generates the CDI
+#                   spec there; the image is built without one. base::nvidia_baked
+#                   bakes the driver and the toolkit instead, and the toolkit's
+#                   own units make the spec at boot.
 #
-# Order follows base::default for everything both run, then the three solo-only
-# recipes: hardened_firstboot, share_helper, no_ssm_agent.
+# Order follows base::default for everything both run. nvidia_baked takes the
+# slot nvidia_docker has there, after docker; the three other solo-only recipes
+# come last: hardened_firstboot, share_helper, no_ssm_agent.
 include_recipe 'base::packages'
 include_recipe 'base::firewall'
 include_recipe 'base::ssh'
@@ -35,6 +38,7 @@ include_recipe 'base::unattended_upgrades'
 include_recipe 'base::chrony'
 include_recipe 'base::sysctl'
 include_recipe 'base::docker'
+include_recipe 'base::nvidia_baked'
 include_recipe 'base::werf'
 include_recipe 'base::kubernetes'
 include_recipe 'base::nodejs'

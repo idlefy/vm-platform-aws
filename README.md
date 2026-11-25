@@ -64,7 +64,7 @@ The [runbook](https://idlefy.github.io/vm-platform-aws/runbook/) takes it from t
 | Audit trail | systemd journal → Grafana Alloy → Grafana Cloud Loki within seconds; `ubuntu` can neither read the system journal nor stop the shipper; a checked-in dashboard and six Grafana alert rules read the stream | [log-shipping](docs/design/log-shipping.md), [optional-log-shipping](docs/design/optional-log-shipping.md) |
 | Publishing | Traefik on every VM: a container labelled with a `Host` rule gets a Let's Encrypt certificate and basic auth, without the developer touching a config the cookbook manages | |
 | Tailnet | Tailscale, joined under the developer's own identity by the one `sudo` command they hold | |
-| Dev tooling | Node.js, kubectl, helm, werf, gh, uv, yq, ripgrep, zsh, Claude Code CLI; NVIDIA Container Toolkit on GPU instance types | |
+| Dev tooling | Node.js, kubectl, helm, werf, gh, uv, yq, ripgrep, zsh, Claude Code CLI; NVIDIA Container Toolkit on GPU instance types; on the `solo` policy the NVIDIA driver and toolkit are baked in | |
 
 The recipe-by-recipe reference is [`cinc/README.md`](cinc/README.md); the module and region model is [`vms/README.md`](vms/README.md); the dashboard and alerts are [`grafana/README.md`](grafana/README.md).
 

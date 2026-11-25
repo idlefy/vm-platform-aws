@@ -27,7 +27,7 @@ package 'nvidia-container-toolkit'
 
 # Configure for rootless (no-cgroups required)
 execute 'nvidia-ctk-config-rootless' do
-  command 'nvidia-ctk runtime configure --runtime=docker && nvidia-ctk config --set no-cgroups=true --in-place'
+  command 'nvidia-ctk runtime configure --runtime=docker && nvidia-ctk config --set nvidia-container-cli.no-cgroups=true --in-place'
   not_if 'grep -q "no-cgroups = true" /etc/nvidia-container-runtime/config.toml 2>/dev/null'
 end
 
