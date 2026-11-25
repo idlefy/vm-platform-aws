@@ -375,7 +375,10 @@ reaches it only through what the customer's own account does to the instance
     `--device nvidia.com/gpu=all` failed until the directory next changed;
     regenerating the spec later did not reproduce it. With the ordering, a
     reboot and a stop and start were both clean; the refresh took about
-    8.5 s of the boot.
+    8.5 s of the boot. A refresh that hangs delays the user manager by at
+    most that timeout: measured on the image's systemd 255 with a stand-in
+    unit, the unit ordered after it starts when the first attempt times
+    out, while the unit itself goes on restarting.
 
     Measured in the same run, as `ubuntu`, which still has no sudo:
     `nvidia-smi` reports the GPU with driver `580.178.04`; containers
