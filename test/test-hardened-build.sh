@@ -334,8 +334,8 @@ check "ami_name is today's first" "$(var "ami_name=idlefy-hardened-agent-ubuntu-
 check "build_region is the first region" "$(var build_region=us-east-1; echo $?)"
 check "ami_regions is every region, in order" "$(var "ami_regions=$REGIONS_JSON"; echo $?)"
 check "the test's region list holds 17 regions" "$([ "${#REGIONS[@]}" = 17 ]; echo $?)"
-check "image/hardened/regions builds in us-east-1 and copies to the eight other published regions" \
-  "$([ "${REAL_REGIONS[*]}" = "us-east-1 eu-central-1 us-east-2 us-west-2 eu-west-1 eu-west-2 ap-south-1 ap-northeast-1 ap-southeast-1" ]; echo $?)"
+check "image/hardened/regions builds in us-east-1 and copies to the nine other published regions" \
+  "$([ "${REAL_REGIONS[*]}" = "us-east-1 eu-central-1 us-east-2 us-west-2 eu-west-1 eu-west-2 ap-south-1 ap-northeast-1 ap-southeast-1 eu-north-1" ]; echo $?)"
 check "...and every region it lists is a default-enabled one from this test's list, none left as a comment" \
   "$(for r in "${REAL_REGIONS[@]}"; do printf '%s\n' "${REGIONS[@]}" | grep -qx "$r" || exit 1; done \
      && ! grep -qE '^# *(us|ca|eu|ap|sa)-[a-z]+-[0-9]$' "$ROOT/image/hardened/regions"; echo $?)"

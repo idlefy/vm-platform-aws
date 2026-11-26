@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.3.1
+
+**`v2.3.1`**
+
+- `image/hardened/regions`: the hardened image is also published to
+  `eu-north-1`, ten regions in all. The image itself is unchanged.
+
 ## 2.3.0
 
 The hardened image carries the NVIDIA driver and the NVIDIA Container
